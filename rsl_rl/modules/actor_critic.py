@@ -11,9 +11,8 @@ from tensordict import TensorDict
 from torch.distributions import Normal, Distribution, constraints
 from typing import Any, NoReturn, Optional
 
-from rsl_rl.networks import MLP, EmpiricalNormalization
+from rsl_rl.networks import MLP, EmpiricalNormalization, MLP_FiLM
 from rsl_rl.modules.actor_critic_recurrent import ResNetEncoder
-
 
 class GSDENoiseDistribution(Distribution):
     """
@@ -159,6 +158,8 @@ class ActorCritic(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        film_obs_key: str | None = None,
+        film_hiddens: list[int] = [256],
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -192,11 +193,25 @@ class ActorCritic(nn.Module):
 
         self.state_dependent_std = state_dependent_std
 
+        add_actor_params = {}
+
+        self.film_obs_key = film_obs_key
+        actor_network_class = MLP
+        # does the critic also need a film setting?
+        self.film_obs_normalization = self.film_obs_key is not None
+        if self.film_obs_key is not None:
+            film_num_input_channels = obs[self.film_obs_key].shape[-1]
+            add_actor_params["film_num_input_channels"] = film_num_input_channels
+            add_actor_params["film_hiddens"] = film_hiddens
+            actor_network_class = MLP_FiLM
+
+            self.film_obs_normalizer = EmpiricalNormalization(film_num_input_channels)
+
         # Actor
         if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = actor_network_class(input_dim=num_actor_obs, output_dim=[2, num_actions], hidden_dims=actor_hidden_dims, activation=activation, **add_actor_params)
         else:
-            self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
+            self.actor = actor_network_class(input_dim=num_actor_obs, output_dim=num_actions, hidden_dims=actor_hidden_dims, activation=activation, **add_actor_params)
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization
@@ -205,7 +220,7 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
-        
+
 
         # Critic
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
@@ -269,10 +284,10 @@ class ActorCritic(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _update_distribution(self, obs: TensorDict) -> None:
+    def _update_distribution(self, obs: dict[str, TensorDict]) -> None:
         if self.state_dependent_std:
             # Compute mean and standard deviation
-            mean_and_std = self.actor(obs)
+            mean_and_std = self.actor(**obs)
             if self.noise_std_type == "scalar":
                 mean, std = torch.unbind(mean_and_std, dim=-2)
             elif self.noise_std_type == "log":
@@ -282,7 +297,7 @@ class ActorCritic(nn.Module):
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         else:
             # Compute mean
-            mean = self.actor(obs)
+            mean = self.actor(**obs)
             # Compute standard deviation
             if self.noise_std_type == "scalar":
                 std = self.std.expand_as(mean)
@@ -294,24 +309,34 @@ class ActorCritic(nn.Module):
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # Create distribution
         if self.noise_std_type == "gsde":
-            features = self.actor[:-1](obs)
+            features = self.actor.get_features()
             self.distribution.proba_distribution(mean, self.log_std, features)
         else:
             self.distribution = Normal(mean, std)
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
-        obs = self.get_actor_obs(obs)
-        obs = self.actor_obs_normalizer(obs)
+        obs = self.resolve_actor_obs(obs)
         self._update_distribution(obs)
         return self.distribution.sample()
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
-        obs = self.get_actor_obs(obs)
-        obs = self.actor_obs_normalizer(obs)
+        obs = self.resolve_actor_obs(obs)
         if self.state_dependent_std:
-            return self.actor(obs)[..., 0, :]
+            return self.actor(**obs)[..., 0, :]
         else:
-            return self.actor(obs)
+            return self.actor(**obs)
+    
+    def resolve_actor_obs(self, obs: TensorDict) -> dict[str, TensorDict]:
+        # adds the FiLM observation if necessary
+        actor_obs = self.get_actor_obs(obs)
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        if self.film_obs_key is not None:
+            film_obs = self.get_film_obs(obs)
+            film_obs = self.film_obs_normalizer(film_obs)
+            obs = {"x": actor_obs, "film_input": film_obs}
+        else:
+            obs = {"x": actor_obs}
+        return obs
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_critic_obs(obs)
@@ -327,6 +352,10 @@ class ActorCritic(nn.Module):
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic"]]
         return torch.cat(obs_list, dim=-1)
+    
+    def get_film_obs(self, obs: TensorDict) -> torch.Tensor:
+        film_obs = obs[self.film_obs_key]
+        return film_obs
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
@@ -338,6 +367,9 @@ class ActorCritic(nn.Module):
         if self.critic_obs_normalization:
             critic_obs = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(critic_obs)
+        if self.film_obs_normalization:
+            film_obs = self.get_film_obs(obs)
+            self.film_obs_normalizer.update(film_obs)
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         """Load the parameters of the actor-critic model.

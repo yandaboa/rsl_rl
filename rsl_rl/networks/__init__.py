@@ -8,9 +8,12 @@
 from .memory import HiddenState, Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .film import FiLM, MLP_FiLM
 
 __all__ = [
     "MLP",
+    "FiLM",
+    "MLP_FiLM",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
     "HiddenState",

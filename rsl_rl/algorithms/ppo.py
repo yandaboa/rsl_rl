@@ -144,8 +144,9 @@ class PPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
-        policy_obs = obs.pop("policy")
         self.transition.actions = self.policy.act(obs).detach()
+        policy_obs = obs.pop("policy")
+        # for supporting obs when it's no longer a concatenated tensor, so we can use different encoders
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -225,6 +226,10 @@ class PPO:
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
+
+            policy_obs_batch = {"policy": policy_obs_batch}
+            if self.policy.film_obs_key is not None:
+                policy_obs_batch[self.policy.film_obs_key] = obs_batch[self.policy.film_obs_key] # type: ignore
 
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:

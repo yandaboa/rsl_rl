@@ -104,9 +104,16 @@ class MLP(nn.Sequential):
         Args:
             x: Input tensor.
         """
-        for layer in self:
+        for i, layer in enumerate(self):
+            if i == len(self) - 1:
+                self.last_features = x
             x = layer(x)
         return x
+    
+    def get_features(self) -> torch.Tensor:
+        if getattr(self, "last_features", None) is None:
+            raise ValueError("No features have been computed yet. Call forward() first, or make sure your forward() method caches features")
+        return self.last_features
 
     def __getitem__(self, idx):
         """Enable slicing support by returning a plain Sequential when a slice is used."""
