@@ -145,7 +145,7 @@ class PPO:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
         policy_obs = obs.pop("policy")
-        self.transition.actions = self.policy.act(policy_obs).detach()
+        self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()

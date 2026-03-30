@@ -12,6 +12,7 @@ from torch.distributions import Normal, Distribution, constraints
 from typing import Any, NoReturn, Optional
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
+from rsl_rl.modules.actor_critic_recurrent import ResNetEncoder
 
 
 class GSDENoiseDistribution(Distribution):
@@ -167,16 +168,27 @@ class ActorCritic(nn.Module):
         super().__init__()
 
         # Get the observation dimensions
+        # We assume that any 4D (num_envs, 3, H, W) observations are image observations
+        create_obs_encoder = False
         self.obs_groups = obs_groups
         num_actor_obs = 0
         for obs_group in obs_groups["policy"]:
             # assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             for key in obs[obs_group].keys():
-                num_actor_obs += obs[obs_group][key].shape[-1]
+                if len(obs[obs_group][key].shape) == 4:
+                    create_obs_encoder = True
+                    obs_dim = 512 # we should add some downsampling to get this to be smaller...
+                else:
+                    obs_dim = obs[obs_group][key].shape[-1]
+                num_actor_obs += obs_dim
         num_critic_obs = 0
         for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            assert len(obs[obs_group].shape) == 2, "The ActorCritic module's critic only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
+
+        if create_obs_encoder:
+            self.obs_encoder = ResNetEncoder()
+            print(f"Created ResNet encoder for actor observations. New actor obs dim: {num_actor_obs}")
 
         self.state_dependent_std = state_dependent_std
 
@@ -193,6 +205,7 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
+        
 
         # Critic
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
@@ -307,7 +320,8 @@ class ActorCritic(nn.Module):
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         # return torch.cat(obs_list, dim=-1)
-        features = [obs[key] for key in obs.keys()]
+        policy_obs : TensorDict = obs["policy"] # type: ignore
+        features = [self.obs_encoder(policy_obs[key]) if len(policy_obs[key].shape) > 3 else policy_obs[key] for key in policy_obs.keys()]
         return torch.cat(features, dim=-1)
 
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
@@ -319,7 +333,7 @@ class ActorCritic(nn.Module):
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:
-            actor_obs = self.get_actor_obs(obs["policy"])
+            actor_obs = self.get_actor_obs(obs)
             self.actor_obs_normalizer.update(actor_obs)
         if self.critic_obs_normalization:
             critic_obs = self.get_critic_obs(obs)

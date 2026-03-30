@@ -119,8 +119,8 @@ class BCPPO(PPO):
         
         # Compute the actions and values
         # Compute the actions and values
+        self.transition.actions = self.policy.act(obs).detach()
         policy_obs = obs.pop("policy")
-        self.transition.actions = self.policy.act(policy_obs).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -182,6 +182,10 @@ class BCPPO(PPO):
         ) in generator:
 
             original_batch_size = obs_batch.shape[0]
+
+            # match format of policy_obs_batch with the one that actor_critic expects
+            # TODO: fix the batch generation so that this is not necessary
+            policy_obs_batch = {"policy": policy_obs_batch}
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
