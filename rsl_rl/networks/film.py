@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-from rsl_rl.networks import MLP
 from rsl_rl.utils import resolve_nn_activation
 
 from functools import reduce
@@ -11,37 +10,23 @@ class FiLM(nn.Module):
     """
     Feature-wise Linear Modulation
     paper: https://arxiv.org/pdf/1709.07871
+    We expect an embedding, which we then linearly project into the feature space
     """
-    def __init__(self, num_input_channels: int, hiddens: list[int], num_features: int):
+    def __init__(self, num_input_channels: int, num_features: int):
         super().__init__()
         self.num_input_channels = num_input_channels
         self.num_features = num_features
-
-        hiddens = list(hiddens)  # avoid mutating caller's list
-        self.embedding_dim = hiddens[0]
-        hiddens.append(num_features * 2)
-
-        self.encoder = nn.Sequential(
-            nn.Linear(num_input_channels, self.embedding_dim),
-            nn.ReLU(),
-        )
-        layers = []
-        for i in range(len(hiddens) - 1):
-            layers.append(nn.Linear(hiddens[i], hiddens[i + 1]))
-            if i < len(hiddens) - 2:  # no activation on final output layer
-                layers.append(nn.ReLU())
-        self.generator = nn.Sequential(*layers)
+        self.generator = nn.Linear(self.num_input_channels, self.num_features * 2)
 
     def forward(self, x: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         assert x.shape[-1] == self.num_input_channels
         assert features.shape[-1] == self.num_features
 
-        embed = self.encoder(x)
-        out = self.generator(embed)
+        out = self.generator(x)
         scale, shift = torch.split(out, self.num_features, dim=-1)
         return scale * features + shift
 
-class MLP_FiLM(MLP):
+class MLP_FiLM(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -50,24 +35,34 @@ class MLP_FiLM(MLP):
         film_num_input_channels: int,
         activation: str = "elu",
         last_activation: str | None = None,
-        film_hiddens: list[int] = [256],
+        film_hiddens: tuple[int] | list[int] = (256,),
     ) -> None:
-        nn.Sequential.__init__(self) 
+        super().__init__()
 
         activation_mod = resolve_nn_activation(activation)
         last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
 
         hidden_dims_processed = [input_dim if dim == -1 else dim for dim in hidden_dims]
 
+        # create film encoder
+        film_dims = [film_num_input_channels, *film_hiddens]
+        film_encoder_layers = []
+        for i in range(len(film_dims) - 1):
+            film_encoder_layers.append(nn.Linear(film_dims[i], film_dims[i + 1]))
+            if i < len(film_dims) - 2:
+                film_encoder_layers.append(activation_mod)
+        self.film_encoder = nn.Sequential(*film_encoder_layers)
+        self.film_embed_dim = film_dims[-1]
+
         # Create layers sequentially
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
-        layers.append(FiLM(film_num_input_channels, film_hiddens, hidden_dims_processed[0]))
+        layers.append(FiLM(self.film_embed_dim, hidden_dims_processed[0]))
         layers.append(activation_mod)
 
         for layer_index in range(len(hidden_dims_processed) - 1):
             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
-            layers.append(FiLM(film_num_input_channels, film_hiddens, hidden_dims_processed[layer_index + 1]))
+            layers.append(FiLM(self.film_embed_dim, hidden_dims_processed[layer_index + 1]))
             layers.append(activation_mod)
 
         # Add last layer
@@ -84,16 +79,34 @@ class MLP_FiLM(MLP):
         if last_activation_mod is not None:
             layers.append(last_activation_mod)
 
-        # Register the layers
-        for idx, layer in enumerate(layers):
-            self.add_module(f"{idx}", layer)
+        # Register the MLP layers separately so they don't mix with film_encoder.
+        self.layers = nn.ModuleList(layers)
 
     def forward(self, x: torch.Tensor, film_input: torch.Tensor) -> torch.Tensor:
-        for i, layer in enumerate(self):
-            if i == len(self) - 1:
+
+        film_embed = self.film_encoder(film_input)
+        for i, layer in enumerate(self.layers):
+            if i == len(self.layers) - 1:
                 self.last_features = x
             if isinstance(layer, FiLM):
-                x = layer(film_input, x)
+                x = layer(film_embed, x)
             else:
                 x = layer(x)
         return x
+
+    def init_weights(self, scales: float | tuple[float]) -> None:
+        def get_scale(idx: int) -> float:
+            return scales[idx] if isinstance(scales, (list, tuple)) else scales
+
+        for idx, module in enumerate(self.layers):
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=get_scale(idx))  # type: ignore[arg-type]
+                nn.init.zeros_(module.bias)
+
+    def get_features(self) -> torch.Tensor:
+        if getattr(self, "last_features", None) is None:
+            raise ValueError("No features have been computed yet. Call forward() first, or make sure your forward() method caches features")
+        return self.last_features
+
+    def __getitem__(self, idx):
+        raise RuntimeError("Runing through a sliced version of MLP_FiLM is not supported. Use the forward() method instead.")

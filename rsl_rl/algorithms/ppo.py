@@ -46,6 +46,7 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        weight_decay: float = 0.0,
     ) -> None:
         # Device-related parameters
         self.device = device
@@ -101,7 +102,7 @@ class PPO:
         self.policy.to(self.device)
 
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
