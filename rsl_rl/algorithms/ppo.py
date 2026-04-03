@@ -229,7 +229,8 @@ class PPO:
             original_batch_size = obs_batch.batch_size[0]
 
             policy_obs_batch = {"policy": policy_obs_batch}
-            if self.policy.film_obs_key is not None:
+            actor_uses_film = getattr(self.policy, "actor_uses_film", self.policy.film_obs_key is not None)
+            if actor_uses_film:
                 policy_obs_batch[self.policy.film_obs_key] = obs_batch[self.policy.film_obs_key] # type: ignore
 
             # Check if we should normalize advantages per mini batch

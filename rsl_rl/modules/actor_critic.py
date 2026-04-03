@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch.distributions import Normal, Distribution, constraints
-from typing import Any, NoReturn, Optional
+from typing import Any, Literal, NoReturn, Optional
 
 from rsl_rl.networks import MLP, EmpiricalNormalization, MLP_FiLM
 from rsl_rl.modules.actor_critic_recurrent import ResNetEncoder
@@ -159,6 +159,7 @@ class ActorCritic(nn.Module):
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
         film_obs_key: str | None = None,
+        film_application_mode: Literal["actor", "critic", "both"] = "actor",
         film_hiddens: list[int] = [256],
         **kwargs: dict[str, Any],
     ) -> None:
@@ -196,15 +197,26 @@ class ActorCritic(nn.Module):
         add_actor_params = {}
 
         self.film_obs_key = film_obs_key
+        valid_film_modes = {"actor", "critic", "both"}
+        if film_application_mode not in valid_film_modes:
+            raise ValueError(
+                f"Unknown FiLM application mode: {film_application_mode}. "
+                "Should be one of {'actor', 'critic', 'both'}."
+            )
+        self.film_application_mode = film_application_mode
+        self.actor_uses_film = self.film_obs_key is not None and self.film_application_mode in {"actor", "both"}
+        self.critic_uses_film = self.film_obs_key is not None and self.film_application_mode in {"critic", "both"}
+
         actor_network_class = MLP
-        # does the critic also need a film setting?
-        self.film_obs_normalization = self.film_obs_key is not None
-        if self.film_obs_key is not None:
+        if self.actor_uses_film:
             film_num_input_channels = obs[self.film_obs_key].shape[-1]
             add_actor_params["film_num_input_channels"] = film_num_input_channels
             add_actor_params["film_hiddens"] = film_hiddens
             actor_network_class = MLP_FiLM
 
+        self.film_obs_normalization = self.actor_uses_film or self.critic_uses_film
+        if self.film_obs_normalization:
+            film_num_input_channels = obs[self.film_obs_key].shape[-1]
             self.film_obs_normalizer = EmpiricalNormalization(film_num_input_channels)
 
         # Actor
@@ -223,7 +235,17 @@ class ActorCritic(nn.Module):
 
 
         # Critic
-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
+        if self.critic_uses_film:
+            self.critic = MLP_FiLM(
+                input_dim=num_critic_obs,
+                output_dim=1,
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                film_num_input_channels=obs[self.film_obs_key].shape[-1],
+                film_hiddens=film_hiddens,
+            )
+        else:
+            self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization
@@ -339,9 +361,8 @@ class ActorCritic(nn.Module):
         return obs
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
-        obs = self.get_critic_obs(obs)
-        obs = self.critic_obs_normalizer(obs)
-        return self.critic(obs)
+        obs = self.resolve_critic_obs(obs)
+        return self.critic(**obs)
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         # return torch.cat(obs_list, dim=-1)
@@ -353,7 +374,18 @@ class ActorCritic(nn.Module):
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic"]]
         return torch.cat(obs_list, dim=-1)
     
+    def resolve_critic_obs(self, obs: TensorDict) -> dict[str, TensorDict]:
+        critic_obs = self.get_critic_obs(obs)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
+        if self.critic_uses_film:
+            film_obs = self.get_film_obs(obs)
+            film_obs = self.film_obs_normalizer(film_obs)
+            return {"x": critic_obs, "film_input": film_obs}
+        return {"x": critic_obs}
+
     def get_film_obs(self, obs: TensorDict) -> torch.Tensor:
+        if self.film_obs_key is None:
+            raise ValueError("Requested FiLM observations, but `film_obs_key` is not set.")
         film_obs = obs[self.film_obs_key]
         return film_obs
 
