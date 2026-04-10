@@ -161,6 +161,8 @@ class ActorCritic(nn.Module):
         film_obs_key: str | None = None,
         film_application_mode: Literal["actor", "critic", "both"] = "actor",
         film_hiddens: list[int] = [256],
+        privileged_obs_encoder_dims: list[int] = [128],
+        use_privileged_obs_encoder: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -173,6 +175,8 @@ class ActorCritic(nn.Module):
         # We assume that any 4D (num_envs, 3, H, W) observations are image observations
         create_obs_encoder = False
         self.obs_groups = obs_groups
+        self.use_privileged_obs_encoder = use_privileged_obs_encoder and "privileged_info" in obs.keys()
+        self.privileged_obs_encoder: nn.Module | None = None
         num_actor_obs = 0
         for obs_group in obs_groups["policy"]:
             # assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
@@ -183,6 +187,22 @@ class ActorCritic(nn.Module):
                 else:
                     obs_dim = obs[obs_group][key].shape[-1]
                 num_actor_obs += obs_dim
+        if self.use_privileged_obs_encoder:
+            privileged_obs = obs["privileged_info"]
+            if isinstance(privileged_obs, TensorDict):
+                privileged_obs_dim = sum(privileged_obs[key].shape[-1] for key in privileged_obs.keys())
+            else:
+                privileged_obs_dim = privileged_obs.shape[-1]
+            privileged_latent_dim = privileged_obs_encoder_dims[-1]
+            self.privileged_obs_encoder = MLP(
+                input_dim=privileged_obs_dim,
+                output_dim=privileged_latent_dim,
+                hidden_dims=privileged_obs_encoder_dims[:-1],
+                activation=activation,
+            )
+            num_actor_obs += privileged_latent_dim
+            print(f"Privileged obs encoder: {self.privileged_obs_encoder}")
+            print(f"Created privileged obs encoder. New actor obs dim: {num_actor_obs}")
         num_critic_obs = 0
         for obs_group in obs_groups["critic"]:
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module's critic only supports 1D observations."
@@ -368,6 +388,13 @@ class ActorCritic(nn.Module):
         # return torch.cat(obs_list, dim=-1)
         policy_obs : TensorDict = obs["policy"] # type: ignore
         features = [self.obs_encoder(policy_obs[key]) if len(policy_obs[key].shape) > 3 else policy_obs[key] for key in policy_obs.keys()]
+        if self.use_privileged_obs_encoder:
+            privileged_obs = obs["privileged_info"]
+            if isinstance(privileged_obs, TensorDict):
+                privileged_obs = torch.cat([privileged_obs[key] for key in privileged_obs.keys()], dim=-1)
+            if self.privileged_obs_encoder is None:
+                raise RuntimeError("Privileged observation encoder is enabled but was not initialized.")
+            features.append(self.privileged_obs_encoder(privileged_obs))
         return torch.cat(features, dim=-1)
 
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
