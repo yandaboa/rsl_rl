@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from functools import reduce
 from collections import OrderedDict
-
 from rsl_rl.utils import resolve_nn_activation
 
 
@@ -76,6 +75,8 @@ class MLP(nn.Sequential):
         # Register the layers
         for idx, layer in enumerate(layers):
             self.add_module(f"{idx}", layer)
+        self._num_layers = len(layers)
+        self.last_features = torch.empty(0)
 
     def init_weights(self, scales: float | tuple[float]) -> None:
         """Initialize the weights of the MLP.
@@ -105,13 +106,13 @@ class MLP(nn.Sequential):
             x: Input tensor.
         """
         for i, layer in enumerate(self):
-            if i == len(self) - 1:
+            if i == self._num_layers - 1:
                 self.last_features = x
             x = layer(x)
         return x
     
     def get_features(self) -> torch.Tensor:
-        if getattr(self, "last_features", None) is None:
+        if self.last_features.numel() == 0:
             raise ValueError("No features have been computed yet. Call forward() first, or make sure your forward() method caches features")
         return self.last_features
 
