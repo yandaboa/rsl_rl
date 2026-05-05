@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .ppo import PPO
 from .bc_ppo import BCPPO
+from .diversity_ppo import DiversityPPO
 
-__all__ = ["PPO", "Distillation", "BCPPO"]
+__all__ = ["PPO", "Distillation", "BCPPO", "DiversityPPO"]
