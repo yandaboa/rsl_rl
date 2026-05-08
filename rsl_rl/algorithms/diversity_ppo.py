@@ -200,15 +200,29 @@ class DiversityPPO(PPO):
         s_next = disc_obs[1:].reshape(-1, disc_obs.shape[-1])
         z_next = labels[1:].reshape(-1)
 
-        # Drop pairs where step t was a terminal — s_{t+1} is then a fresh reset state the
-        # policy didn't drive into existence, so we don't want the discriminator learning from
-        # initial-state distributions.
-        prev_dones = self.storage.dones[:-1].reshape(-1).bool()  # True == previous step ended
-        keep = ~prev_dones
-        s_next = s_next[keep]
-        z_next = z_next[keep]
-        if s_next.numel() == 0:
-            return None
+        # We mask out two kinds of pairs:
+        #  - step t was terminal -> s_{t+1} is a fresh reset state the policy didn't drive,
+        #  - the post-success latch was already True at step t -> the policy was free to do
+        #    whatever after the task was solved, so those transitions don't reflect skill-
+        #    conditioned behaviour.
+        # We *do not* drop them — under DDP every rank must call the same number of
+        # all-reduces in lockstep, and filtering would give each rank a different batch size
+        # and minibatch count. Instead we compute a per-sample weight and use a weighted CE
+        # loss; masked samples contribute zero gradient.
+        prev_dones = self.storage.dones[:-1].reshape(-1).bool()
+        if (
+            "diversity_meta" in self.storage.observations.keys()
+            and self.storage.observations["diversity_meta"].shape[-1] >= 1
+        ):
+            prev_latch = (
+                self.storage.observations["diversity_meta"][:-1, ..., 0].reshape(-1).bool()
+            )
+        else:
+            prev_latch = torch.zeros_like(prev_dones)
+        sample_weight = ((~prev_dones) & (~prev_latch)).float()
+        # Note: do NOT early-return when sample_weight is all-zero on this rank; the other
+        # ranks will keep all-reducing and the comm will deadlock. The weighted loss handles
+        # the all-zero case naturally (grads = 0).
 
         cfg = self.disc_cfg
         num_epochs = max(1, int(cfg.get("num_learning_epochs", 4)))
@@ -217,24 +231,36 @@ class DiversityPPO(PPO):
         label_smoothing = float(cfg.get("label_smoothing", 0.0))
 
         # Update the discriminator's input normalizer with one full pass over the batch.
+        # Only feed in unmasked samples so the running mean/var reflects the policy-driven
+        # state distribution (skipping reset / post-success states).
         with torch.no_grad():
-            self.discriminator.update_normalization(s_next)
+            unmasked = sample_weight.bool()
+            if unmasked.any():
+                self.discriminator.update_normalization(s_next[unmasked])
 
+        # Crucially: every rank runs exactly the same number of inner steps and all-reduces,
+        # regardless of how many samples are masked out on each rank — otherwise NCCL
+        # all-reduce deadlocks.
         batch_size = s_next.shape[0]
         mb_size = max(1, batch_size // num_minibatches)
-        n_mb = (batch_size + mb_size - 1) // mb_size
+        n_mb = max(1, batch_size // mb_size)
 
         total_loss = 0.0
         total_acc = 0.0
-        total_count = 0
+        total_weight = 0.0
         for _ in range(num_epochs):
             perm = torch.randperm(batch_size, device=self.device)
             for i in range(n_mb):
                 idx = perm[i * mb_size : (i + 1) * mb_size]
-                if idx.numel() == 0:
-                    continue
                 logits = self.discriminator(s_next[idx])
-                loss = F.cross_entropy(logits, z_next[idx], label_smoothing=label_smoothing)
+                per_sample_loss = F.cross_entropy(
+                    logits, z_next[idx], label_smoothing=label_smoothing, reduction="none"
+                )
+                w = sample_weight[idx]
+                # Weighted CE: gradient direction is the unweighted CE on retained samples;
+                # masked samples (w == 0) contribute zero loss and zero grad.
+                denom = w.sum().clamp_min(1.0)
+                loss = (per_sample_loss * w).sum() / denom
 
                 self.discriminator_optimizer.zero_grad()
                 loss.backward()
@@ -244,16 +270,22 @@ class DiversityPPO(PPO):
                 self.discriminator_optimizer.step()
 
                 with torch.no_grad():
-                    acc = (logits.argmax(dim=-1) == z_next[idx]).float().mean().item()
-                total_loss += loss.item() * idx.numel()
-                total_acc += acc * idx.numel()
-                total_count += idx.numel()
+                    correct = (logits.argmax(dim=-1) == z_next[idx]).float()
+                    acc_w = (correct * w).sum().item()
+                    weight_sum = w.sum().item()
+                total_loss += loss.item() * weight_sum
+                total_acc += acc_w
+                total_weight += weight_sum
 
-        if total_count == 0:
-            return None
+        if total_weight == 0:
+            return {
+                "discriminator_loss": 0.0,
+                "discriminator_accuracy": 0.0,
+                "discriminator_chance": 1.0 / max(1, self.num_skills),
+            }
         return {
-            "discriminator_loss": total_loss / total_count,
-            "discriminator_accuracy": total_acc / total_count,
+            "discriminator_loss": total_loss / total_weight,
+            "discriminator_accuracy": total_acc / total_weight,
             "discriminator_chance": 1.0 / max(1, self.num_skills),
         }
 
