@@ -306,15 +306,35 @@ class OnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
+    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None, strict: bool = True) -> dict:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
+        # When strict=False, pad or truncate size-mismatched tensors to match the
+        # current model shape so torch's load_state_dict doesn't error on them.
+        if not strict:
+            current_sd = self.alg.policy.state_dict()
+            ckpt_sd = loaded_dict["model_state_dict"]
+            for key, current_val in current_sd.items():
+                if key not in ckpt_sd:
+                    continue
+                ckpt_val = ckpt_sd[key]
+                if ckpt_val.shape == current_val.shape:
+                    continue
+                # Shapes differ: create a zero tensor of the current shape, then
+                # copy as much of the checkpoint data as fits.
+                new_val = torch.zeros_like(current_val)
+                slices = tuple(slice(0, min(c, k)) for c, k in zip(current_val.shape, ckpt_val.shape))
+                new_val[slices] = ckpt_val[slices]
+                ckpt_sd[key] = new_val
+                print(f"[runner.load] shape mismatch for '{key}': {ckpt_val.shape} -> {current_val.shape}, padded with zeros")
+            loaded_dict["model_state_dict"] = ckpt_sd
         # Load model
-        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"], strict=strict)
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-        # Load optimizer if used
-        if load_optimizer and resumed_training:
+        # Load optimizer if used (skip when strict=False: optimizer state shapes
+        # would mismatch any padded/truncated parameters, causing errors at first step)
+        if load_optimizer and resumed_training and strict:
             # Algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             # RND optimizer if used

@@ -199,6 +199,14 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # Probability-ratio diagnostics (per-minibatch reductions of
+        # ratio = exp(new_logp - old_logp)). Mean/std/clip_frac are averaged
+        # over minibatches; min/max are taken over all minibatches.
+        mean_ratio = 0.0
+        mean_ratio_std = 0.0
+        mean_ratio_clip_frac = 0.0
+        ratio_min = float("inf")
+        ratio_max = float("-inf")
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -299,6 +307,19 @@ class PPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
+            # Probability-ratio diagnostics
+            with torch.no_grad():
+                flat_ratio = ratio.detach().reshape(-1)
+                mean_ratio += flat_ratio.mean().item()
+                mean_ratio_std += flat_ratio.std().item()
+                mean_ratio_clip_frac += ((flat_ratio - 1.0).abs() > self.clip_param).float().mean().item()
+                batch_min = flat_ratio.min().item()
+                batch_max = flat_ratio.max().item()
+                if batch_min < ratio_min:
+                    ratio_min = batch_min
+                if batch_max > ratio_max:
+                    ratio_max = batch_max
+
             # Value function loss
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
@@ -395,6 +416,9 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_ratio /= num_updates
+        mean_ratio_std /= num_updates
+        mean_ratio_clip_frac /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -408,6 +432,11 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "ratio_mean": mean_ratio,
+            "ratio_std": mean_ratio_std,
+            "ratio_min": ratio_min,
+            "ratio_max": ratio_max,
+            "ratio_clip_frac": mean_ratio_clip_frac,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
