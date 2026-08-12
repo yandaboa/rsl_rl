@@ -30,7 +30,13 @@ T_EPISODE = 6  # small T so the tests stay fast; the shapes are the same at T = 
 NUM_MEMORY = 3
 
 
-def _make_policy(attention_window: int | None = None, seed: int = 0) -> ActorCriticTrialMemory:
+def _make_policy(
+    attention_window: int | None = None,
+    seed: int = 0,
+    noise_std_type: str = "scalar",
+    init_noise_std: float = 1.0,
+    perturb: bool = True,
+) -> ActorCriticTrialMemory:
     """A small float64 policy. Double precision makes "tight tolerance" mean something."""
     torch.manual_seed(seed)
     sample_obs = TensorDict({"policy": torch.zeros(NUM_ENVS, OBS_DIM)}, batch_size=[NUM_ENVS], device=DEVICE)
@@ -47,11 +53,15 @@ def _make_policy(attention_window: int | None = None, seed: int = 0) -> ActorCri
         ff_mult=2,
         actor_hidden_dims=[16],
         critic_hidden_dims=[16],
+        noise_std_type=noise_std_type,
+        init_noise_std=init_noise_std,
     )
     # Randomize the LayerNorms so that they are not the identity and the test can actually see a difference.
-    for parameter in policy.parameters():
-        with torch.no_grad():
-            parameter.add_(0.1 * torch.randn_like(parameter))
+    # (``perturb=False`` keeps the fresh init, which the gSDE effective-std identity is stated against.)
+    if perturb:
+        for parameter in policy.parameters():
+            with torch.no_grad():
+                parameter.add_(0.1 * torch.randn_like(parameter))
     return policy.double().eval()
 
 
@@ -83,6 +93,52 @@ def _roll_incrementally(policy: ActorCriticTrialMemory, episode: dict[str, torch
             )
         )
     return torch.stack(hidden)
+
+
+def _roll_incrementally_with_distribution(
+    policy: ActorCriticTrialMemory, episode: dict[str, torch.Tensor], actions: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Acting path, but also reading off the action distribution at every step.
+
+    This is exactly what ``act`` does (``forward_step`` -> ``_update_distribution``), only with the sampled action
+    replaced by a fixed one so that the log-probs are comparable against the batched path.
+    """
+    num_steps = episode["obs"].shape[0]
+    policy.initialize_state(NUM_ENVS, DEVICE)
+    means, stds, log_probs, entropies = [], [], [], []
+    for step in range(num_steps):
+        hidden = policy.forward_step(
+            episode["obs"][step],
+            prev_actions=episode["prev_actions"][step],
+            prev_rewards=episode["prev_rewards"][step],
+            prev_dones=episode["prev_dones"][step],
+            commit=True,
+        )
+        policy.update_distribution_from_hidden(hidden)
+        means.append(policy.action_mean.clone())
+        stds.append(policy.action_std.clone())
+        entropies.append(policy.entropy.clone())
+        log_probs.append(policy.get_actions_log_prob(actions[step]).clone())
+    return {
+        "mean": torch.stack(means),
+        "std": torch.stack(stds),
+        "entropy": torch.stack(entropies),
+        "log_prob": torch.stack(log_probs),
+    }
+
+
+def _batched_distribution(
+    policy: ActorCriticTrialMemory, episode: dict[str, torch.Tensor], actions: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Run the PPO reconstruction path: one batched forward, then one distribution over ``[S, B, ...]``."""
+    hidden = _roll_batched(policy, episode)
+    policy.update_distribution_from_hidden(hidden)
+    return {
+        "mean": policy.action_mean.clone(),
+        "std": policy.action_std.clone(),
+        "entropy": policy.entropy.clone(),
+        "log_prob": policy.get_actions_log_prob(actions).clone(),
+    }
 
 
 def _roll_batched(
@@ -403,6 +459,132 @@ def test_attention_window_restricts_context() -> None:
     print(f"[ok] attention window: full={sensitivities['full']:.3e}, W=2={sensitivities['W=2']:.3e}")
 
 
+def test_gsde_incremental_matches_batched() -> None:
+    """Under gSDE the acting path and the batched reconstruction path must give the *same* distribution.
+
+    gSDE keys the std on ``h_t``, so a distribution mismatch is no longer just a mean mismatch -- it would also
+    corrupt the std and hence the PPO ratio. Tight tolerance, float64.
+    """
+    episode = _make_episode(T_EPISODE + 1, seed=11)
+    actions = _make_episode(T_EPISODE + 1, seed=12)["prev_actions"]  # arbitrary fixed actions [S, N, A]
+
+    for window, label in ((None, "full (W >= T)"), (3, "windowed (W = 3)")):
+        policy = _make_policy(attention_window=window, noise_std_type="gsde", init_noise_std=0.5)
+        assert policy.log_std.shape == (policy.d_model, ACTION_DIM), "gSDE log_std must be [d_model, num_actions]"
+        with torch.no_grad():
+            incremental = _roll_incrementally_with_distribution(policy, episode, actions)
+            batched = _batched_distribution(policy, episode, actions)
+
+        errors = {key: (incremental[key] - batched[key]).abs().max().item() for key in incremental}
+        assert incremental["std"].shape == (T_EPISODE + 1, NUM_ENVS, ACTION_DIM)
+        for key, error in errors.items():
+            assert error < 1e-10, f"gSDE {key} mismatch, {label}: {error:.3e}"
+
+        # Non-vacuous: the std really is state-dependent, otherwise this would just be testing a constant.
+        spread = incremental["std"].std(dim=(0, 1)).max().item()
+        assert spread > 1e-3, f"gSDE std is effectively constant ({spread:.3e}); the test would be vacuous"
+        print(
+            f"[ok] gSDE incremental == batched, {label}: max |d mean| = {errors['mean']:.3e},"
+            f" |d std| = {errors['std']:.3e}, |d logp| = {errors['log_prob']:.3e} (std spread {spread:.3e})"
+        )
+
+
+def test_gsde_log_prob_is_reproducible() -> None:
+    """Check the canary property: the same actions get the same log-prob on both paths.
+
+    Re-drawing the gSDE exploration matrix in between must not move it either: the exploration matrix feeds only
+    ``get_noise``, while the density comes from ``sqrt(h_t^2 @ sigma^2)``. If
+    ``sample_weights`` could move a log-prob, every PPO ratio would be wrong the moment the weights were re-drawn.
+    """
+    policy = _make_policy(noise_std_type="gsde", init_noise_std=0.5, seed=2)
+    episode = _make_episode(T_EPISODE + 1, seed=13)
+    actions = _make_episode(T_EPISODE + 1, seed=14)["prev_actions"]
+
+    with torch.no_grad():
+        acted = _roll_incrementally_with_distribution(policy, episode, actions)["log_prob"]
+        # Re-draw the exploration matrix between "acting" and "learning", the worst case for the PPO ratio.
+        policy.distribution.sample_weights(policy.log_std)
+        reconstructed = _batched_distribution(policy, episode, actions)["log_prob"]
+        # ... and once more through the acting path, to show the acting path itself is deterministic in log_prob.
+        acted_again = _roll_incrementally_with_distribution(policy, episode, actions)["log_prob"]
+
+    ratio_error = (torch.exp(reconstructed - acted) - 1.0).abs().max().item()
+    assert (reconstructed - acted).abs().max().item() < 1e-10, "log-probs drifted across the two paths"
+    assert torch.equal(acted, acted_again), "the acting path's log_prob is not reproducible"
+    assert ratio_error < 1e-9, f"epoch-0 PPO ratio would be {1.0 + ratio_error:.9f}, not 1"
+    assert acted.abs().sum().item() > 0.0, "all log-probs are zero; the test would be vacuous"
+    print(f"[ok] gSDE log_prob reproducible across paths and across sample_weights: |ratio - 1| = {ratio_error:.3e}")
+
+
+def test_gsde_effective_std_scaling() -> None:
+    """Check the scaling documented by ``calibrate_gsde_init.py``.
+
+    The realized action std is ``init_noise_std * ||phi||``, and for a fresh readout LayerNorm
+    ``||phi|| = sqrt(d_model)``. Here ``phi`` is ``h_t`` (the ``final_norm`` output).
+    """
+    episode = _make_episode(1, seed=15)
+    measured = {}
+    for init_noise_std in (1.0, 0.1):
+        policy = _make_policy(noise_std_type="gsde", init_noise_std=init_noise_std, perturb=False)
+        policy.initialize_state(NUM_ENVS, DEVICE)
+        with torch.no_grad():
+            hidden = policy.forward_step(episode["obs"][0], prev_actions=episode["prev_actions"][0])
+            policy.update_distribution_from_hidden(hidden)
+            std = policy.action_std
+            feature_norm = hidden.norm(dim=-1)
+
+        # Exact identity (all sigma equal at init): std_j = sigma * ||h||, up to the distribution's 1e-6 epsilon.
+        exact = init_noise_std * feature_norm.unsqueeze(-1).expand_as(std)
+        exact_error = ((std - exact).abs() / exact).max().item()
+        assert exact_error < 1e-5, f"std != init * ||h||: relative error {exact_error:.3e}"
+
+        # ... and for a fresh final_norm, ||h|| == sqrt(d_model), i.e. the sqrt(d_model) amplification the
+        # calibration script warns about (a naive init of 1.0 does NOT give an effective std of 1.0).
+        reference = policy.d_model**0.5
+        norm_error = (feature_norm / reference - 1.0).abs().max().item()
+        assert norm_error < 0.02, f"||h|| = {feature_norm.mean().item():.3f} != sqrt(d_model) = {reference:.3f}"
+        measured[init_noise_std] = std.mean().item()
+        print(
+            f"[ok] gSDE effective std: init={init_noise_std} -> std={std.mean().item():.4f}"
+            f" (= init * ||h||, ||h|| = {feature_norm.mean().item():.3f} vs sqrt(d_model) = {reference:.3f})"
+        )
+
+    # The amplification is linear in init_noise_std, so calibration is a single division.
+    assert abs(measured[1.0] / measured[0.1] - 10.0) < 1e-3, "effective std is not linear in init_noise_std"
+    assert abs(measured[1.0] / 32**0.5 - 1.0) < 0.02, "init_noise_std=1.0 must give ~sqrt(d_model), not ~1.0"
+
+
+def test_gsde_checkpoint_type_mismatch_fails_loudly() -> None:
+    """A checkpoint saved under one noise type must not load silently into another (the shapes differ)."""
+    scalar_policy = _make_policy()
+    gsde_policy = _make_policy(noise_std_type="gsde")
+    log_policy = _make_policy(noise_std_type="log")
+
+    for source, target, label in (
+        (scalar_policy, gsde_policy, "scalar -> gsde"),
+        (gsde_policy, scalar_policy, "gsde -> scalar"),
+        (gsde_policy, log_policy, "gsde -> log"),
+        (log_policy, gsde_policy, "log -> gsde"),
+    ):
+        for strict in (True, False):
+            try:
+                target.load_state_dict(source.state_dict(), strict=strict)
+            except ValueError:
+                continue
+            raise AssertionError(f"{label} (strict={strict}) loaded silently instead of raising")
+
+    # The matching case still works, and re-arms the gSDE distribution.
+    reloaded = _make_policy(noise_std_type="gsde", seed=5)
+    reloaded.load_state_dict(gsde_policy.state_dict())
+    assert torch.equal(reloaded.log_std, gsde_policy.log_std)
+    episode = _make_episode(1, seed=16)
+    reloaded.initialize_state(NUM_ENVS, DEVICE)
+    with torch.no_grad():
+        actions = reloaded.act(TensorDict({"policy": episode["obs"][0]}, batch_size=[NUM_ENVS], device=DEVICE))
+    assert actions.shape == (NUM_ENVS, ACTION_DIM) and torch.isfinite(actions).all()
+    print("[ok] mismatched noise_std_type checkpoints raise; a matching gSDE checkpoint reloads and acts")
+
+
 def test_design_doc_defaults() -> None:
     """The documented configuration (d=256, L=4, heads=8, M=8, W >= T, T=80) instantiates and runs."""
     sample_obs = TensorDict({"policy": torch.zeros(2, 43)}, batch_size=[2], device=DEVICE)
@@ -444,5 +626,9 @@ if __name__ == "__main__":
     test_tensordict_obs_and_action_api()
     test_terminal_token_for_a_subset_of_envs()
     test_attention_window_restricts_context()
+    test_gsde_incremental_matches_batched()
+    test_gsde_log_prob_is_reproducible()
+    test_gsde_effective_std_scaling()
+    test_gsde_checkpoint_type_mismatch_fails_loudly()
     test_design_doc_defaults()
     print("all trial-memory policy tests passed")

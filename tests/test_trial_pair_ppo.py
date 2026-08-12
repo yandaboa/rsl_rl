@@ -182,6 +182,8 @@ def test_gradient_routing() -> None:
 
     # Make the stored observations differentiable leaves: their gradients tell us exactly which episode's trunk
     # the loss reached. (Parameters are shared across episodes, so a parameter gradient could not distinguish.)
+    # The rollout sits *after* the carry region, which is empty here but still offsets every row index.
+    carry = ppo.storage.carry_steps
     observations = ppo.storage.observations["policy"]
     observations.requires_grad_(True)
 
@@ -195,7 +197,10 @@ def test_gradient_routing() -> None:
 
     grad = observations.grad
     assert grad is not None, "no gradient reached the stored observations at all"
-    episode_grad = [grad[episode * T_EPISODE : (episode + 1) * T_EPISODE].abs().sum().item() for episode in range(K)]
+    episode_grad = [
+        grad[carry + episode * T_EPISODE : carry + (episode + 1) * T_EPISODE].abs().sum().item()
+        for episode in range(K)
+    ]
 
     assert episode_grad[2] > 0.0, "the target episode's own trunk received no gradient"
     assert episode_grad[1] > 0.0, "the loss did not reach the SOURCE episode's trunk through the memory writer"
@@ -218,7 +223,9 @@ def test_gradient_routing() -> None:
     assert policy.z_init.grad is not None and policy.z_init.grad.abs().sum().item() > 0.0, (
         "the degenerate (None, t1) pair must still train Z_init"
     )
-    assert observations.grad[T_EPISODE:].abs().sum().item() == 0.0, "the first episode's loss reached later episodes"
+    assert observations.grad[carry + T_EPISODE :].abs().sum().item() == 0.0, (
+        "the first episode's loss reached later episodes"
+    )
 
     print(
         f"[ok] gradient routing: |g| per episode = "
@@ -272,7 +279,8 @@ def test_desynchronized_environments() -> None:
     time_outs[:, 0] = dones[:, 0]
 
     # env 1: an "abnormal_robot" terminal at step 1 (a real terminal, so no timeout bootstrap) ends the trial
-    # early; the trial that starts at step 2 is still open when the rollout ends and must be dropped.
+    # early; the trial that starts at step 2 is still open when the rollout ends and must be DEFERRED -- kept
+    # in the buffer for the next rollout, not thrown away.
     dones[1, 1] = True
     trial_dones[1, 1] = True
     dones[7, 1] = True
@@ -280,25 +288,31 @@ def test_desynchronized_environments() -> None:
 
     policy = _make_policy(num_envs, seed=13)
     ppo = _make_ppo(policy, num_envs, T_TRIAL)
+    carry = ppo.storage.carry_steps
+    assert carry == T_TRIAL, "the trial-memory path must reserve a carry region by default"
     _collect(ppo, num_envs, dones, trial_dones, time_outs, seed=17)
 
     index = ppo.storage.build_trial_pairs()
     assert index["num_pairs"] == K + 1, f"expected {K + 1} pairs (env 0's trial + env 1's short trial)"
-    assert index["dropped_episodes"] == 3 and index["dropped_trials"] == 1 and index["dropped_envs"] == 1, (
-        f"dropped accounting wrong: {index['dropped_episodes']} eps / {index['dropped_trials']} trials"
-        f" / {index['dropped_envs']} envs"
+    assert index["dropped_episodes"] == 0 and index["dropped_trials"] == 0, (
+        f"nothing may be dropped: {index['dropped_episodes']} eps / {index['dropped_trials']} trials"
     )
+    assert index["deferred_trials"] == 1 and index["deferred_episodes"] == 3, (
+        f"env 1's open trial must be deferred, got {index['deferred_trials']} trials"
+    )
+    assert index["envs_without_data"] == 0
     assert index["ep_env"].tolist() == [0, 0, 0, 1]
-    assert index["ep_start"].tolist() == [0, T_EPISODE, 2 * T_EPISODE, 0]
+    assert index["ep_start"].tolist() == [carry, carry + T_EPISODE, carry + 2 * T_EPISODE, carry]
     assert index["ep_len"].tolist() == [T_EPISODE, T_EPISODE, T_EPISODE, 2]
     assert index["ep_pos"].tolist() == [0, 1, 2, 0], "env 1's short trial must start a fresh trial at position 0"
+    assert index["ep_lag"].tolist() == [0, 0, 0, 0], "everything here was collected under the current policy"
 
     # The pairing must connect the right spans: the source of env 0's second episode is its first episode.
     batch = next(ppo.storage.trial_pair_mini_batch_generator(policy, num_mini_batches=1, num_epochs=1))
     column = int((batch["episode_ids"] == 1).nonzero(as_tuple=False)[0, 0].item())
     slot = int((batch["source_slots"] == column).nonzero(as_tuple=False)[0, 0].item())
     source_obs = batch["source"]["obs"]["policy"][:, slot]
-    stored = ppo.storage.observations["policy"][:T_EPISODE, 0]
+    stored = ppo.storage.observations["policy"][carry : carry + T_EPISODE, 0]
     assert torch.equal(source_obs[:T_EPISODE], stored), "the source episode does not carry env 0's first episode"
     # Source sequences carry T + 1 tokens (the terminal token) whose observation slot is zeros by default.
     assert source_obs.shape[0] == T_EPISODE + 1
@@ -314,11 +328,18 @@ def test_desynchronized_environments() -> None:
     assert int(batch["target"]["loss_mask"][:, env1_column].sum().item()) == 2
 
     # ... and PPO still runs end to end on the ragged rollout
+    deferred_obs = ppo.storage.observations["policy"][carry + 2 : carry + T_TRIAL, 1].clone()
     loss_dict = ppo.update()
     assert abs(loss_dict["ratio_mean"] - 1.0) < 1e-4, f"ratio_mean = {loss_dict['ratio_mean']} on a ragged rollout"
-    # After the update the storage rolls the trial phase forward: env 0 closed its trial, env 1 did not.
-    assert ppo.storage.at_trial_start.tolist() == [True, False]
-    print("[ok] desynchronized environments: 4 pairs kept, 3 episodes in 1 open trial dropped, spans correct")
+    assert loss_dict["pool_dropped_episodes"] == 0.0 and loss_dict["pool_envs_without_data"] == 0.0
+
+    # After the update the storage carried env 1's open trial (steps 2..17) into the carry region, and env 0 --
+    # which closed its trial exactly at the rollout end -- carried nothing.
+    assert ppo.storage.carry_len.tolist() == [0, T_TRIAL - 2]
+    assert ppo.storage.at_trial_start.tolist() == [True, True]
+    kept = ppo.storage.observations["policy"][carry - (T_TRIAL - 2) : carry, 1]
+    assert torch.equal(kept, deferred_obs), "the deferred trial's observations did not survive the roll-over"
+    print("[ok] desynchronized environments: 4 pairs kept, env 1's open trial deferred (not dropped), spans correct")
 
 
 if __name__ == "__main__":

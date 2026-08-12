@@ -5,16 +5,29 @@
 
 from __future__ import annotations
 
+import contextlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticTrialMemory
+from rsl_rl.modules.actor_critic import upcast_from_half
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
+
+# Accepted spellings of the mixed-precision dtype, see :class:`PPO`'s ``amp_dtype``.
+_AMP_DTYPES: dict[str, torch.dtype] = {
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "half": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def _zeros_like_obs(obs: TensorDict | torch.Tensor) -> TensorDict | torch.Tensor:
@@ -51,7 +64,10 @@ class PPO:
         # Trial-memory parameters (only used when the policy is an ActorCriticTrialMemory)
         trial_memory_sweep_chunk_size: int | None = None,
         trial_memory_cache_dtype: str | None = None,
+        trial_carry_steps: int | None = None,
+        max_policy_lag: int = 1,
         terminal_obs_key: str | None = None,
+        amp_dtype: str | None = None,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -143,6 +159,13 @@ class PPO:
         #   generator splits on episode dones and would be wrong here (it knows nothing about trials or pairs).
         self.is_trial_memory = isinstance(policy, ActorCriticTrialMemory)
         self.trial_memory_sweep_chunk_size = trial_memory_sweep_chunk_size
+        # Rows reserved for a trial that is still open when a rollout ends, so that it is carried into the
+        # next rollout instead of being thrown away (see RolloutStorage's ``carry_steps``). ``None`` (or any
+        # negative value, which is how a config that cannot express None spells it) means one full rollout,
+        # covering any trial no longer than the rollout itself. Only used for trial memory: with one episode
+        # per trial there is nothing to carry that PPO could still use.
+        self.trial_carry_steps = None if trial_carry_steps is None or trial_carry_steps < 0 else trial_carry_steps
+        self.max_policy_lag = int(max_policy_lag)
         self.trial_memory_cache_dtype = (
             None if trial_memory_cache_dtype is None else getattr(torch, trial_memory_cache_dtype)
         )
@@ -158,6 +181,66 @@ class PPO:
             ):
                 raise ValueError("Symmetry augmentation is not supported for the trial-memory policy.")
 
+        # Mixed precision (opt-in, trial-memory update only). ``None`` keeps the fp32 path bit-for-bit.
+        # The activation memory of the pair update is what forces this: at 16k envs the trunk activations are
+        # ~80 GB in fp32 at 8 minibatches (design doc section 7); fp16 halves that and is what makes 4 viable.
+        self.amp_dtype = self._resolve_amp_dtype(amp_dtype)
+        self._amp_device_type = torch.device(self.device).type
+        # fp16 needs loss scaling (its gradients underflow); bf16 has fp32's exponent range and does not.
+        # The scaler is CUDA-only here -- CPU fp16 autocast exists but is a debug path, not a training one.
+        scaler_enabled = self.amp_dtype == torch.float16 and self._amp_device_type == "cuda"
+        self.grad_scaler = torch.amp.GradScaler(self._amp_device_type) if scaler_enabled else None
+        if self.amp_dtype is not None and not self.is_trial_memory:
+            raise ValueError(
+                "amp_dtype is only implemented for the trial-memory (episode-pair) update; the flat PPO path"
+                " would silently keep running in fp32."
+            )
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Mixed precision helpers
+    # ----------------------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_amp_dtype(amp_dtype: str | torch.dtype | None) -> torch.dtype | None:
+        """Map the ``amp_dtype`` argument to a torch dtype (``None`` == full precision)."""
+        if amp_dtype is None:
+            return None
+        if isinstance(amp_dtype, torch.dtype):
+            return None if amp_dtype == torch.float32 else amp_dtype
+        key = str(amp_dtype).lower()
+        if key in ("none", "fp32", "float32", ""):
+            return None
+        if key not in _AMP_DTYPES:
+            raise ValueError(f"Unknown amp_dtype '{amp_dtype}'. Expected one of {sorted(_AMP_DTYPES)} or None.")
+        return _AMP_DTYPES[key]
+
+    def _autocast(self) -> AbstractContextManager:
+        """Autocast context for the trial-memory forward passes.
+
+        Returns a genuine no-op when mixed precision is off, so that ``amp_dtype=None`` is numerically identical
+        to the code before this flag existed (an ``autocast(enabled=False)`` block would also *disable* any
+        enclosing autocast, which is a different statement).
+        """
+        if self.amp_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self._amp_device_type, dtype=self.amp_dtype)
+
+    def _autocast_generator(self, generator: Iterator[dict]) -> Iterator[dict]:
+        """Advance ``generator`` under autocast, yield outside of it.
+
+        The per-epoch ``no_grad`` memory sweep runs *inside* the pair generator (it is what the first ``next()``
+        of every epoch does), so this is the only way to put the sweep under autocast without reaching into
+        ``RolloutStorage``. Yielding outside the context keeps the caller's own autocast scoping explicit.
+        """
+        iterator = iter(generator)
+        while True:
+            with self._autocast():
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    return
+            yield batch
+
     def init_storage(
         self,
         training_type: str,
@@ -166,6 +249,12 @@ class PPO:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
     ) -> None:
+        # A trial is the training-data unit but a rollout is the collection unit, and the two do not divide
+        # each other once an environment terminates early. The carry region decouples them: an unfinished
+        # trial survives the rollout boundary instead of being discarded.
+        carry_steps = 0
+        if self.is_trial_memory:
+            carry_steps = num_transitions_per_env if self.trial_carry_steps is None else int(self.trial_carry_steps)
         # Create rollout storage
         self.storage = RolloutStorage(
             training_type,
@@ -174,6 +263,8 @@ class PPO:
             obs,
             actions_shape,
             self.device,
+            carry_steps=carry_steps,
+            max_policy_lag=self.max_policy_lag,
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
@@ -533,6 +624,7 @@ class PPO:
 
         # Clear the storage
         self.storage.clear()
+        self.storage.policy_version += 1
 
         # Construct the loss dictionary
         loss_dict = {
@@ -613,13 +705,29 @@ class PPO:
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
-        # Probability-ratio diagnostics -- the reconstruction canary of the design doc lives here
+        # Probability-ratio diagnostics -- the reconstruction canary of the design doc lives here.
+        # Note: the canary statement ("with unchanged parameters the ratio is 1") only holds for trials whose
+        #   behavior policy IS the current one. A trial carried across a rollout boundary was partly collected
+        #   under the previous policy, so its ratio is legitimately != 1 at epoch 0. Reporting one number over
+        #   both would make a healthy run look broken, so the lag-0 subset is measured separately and the
+        #   *_lag0 keys are the ones to read as the canary.
         mean_ratio = 0.0
         mean_ratio_std = 0.0
         mean_ratio_clip_frac = 0.0
         ratio_min = float("inf")
         ratio_max = float("-inf")
+        lag0_ratio_sum = 0.0
+        lag0_clip_frac_sum = 0.0
+        lag0_ratio_min = float("inf")
+        lag0_ratio_max = float("-inf")
+        lag0_batches = 0
+        # The canary proper: the very FIRST minibatch, on lag-0 pairs. It is the only point in the update at
+        # which the parameters are still exactly the ones that acted -- the optimizer steps after every
+        # minibatch, so even the rest of epoch 0 is already off-policy and its ratio is *supposed* to move.
+        first_batch_lag0_dev = 0.0
         num_updates = 0
+        # Snapshot the pool accounting before update() consumes and clears the storage
+        pool = dict(self.storage.build_trial_pairs())
 
         generator = self.storage.trial_pair_mini_batch_generator(
             self.policy,
@@ -629,18 +737,31 @@ class PPO:
             memory_dtype=self.trial_memory_cache_dtype,
         )
 
-        for batch in generator:
+        for batch in self._autocast_generator(generator):
             target = batch["target"]
-            hidden, _ = self.trial_pair_forward(batch)
+            # Autocast covers the memory-hungry part: the source recompute, the writer, the target recompute and
+            # the heads. Everything downstream of it is per-step scalars, so it is upcast to fp32 below -- that is
+            # both the AMP convention (losses in fp32, scaled) and what keeps the ratio diagnostics meaningful.
+            with self._autocast():
+                hidden, _ = self.trial_pair_forward(batch)
 
-            # Every quantity below lives on the target episode's acting steps only (no terminal token, no padding)
-            loss_mask = target["loss_mask"]
-            distribution = self.policy.update_distribution_from_hidden(hidden)
-            actions_log_prob = distribution.log_prob(target["actions"]).sum(dim=-1)[loss_mask]
-            entropy_batch = distribution.entropy().sum(dim=-1)[loss_mask]
-            mu_batch = distribution.mean[loss_mask]
-            sigma_batch = distribution.stddev[loss_mask]
-            value_batch = self.policy.value_from_hidden(hidden)[loss_mask]
+                # Every quantity below lives on the target episode's acting steps only (no terminal token,
+                # no padding)
+                loss_mask = target["loss_mask"]
+                distribution = self.policy.update_distribution_from_hidden(hidden)
+                actions_log_prob = distribution.log_prob(target["actions"]).sum(dim=-1)[loss_mask]
+                entropy_batch = distribution.entropy().sum(dim=-1)[loss_mask]
+                mu_batch = distribution.mean[loss_mask]
+                sigma_batch = distribution.stddev[loss_mask]
+                value_batch = self.policy.value_from_hidden(hidden)[loss_mask]
+
+            # Out of autocast: the loss arithmetic runs in fp32. The upcast is a no-op for anything that is not
+            # half precision, so the fp32 path (and the fp64 exactness tests) are unchanged.
+            actions_log_prob = upcast_from_half(actions_log_prob)
+            entropy_batch = upcast_from_half(entropy_batch)
+            mu_batch = upcast_from_half(mu_batch)
+            sigma_batch = upcast_from_half(sigma_batch)
+            value_batch = upcast_from_half(value_batch)
 
             # The PPO denominator is always the stored behavior log-prob; it is never recomputed.
             old_actions_log_prob_batch = target["old_actions_log_prob"][loss_mask].squeeze(-1)
@@ -654,7 +775,10 @@ class PPO:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
-            # Compute KL divergence and adapt the learning rate
+            # Compute KL divergence and adapt the learning rate.
+            # Note: fp32 by construction -- ``mu_batch``/``sigma_batch`` were upcast above. The KL drives the
+            #   learning rate, so it must not inherit fp16's ~1e-3 relative error (nor its exponent range: the
+            #   ratio sigma_new / sigma_old and the squares below can underflow in half precision).
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -698,6 +822,17 @@ class PPO:
                 mean_ratio_clip_frac += ((flat_ratio - 1.0).abs() > self.clip_param).float().mean().item()
                 ratio_min = min(ratio_min, flat_ratio.min().item())
                 ratio_max = max(ratio_max, flat_ratio.max().item())
+                # ... and the same, restricted to the fully on-policy trials (the actual canary)
+                lag0 = (batch["lags"] == 0).unsqueeze(0).expand_as(loss_mask)[loss_mask]
+                if bool(lag0.any()):
+                    lag0_ratio = flat_ratio[lag0]
+                    lag0_ratio_sum += lag0_ratio.mean().item()
+                    lag0_clip_frac_sum += ((lag0_ratio - 1.0).abs() > self.clip_param).float().mean().item()
+                    lag0_ratio_min = min(lag0_ratio_min, lag0_ratio.min().item())
+                    lag0_ratio_max = max(lag0_ratio_max, lag0_ratio.max().item())
+                    lag0_batches += 1
+                    if num_updates == 0:  # parameters still bit-identical to the ones that acted
+                        first_batch_lag0_dev = (lag0_ratio - 1.0).abs().max().item()
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -712,19 +847,37 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # Gradient step
+            # Gradient step.
+            # Order under fp16: backward on the SCALED loss -> (multi-GPU all-reduce, still scaled) ->
+            #   ``scaler.unscale_(optimizer)`` -> clip -> ``scaler.step``. The unscale MUST come before the clip:
+            #   clipping scaled gradients would compare a ~65536x inflated norm against ``max_grad_norm`` and clip
+            #   every step to a ~1/65536 effective threshold, which looks like "training just got slower" rather
+            #   than like a bug. Reducing while still scaled is fine and deliberate: the scale is one scalar shared
+            #   by all ranks, so averaging commutes with it, and a rank whose backward overflowed propagates the
+            #   inf to everyone, keeping the skip decision (and hence the scale) identical across ranks.
             self.optimizer.zero_grad()
-            loss.backward()
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
             if self.is_multi_gpu:
                 # Not every parameter is reached by every minibatch (Z_init is only trained by the degenerate
                 # pairs), and reduce_parameters() flattens exactly the parameters that have a gradient -- so
                 # ranks would disagree on the buffer layout. Materialize the missing gradients as zeros.
+                # (Zeros are scale-invariant, so doing this on scaled gradients is safe.)
                 for param in self.policy.parameters():
                     if param.grad is None:
                         param.grad = torch.zeros_like(param)
                 self.reduce_parameters()
+            if self.grad_scaler is not None:
+                self.grad_scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                # Skips the step (and lowers the scale) if the unscale found an inf/NaN.
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                self.optimizer.step()
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -732,8 +885,11 @@ class PPO:
             num_updates += 1
 
         num_updates = max(num_updates, 1)
+        # Carries every still-open trial into the next rollout, then moves on to the next policy version.
         self.storage.clear()
+        self.storage.policy_version += 1
 
+        lag0_batches = max(lag0_batches, 1)
         return {
             "value_function": mean_value_loss / num_updates,
             "surrogate": mean_surrogate_loss / num_updates,
@@ -743,6 +899,25 @@ class PPO:
             "ratio_min": ratio_min,
             "ratio_max": ratio_max,
             "ratio_clip_frac": mean_ratio_clip_frac / num_updates,
+            # The reconstruction canary: on-policy trials only (see the note above)
+            "ratio_mean_lag0": lag0_ratio_sum / lag0_batches,
+            "ratio_min_lag0": lag0_ratio_min,
+            "ratio_max_lag0": lag0_ratio_max,
+            "ratio_clip_frac_lag0": lag0_clip_frac_sum / lag0_batches,
+            # max |ratio - 1| over the first minibatch, lag-0 pairs only: ~0 iff the reconstruction reproduces
+            # the behavior policy. This is the design doc's section 13 canary. 0.0 also means "no lag-0 pair
+            # landed in the first minibatch", so read it together with pool_pairs_lag0.
+            "ratio_max_dev_lag0_first_mb": first_batch_lag0_dev,
+            # Trial-pool accounting. Anything but zeros in the ``dropped``/``envs_without_data`` lines means
+            # collected experience is being thrown away.
+            "pool_pairs": float(pool["num_pairs"]),
+            "pool_pairs_lag0": float(pool["lag0_pairs"]),
+            "pool_trials": float(pool["num_trials"]),
+            "pool_deferred_trials": float(pool["deferred_trials"]),
+            "pool_dropped_episodes": float(pool["dropped_episodes"]),
+            "pool_dropped_lagged_trials": float(pool["dropped_lagged_trials"]),
+            "pool_dropped_truncated_trials": float(pool["dropped_truncated_trials"]),
+            "pool_envs_without_data": float(pool["envs_without_data"]),
         }
 
     def broadcast_parameters(self) -> None:

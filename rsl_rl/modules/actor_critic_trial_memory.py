@@ -36,6 +36,7 @@ Reset semantics need two distinct signals, a single ``dones`` flag cannot expres
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
@@ -44,8 +45,13 @@ from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any, NoReturn
 
+from rsl_rl.modules.actor_critic import GSDENoiseDistribution, upcast_from_half
 from rsl_rl.networks import MLP, EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
+
+# Which parameter holds the action noise, per ``noise_std_type``, and its shape (``A`` = num_actions,
+# ``d`` = d_model). A checkpoint written under one noise type cannot be loaded into another.
+_NOISE_PARAM_NAME = {"scalar": "std", "log": "log_std", "gsde": "log_std"}
 
 
 class MultiHeadAttention(nn.Module):
@@ -280,8 +286,13 @@ class ActorCriticTrialMemory(nn.Module):
             actor_hidden_dims: Hidden dims of the policy head (consumes ``h_t``).
             critic_hidden_dims: Hidden dims of the value head (consumes ``h_t``).
             activation: Activation used in the trunk, the writer and the heads.
-            init_noise_std: Initial action noise standard deviation.
-            noise_std_type: ``"scalar"`` or ``"log"``.
+            init_noise_std: Initial action noise standard deviation. Under ``"gsde"`` this is *not* the realized
+                action std -- see :meth:`_update_distribution` and ``calibrate_gsde_init.py``: the realized std is
+                ``init_noise_std * ||h_t||``, and ``||h_t|| = sqrt(d_model)`` for a fresh ``final_norm``.
+            noise_std_type: ``"scalar"``, ``"log"`` or ``"gsde"``. The first two are a state-independent diagonal
+                Gaussian; ``"gsde"`` (generalized State-Dependent Exploration, https://arxiv.org/abs/2005.05719)
+                makes the std a function of the trunk readout ``h_t`` -- this is what the repo's validated BC -> RL
+                recipe uses (design doc section 11).
         """
         if kwargs:
             print(
@@ -362,11 +373,16 @@ class ActorCriticTrialMemory(nn.Module):
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        elif noise_std_type == "gsde":
+            # gSDE keys the noise on the trunk readout h_t, so log_std is [d_model, num_actions] -- one column of
+            # per-feature scales per action, exactly as in the state-history transformer recipe.
+            self.log_std = nn.Parameter(torch.ones(d_model, num_actions) * math.log(init_noise_std))
         else:
-            raise ValueError(f"Unknown standard deviation type: {noise_std_type}. Should be 'scalar' or 'log'")
+            raise ValueError(f"Unknown standard deviation type: {noise_std_type}. Should be 'scalar', 'log' or 'gsde'")
 
-        # Action distribution (populated in _update_distribution)
-        self.distribution = None
+        # Action distribution (populated in _update_distribution). gSDE keeps a single distribution object that is
+        # re-parameterized in place; the other noise types build a fresh Normal per call.
+        self.distribution = self._make_gsde_distribution() if noise_std_type == "gsde" else None
         Normal.set_default_validate_args(False)
 
         self._init_weights()
@@ -465,14 +481,41 @@ class ActorCriticTrialMemory(nn.Module):
     def forward(self) -> NoReturn:
         raise NotImplementedError
 
+    def _make_gsde_distribution(self) -> GSDENoiseDistribution:
+        """Build the gSDE distribution and draw its exploration matrix.
+
+        **When is ``sample_weights`` called, and does it matter for the PPO ratio?** Once, here (construction and
+        after :meth:`load_state_dict`), which is the convention of the reference implementation. It is safe to call
+        at any time: the exploration matrix feeds only :meth:`GSDENoiseDistribution.get_noise`, which this policy
+        never calls. Both the density (``log_prob``/``entropy``) and the sample come from the base Normal that
+        :meth:`GSDENoiseDistribution.proba_distribution` builds from ``sqrt(h_t^2 @ sigma^2)``, which depends on
+        ``h_t`` and ``log_std`` only. So resampling the weights cannot desynchronize the acting path from the PPO
+        reconstruction pass, and cannot move a stored behavior log-prob.
+        """
+        distribution = GSDENoiseDistribution(action_dim=self.num_actions)
+        distribution.sample_weights(self.log_std)
+        return distribution
+
     def _action_std(self, mean: torch.Tensor) -> torch.Tensor:
         if self.noise_std_type == "scalar":
             return self.std.expand_as(mean)
         return torch.exp(self.log_std).expand_as(mean)
 
     def _update_distribution(self, hidden: torch.Tensor) -> None:
+        """Set the action distribution from ``h_t``.
+
+        Shape-agnostic: ``hidden`` may be ``[N, d]`` (acting path) or ``[S, B, d]`` (batched reconstruction path).
+        Both routes run the identical arithmetic, which is what keeps the PPO reconstruction canary exact.
+        """
         mean = self.actor(hidden)
-        self.distribution = Normal(mean, self._action_std(mean))
+        if self.noise_std_type == "gsde":
+            # std = sqrt(h_t^2 @ exp(log_std)^2), i.e. state-dependent noise keyed on the shared trunk readout.
+            # (``proba_distribution`` forces that computation to fp32; see the note there about autocast.)
+            self.distribution.proba_distribution(mean, self.log_std, hidden)
+        else:
+            # The upcast is a no-op outside autocast; under it, it keeps the density in fp32 and matches the
+            # dtype of the std parameter (``Normal`` does not promote a half mean against an fp32 std).
+            self.distribution = Normal(upcast_from_half(mean), upcast_from_half(self._action_std(mean)))
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
@@ -628,7 +671,7 @@ class ActorCriticTrialMemory(nn.Module):
         """Policy mean from a hidden state produced by either forward path."""
         return self.actor(hidden)
 
-    def update_distribution_from_hidden(self, hidden: torch.Tensor) -> Normal:
+    def update_distribution_from_hidden(self, hidden: torch.Tensor) -> Normal | GSDENoiseDistribution:
         """Set (and return) the action distribution from a hidden state, e.g. during the PPO recompute pass."""
         self._update_distribution(hidden)
         return self.distribution
@@ -951,6 +994,33 @@ class ActorCriticTrialMemory(nn.Module):
     # Checkpointing
     # ------------------------------------------------------------------------------------------------------------
 
+    def _check_noise_std_compatible(self, state_dict: dict) -> None:
+        """Fail loudly when a checkpoint's noise parameterization does not match ``noise_std_type``.
+
+        The noise parameter differs in *name* (``std`` vs ``log_std``) and in *shape* (``[A]`` vs ``[d, A]``) across
+        the three types, so a mismatched checkpoint would otherwise silently keep this module's freshly initialized
+        noise (with ``strict=False``) instead of the trained one.
+        """
+        expected_name = _NOISE_PARAM_NAME[self.noise_std_type]
+        present = [name for name in ("std", "log_std") if name in state_dict]
+        if not present:
+            return  # no noise parameter saved at all (e.g. a partial BC init); nothing to check
+        if expected_name not in state_dict:
+            raise ValueError(
+                f"Checkpoint stores the action noise as '{present[0]}' but this policy was built with"
+                f" noise_std_type='{self.noise_std_type}', which expects '{expected_name}'. Rebuild the policy with"
+                " the checkpoint's noise_std_type."
+            )
+        expected_shape = tuple(getattr(self, expected_name).shape)
+        actual_shape = tuple(state_dict[expected_name].shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Checkpoint '{expected_name}' has shape {actual_shape} but noise_std_type="
+                f"'{self.noise_std_type}' expects {expected_shape}. A 'gsde' checkpoint stores a"
+                " [d_model, num_actions] matrix and a 'scalar'/'log' one a [num_actions] vector; they are not"
+                " interchangeable."
+            )
+
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         """Load the parameters of the actor-critic model.
 
@@ -963,6 +1033,11 @@ class ActorCriticTrialMemory(nn.Module):
             Whether this training resumes a previous training. This flag is used by the :func:`load` function of
                 :class:`OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
         """
+        self._check_noise_std_compatible(state_dict)
         super().load_state_dict(state_dict, strict=strict)
         self._reset_runtime_state()
+        if self.noise_std_type == "gsde":
+            # Re-draw the exploration matrix from the loaded log_std (harmless for the density; see
+            # _make_gsde_distribution) and drop any stale base distribution left over from before the load.
+            self.distribution = self._make_gsde_distribution()
         return True

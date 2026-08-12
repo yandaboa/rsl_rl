@@ -14,6 +14,18 @@ from typing import Any, NoReturn, Optional
 from rsl_rl.networks import MLP, EmpiricalNormalization
 
 
+def upcast_from_half(tensor: torch.Tensor) -> torch.Tensor:
+    """Promote a half-precision tensor to fp32, leaving fp32 (and fp64) alone.
+
+    Used to pull the parts of the action distribution that must not lose precision out of an ``autocast``
+    region. Deliberately not ``Tensor.float()``: that would *downcast* an fp64 tensor, and the exactness tests
+    run the policy in double precision.
+    """
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        return tensor.float()
+    return tensor
+
+
 class GSDENoiseDistribution(Distribution):
     """
     Distribution class for using generalized State Dependent Exploration (gSDE).
@@ -69,8 +81,16 @@ class GSDENoiseDistribution(Distribution):
         if self._exploration_matrices is not None:
             self._exploration_matrices = self._exploration_matrices.to(latent_features.device)
         # variance per action: (phi(s)^2) @ (sigma^2)
-        variance = torch.mm(latent_features**2, self._std_from_log_std(log_std) ** 2)
-        self._base_distribution = Normal(mean_actions, torch.sqrt(variance + self.epsilon))
+        # ``matmul`` (not ``mm``) so that sequence-shaped features ``[S, B, d]`` work as well as ``[B, d]``;
+        # for 2D inputs it is exactly ``mm``.
+        # Always fp32, even under autocast: the two squarings are the one place in this policy where half
+        # precision genuinely breaks. ``phi`` is a LayerNorm readout with ||phi|| = sqrt(d), so ``phi^2`` is at the
+        # edge of fp16 once features reach ~256, and ``sigma^2`` underflows to zero for sigma < 2.4e-4 -- a std of
+        # exactly zero makes every log-prob inf. The block is a no-op in a non-autocast fp32 forward.
+        with torch.autocast(device_type=latent_features.device.type, enabled=False):
+            std = self._std_from_log_std(upcast_from_half(log_std))
+            variance = torch.matmul(upcast_from_half(latent_features) ** 2, std**2)
+            self._base_distribution = Normal(upcast_from_half(mean_actions), torch.sqrt(variance + self.epsilon))
         return self
 
     def log_prob(self, actions: torch.Tensor) -> torch.Tensor:

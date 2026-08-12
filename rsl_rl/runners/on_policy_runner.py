@@ -151,7 +151,9 @@ class OnPolicyRunner:
             # Note: This has to happen *after* update(), so that the rollout is acted and reconstructed under
             #   identical normalizer statistics (otherwise the PPO ratio is off at epoch 0 by construction).
             if self.alg.defer_obs_normalization:
-                self.alg.commit_obs_normalization(self.alg.storage.observations)
+                # Only the rows this rollout collected: the carried-over region was already committed by the
+                # rollout that collected it, and counting it twice would skew the statistics.
+                self.alg.commit_obs_normalization(self.alg.storage.collected_observations)
 
             stop = time.time()
             learn_time = stop - start

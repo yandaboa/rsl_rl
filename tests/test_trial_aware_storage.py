@@ -329,9 +329,182 @@ def test_deferred_obs_normalization() -> None:
     print("[ok] deferred obs normalization: 0 updates during collection, 1 flattened commit after")
 
 
+class _TrialSchedule:
+    """Environment-side trial bookkeeping, mirroring the ``advance_trial`` event term.
+
+    Every environment has its own list of episode lengths (cycled), so an early termination shortens one
+    episode and phase-shifts that environment against the rollout boundary for good -- which is precisely the
+    situation the carry-over buffer exists for. A trial ends after ``K`` episodes, whatever their lengths.
+    """
+
+    def __init__(self, episode_lengths: list[list[int]], num_episodes_per_trial: int) -> None:
+        self.episode_lengths = episode_lengths
+        self.num_envs = len(episode_lengths)
+        self.K = num_episodes_per_trial
+        self.episode_index = [0] * self.num_envs
+        self.steps_in_episode = [0] * self.num_envs
+        self.episodes_in_trial = [0] * self.num_envs
+        self.trial_index = [0] * self.num_envs
+        # Ground truth: for every emitted step, which (env, trial) it belongs to, and which trials completed
+        self.step_trial: list[tuple[int, int]] = []
+        self.completed: set[tuple[int, int]] = set()
+
+    def step(self) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
+        dones = torch.zeros(self.num_envs, dtype=torch.bool, device=DEVICE)
+        trial_dones = torch.zeros(self.num_envs, dtype=torch.bool, device=DEVICE)
+        owners = []
+        for env in range(self.num_envs):
+            owners.append((env, self.trial_index[env]))
+            self.steps_in_episode[env] += 1
+            schedule = self.episode_lengths[env]
+            if self.steps_in_episode[env] >= schedule[self.episode_index[env] % len(schedule)]:
+                dones[env] = True
+                self.steps_in_episode[env] = 0
+                self.episode_index[env] += 1
+                self.episodes_in_trial[env] += 1
+                if self.episodes_in_trial[env] >= self.K:
+                    trial_dones[env] = True
+                    self.episodes_in_trial[env] = 0
+                    self.completed.add((env, self.trial_index[env]))
+                    self.trial_index[env] += 1
+        self.step_trial.extend(owners)
+        return dones, trial_dones, owners
+
+
+def test_carry_over_never_drops_a_straddling_trial() -> None:
+    """The regression test for the data-loss bug: a phase-shifted environment must keep contributing.
+
+    Environment 1 terminates early in its very first episode, so from then on its trials never line up with a
+    rollout boundary. Segmenting each rollout in isolation would drop every one of them and the environment
+    would silently go dark. With the carry-over buffer every completed trial must be trained on exactly once,
+    across rollout boundaries, and no episode may be lost.
+    """
+    num_envs, action_dim = 2, 3
+    episode_len, trial_episodes, num_rollouts = 8, 3, 6
+    rollout = episode_len * trial_episodes  # 24 = one nominal trial
+    obs = TensorDict({"policy": torch.zeros(num_envs, 1, device=DEVICE)}, batch_size=[num_envs], device=DEVICE)
+    actions = torch.zeros(num_envs, action_dim, device=DEVICE)
+
+    storage = RolloutStorage(
+        "rl", num_envs, rollout, obs, [action_dim], device=DEVICE, carry_steps=rollout, max_policy_lag=1
+    )
+    # env 0 is nominal; env 1 loses 5 steps to an "abnormal_robot" terminal in its first episode and then
+    # another one much later, so it is permanently out of phase with the rollout grid.
+    schedule = _TrialSchedule([[episode_len], [3, episode_len, episode_len, episode_len, 6, episode_len]], 3)
+
+    trained: dict[tuple[int, int], int] = {}
+    tags_seen: list[float] = []
+    tag = 0.0
+    for iteration in range(num_rollouts):
+        transition = RolloutStorage.Transition()
+        for _ in range(rollout):
+            dones, trial_dones, owners = schedule.step()
+            # A unique, decodable tag per (step, env) so the gathered episodes can be checked against truth
+            tag_row = torch.tensor([tag + env for env in range(num_envs)], device=DEVICE).unsqueeze(-1)
+            tag += num_envs
+            transition.observations = TensorDict(
+                {"policy": tag_row}, batch_size=[num_envs], device=DEVICE
+            )
+            transition.actions = actions
+            transition.rewards = torch.zeros(num_envs, device=DEVICE)
+            transition.dones = dones
+            transition.trial_dones = trial_dones
+            transition.values = torch.zeros(num_envs, 1, device=DEVICE)
+            transition.actions_log_prob = torch.zeros(num_envs, device=DEVICE)
+            transition.action_mean = actions
+            transition.action_sigma = actions
+            storage.add_transitions(transition)
+            transition.clear()
+
+        index = storage.build_trial_pairs(verbose=False)
+        assert index["dropped_episodes"] == 0, f"iteration {iteration} dropped {index['dropped_episodes']} episodes"
+        assert index["dropped_trials"] == 0, f"iteration {iteration} dropped {index['dropped_trials']} trials"
+        if iteration > 0:
+            assert index["envs_without_data"] == 0, (
+                f"iteration {iteration}: {index['envs_without_data']} environments contributed nothing --"
+                " this is the failure mode the carry-over buffer exists to prevent"
+            )
+        # Which trials did this update train on, and were their steps the right ones?
+        observations = storage.observations["policy"].reshape(storage.num_transitions_per_env, num_envs)
+        for episode in range(index["num_pairs"]):
+            start = int(index["ep_start"][episode].item())
+            length = int(index["ep_len"][episode].item())
+            env = int(index["ep_env"][episode].item())
+            episode_tags = observations[start : start + length, env]
+            for value in episode_tags.tolist():
+                assert value % num_envs == env, "an episode mixes steps from two environments"
+                tags_seen.append(value)
+                owner = schedule.step_trial[int(value)]
+                trained[owner] = trained.get(owner, 0) + 1
+        storage.clear()
+        storage.policy_version += 1
+
+    # Every trial that completed (except any still being carried) was trained on, exactly once, in full.
+    still_open = {(env, schedule.trial_index[env]) for env in range(num_envs)}
+    expected = schedule.completed - still_open
+    assert set(trained) == expected, f"trials trained {sorted(set(trained) ^ expected)} differ from completed ones"
+    assert len(tags_seen) == len(set(tags_seen)), "a step was trained on twice"
+    steps_of_expected = sum(1 for owner in schedule.step_trial if owner in expected)
+    assert len(tags_seen) == steps_of_expected, (
+        f"trained on {len(tags_seen)} steps but the completed trials contain {steps_of_expected}"
+    )
+    print(
+        f"[ok] carry-over: {len(expected)} trials over {num_rollouts} rollouts, all trained exactly once,"
+        f" {len(tags_seen)} steps, 0 dropped (env 1 is permanently out of phase)"
+    )
+
+
+def test_lagged_trials_are_dropped_and_counted() -> None:
+    """``max_policy_lag = 0`` refuses any trial that spans a rollout boundary -- and says so, loudly."""
+    num_envs, action_dim = 1, 2
+    rollout = 8
+    obs = TensorDict({"policy": torch.zeros(num_envs, 1, device=DEVICE)}, batch_size=[num_envs], device=DEVICE)
+    actions = torch.zeros(num_envs, action_dim, device=DEVICE)
+
+    def run(max_policy_lag: int) -> dict:
+        storage = RolloutStorage(
+            "rl", num_envs, rollout, obs, [action_dim], device=DEVICE, carry_steps=rollout,
+            max_policy_lag=max_policy_lag,
+        )
+        transition = RolloutStorage.Transition()
+        # One trial of 12 steps: it starts in rollout 0 and ends in the middle of rollout 1.
+        for iteration in range(2):
+            for step in range(rollout):
+                absolute = iteration * rollout + step
+                transition.observations = obs
+                transition.actions = actions
+                transition.rewards = torch.zeros(num_envs, device=DEVICE)
+                closes = absolute in (5, 11)
+                transition.dones = torch.full((num_envs,), closes, dtype=torch.bool, device=DEVICE)
+                transition.trial_dones = torch.full((num_envs,), absolute == 11, dtype=torch.bool, device=DEVICE)
+                transition.values = torch.zeros(num_envs, 1, device=DEVICE)
+                transition.actions_log_prob = torch.zeros(num_envs, device=DEVICE)
+                transition.action_mean = actions
+                transition.action_sigma = actions
+                storage.add_transitions(transition)
+                transition.clear()
+            index = storage.build_trial_pairs(verbose=False)
+            storage.clear()
+            storage.policy_version += 1
+        return index
+
+    tolerant = run(max_policy_lag=1)
+    assert tolerant["num_pairs"] == 2 and tolerant["dropped_trials"] == 0
+    assert tolerant["ep_lag"].tolist() == [1, 1], "the trial began one update ago"
+    assert tolerant["lag0_pairs"] == 0, "the canary must not count a trial collected under the old policy"
+
+    strict = run(max_policy_lag=0)
+    assert strict["num_pairs"] == 0 and strict["dropped_trials"] == 1 and strict["dropped_lagged_trials"] == 1
+    assert strict["dropped_episodes"] == 2 and strict["envs_without_data"] == 1
+
+    print("[ok] policy lag: straddling trial kept at lag 1 (and excluded from the canary), dropped at lag 0")
+
+
 if __name__ == "__main__":
     test_trace_survives_episode_boundaries_inside_a_trial()
     test_default_trial_dones_reproduce_stock_returns_bitwise()
     test_timeout_bootstrap_only_at_trial_end()
     test_deferred_obs_normalization()
+    test_carry_over_never_drops_a_straddling_trial()
+    test_lagged_trials_are_dropped_and_counted()
     print("all trial-aware storage tests passed")

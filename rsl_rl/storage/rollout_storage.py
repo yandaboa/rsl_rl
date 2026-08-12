@@ -71,10 +71,31 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
+        carry_steps: int = 0,
+        max_policy_lag: int = 1,
     ) -> None:
+        """
+        Args:
+            num_transitions_per_env: Steps **collected** per environment per rollout.
+            carry_steps: Extra rows reserved *in front of* the rollout for a trial that is still open when the
+                rollout ends. With ``carry_steps > 0`` the training-data unit (a trial) is decoupled from the
+                collection unit (a rollout): an unfinished trial is carried across the rollout boundary instead
+                of being thrown away, and is trained on once it completes. It must be at least as long as the
+                longest trial (``K * T``) for nothing to be lost. ``0`` (the default) keeps the stock behavior.
+            max_policy_lag: How many updates old a trial's *behavior* policy may be. A trial that spans a
+                rollout boundary was partly collected under the previous policy, so it is off-policy by one
+                update; anything older than this is dropped (and reported) rather than trained on with a stale
+                PPO denominator.
+        """
         self.training_type = training_type
         self.device = device
-        self.num_transitions_per_env = num_transitions_per_env
+        # Rows written per rollout, versus total rows in the buffer (carry region + rollout region).
+        # ``num_transitions_per_env`` keeps meaning "buffer rows" for every indexing helper below.
+        self.num_collect_steps = num_transitions_per_env
+        self.carry_steps = int(carry_steps)
+        self.num_transitions_per_env = self.carry_steps + num_transitions_per_env
+        num_transitions_per_env = self.num_transitions_per_env
+        self.max_policy_lag = int(max_policy_lag)
         self.num_envs = num_envs
         self.actions_shape = actions_shape
 
@@ -112,8 +133,18 @@ class RolloutStorage:
 
         # For trial-memory policies (lazily allocated on the first transition that provides them)
         self.terminal_observations: TensorDict | None = None
-        # Whether each environment sat on a trial boundary (Z == Z_init) at step 0 of this rollout. Rolled
-        # forward by :meth:`clear` from the trial dones of the last stored step.
+
+        # -- carry-over of a trial that is still open when the rollout ends (see ``carry_steps``) --
+        # Behavior-policy version of every stored step: the number of PPO updates that had happened when the
+        # step was collected. A trial's lag is measured on its FIRST step, since that is where its memory
+        # (and therefore every log-prob in it) starts from.
+        self.policy_versions = torch.zeros(num_transitions_per_env, num_envs, 1, dtype=torch.long, device=device)
+        self.policy_version = 0
+        # Rows of the carry region that actually hold data, per environment. The carry region is
+        # RIGHT-aligned, so environment ``e``'s window starts at row ``carry_steps - carry_len[e]``.
+        self.carry_len = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        # Whether that first valid row is genuinely the first step of a trial. False only when an open trial
+        # was longer than the carry region and its start had to be dropped.
         self.at_trial_start = torch.ones(num_envs, dtype=torch.bool, device=self.device)
         # Cached episode/trial segmentation of the current rollout (invalidated whenever the data changes)
         self._pair_index: dict[str, torch.Tensor | int] | None = None
@@ -121,22 +152,40 @@ class RolloutStorage:
         # Counter for the number of transitions stored
         self.step = 0
 
+    @property
+    def row(self) -> int:
+        """Buffer row the next transition will be written to (the carry region sits in front of it)."""
+        return self.carry_steps + self.step
+
+    @property
+    def collected_observations(self) -> TensorDict:
+        """The rows written by the most recent rollout, i.e. excluding the carried-over region.
+
+        Used for the deferred observation-normalizer commit: the carry region has already been seen by the
+        normalizer in the rollout that collected it, and counting it twice would skew the statistics.
+
+        Note: still valid right after :meth:`clear`, which only writes rows *below* ``carry_steps``.
+        """
+        return self.observations[self.carry_steps :]
+
     def add_transitions(self, transition: Transition) -> None:
         # Check if the transition is valid
-        if self.step >= self.num_transitions_per_env:
+        if self.step >= self.num_collect_steps:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
+        step = self.row
 
         # Core
-        self.observations[self.step].copy_(transition.observations)
-        self.actions[self.step].copy_(transition.actions)
-        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
-        self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.observations[step].copy_(transition.observations)
+        self.actions[step].copy_(transition.actions)
+        self.rewards[step].copy_(transition.rewards.view(-1, 1))
+        self.dones[step].copy_(transition.dones.view(-1, 1))
+        self.policy_versions[step].fill_(self.policy_version)
         # Fall back to the episode dones so that callers unaware of trials keep the stock behavior
         trial_dones = transition.trial_dones if transition.trial_dones is not None else transition.dones
-        self.trial_dones[self.step].copy_(trial_dones.view(-1, 1))
+        self.trial_dones[step].copy_(trial_dones.view(-1, 1))
         # Token rewards. Fall back to the (possibly modified) rewards for callers that do not set them.
         raw_rewards = transition.raw_rewards if transition.raw_rewards is not None else transition.rewards
-        self.raw_rewards[self.step].copy_(raw_rewards.view(-1, 1))
+        self.raw_rewards[step].copy_(raw_rewards.view(-1, 1))
         # Optional true terminal observations (see Transition.terminal_observations)
         if transition.terminal_observations is not None:
             if self.terminal_observations is None:
@@ -148,20 +197,20 @@ class RolloutStorage:
                     batch_size=[self.num_transitions_per_env, self.num_envs],
                     device=self.device,
                 )
-            self.terminal_observations[self.step].copy_(transition.terminal_observations)
+            self.terminal_observations[step].copy_(transition.terminal_observations)
         # The rollout changed, so any cached segmentation is stale
         self._pair_index = None
 
         # For distillation
         if self.training_type == "distillation":
-            self.privileged_actions[self.step].copy_(transition.privileged_actions)
+            self.privileged_actions[step].copy_(transition.privileged_actions)
 
         # For reinforcement learning
         if self.training_type == "rl":
-            self.values[self.step].copy_(transition.values)
-            self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
-            self.mu[self.step].copy_(transition.action_mean)
-            self.sigma[self.step].copy_(transition.action_sigma)
+            self.values[step].copy_(transition.values)
+            self.actions_log_prob[step].copy_(transition.actions_log_prob.view(-1, 1))
+            self.mu[step].copy_(transition.action_mean)
+            self.sigma[step].copy_(transition.action_sigma)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -187,16 +236,82 @@ class RolloutStorage:
             ]
         # Copy the states
         for i in range(len(hidden_state_a)):
-            self.saved_hidden_state_a[i][self.step].copy_(hidden_state_a[i])
-            self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])
+            self.saved_hidden_state_a[i][self.row].copy_(hidden_state_a[i])
+            self.saved_hidden_state_c[i][self.row].copy_(hidden_state_c[i])
 
     def clear(self) -> None:
-        # Carry the trial phase into the next rollout: an environment starts the next rollout on a trial
-        # boundary (memory back at Z_init) exactly when the last stored step closed its trial.
+        """Free the buffer for the next rollout, carrying any still-open trial across the boundary.
+
+        With ``carry_steps == 0`` this is the stock "reset the write pointer" behavior. Otherwise the steps of
+        the trial that is still running -- everything after each environment's last trial done -- is moved to
+        the carry region so that the next update can train on it once the trial completes. Nothing is ever
+        discarded for the mere reason that it straddles a rollout boundary.
+        """
         if self.step > 0:
-            self.at_trial_start = self.trial_dones[self.step - 1].reshape(-1).bool().clone()
+            if self.carry_steps > 0:
+                self._roll_carry_over()
+            else:
+                # Without a carry region there is nothing to hand over, so all that survives is the phase:
+                # the next rollout begins on a trial boundary exactly when this one ended on one.
+                self.at_trial_start = self.trial_dones[self.step - 1].reshape(-1).bool().clone()
         self.step = 0
         self._pair_index = None
+
+    def _roll_carry_over(self) -> None:
+        """Move each environment's open-trial tail into the (right-aligned) carry region."""
+        num_steps, num_envs = self.num_transitions_per_env, self.num_envs
+        end = self.carry_steps + self.step  # exclusive; == num_steps after a full rollout
+        rows = torch.arange(num_steps, device=self.device).unsqueeze(1)
+        valid_start = (self.carry_steps - self.carry_len).unsqueeze(0)  # [1, N]
+
+        # Last step of the window that closed a trial; -1 when the whole window is one open trial.
+        closed = self.trial_dones.reshape(num_steps, num_envs).bool() & (rows >= valid_start) & (rows < end)
+        last_close = torch.where(closed, rows.expand_as(closed), torch.full_like(closed, -1, dtype=torch.long))
+        last_close = last_close.max(dim=0).values
+        # Steps since the trial started (the whole valid window when no trial ever closed in it)
+        valid_len = end - (self.carry_steps - self.carry_len)
+        open_len = torch.where(last_close >= 0, end - 1 - last_close, valid_len)
+
+        # The tail sits in the last ``open_len`` rows; shifting the whole buffer down by the number of rows
+        # this rollout wrote puts it exactly at rows [carry_steps - open_len, carry_steps). One uniform shift
+        # for every environment, because both the source and the destination are anchored at the window END.
+        self._shift_rows(self.step)
+        # A trial longer than the carry region loses its first steps, so its memory can no longer be
+        # reconstructed: mark it, and build_trial_pairs drops it (once) when it completes.
+        self.at_trial_start = open_len <= self.carry_steps
+        self.carry_len = open_len.clamp(max=self.carry_steps)
+
+    def _shift_rows(self, shift: int) -> None:
+        """Move rows ``[shift, shift + carry_steps)`` of every stored buffer down to ``[0, carry_steps)``."""
+        carry = self.carry_steps
+
+        def move(tensor: torch.Tensor) -> None:
+            tensor[:carry].copy_(tensor[shift : shift + carry].clone())
+
+        def move_td(td: TensorDict) -> None:
+            for value in td.values():
+                move(value) if isinstance(value, torch.Tensor) else move_td(value)
+
+        move_td(self.observations)
+        if self.terminal_observations is not None:
+            move_td(self.terminal_observations)
+        for name in (
+            "rewards",
+            "raw_rewards",
+            "actions",
+            "dones",
+            "trial_dones",
+            "policy_versions",
+            "privileged_actions",
+            "values",
+            "actions_log_prob",
+            "mu",
+            "sigma",
+            "returns",
+        ):
+            tensor = getattr(self, name, None)
+            if isinstance(tensor, torch.Tensor):
+                move(tensor)
 
     def compute_returns(
         self, last_values: torch.Tensor, gamma: float, lam: float, normalize_advantage: bool = True
@@ -222,7 +337,23 @@ class RolloutStorage:
         # Normalize the advantages if flag is set
         # Note: This is to prevent double normalization (i.e. if per minibatch normalization is used)
         if normalize_advantage:
-            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+            if self.carry_steps == 0:
+                self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+            else:
+                # Rows in front of an environment's window are stale (already-consumed or never-written) and
+                # would otherwise drag the normalization statistics around.
+                live = self.valid_mask().unsqueeze(-1)
+                live_advantages = self.advantages[live]
+                self.advantages = (self.advantages - live_advantages.mean()) / (live_advantages.std() + 1e-8)
+
+    def valid_mask(self) -> torch.Tensor:
+        """``[num_transitions_per_env, num_envs]`` mask of rows that hold live data for their environment.
+
+        Everything from row ``carry_steps - carry_len[e]`` on: the carried-over open trial followed by the
+        rollout just collected. Always all-True without a carry region.
+        """
+        rows = torch.arange(self.num_transitions_per_env, device=self.device).unsqueeze(1)
+        return rows >= (self.carry_steps - self.carry_len).unsqueeze(0)
 
     # For distillation
     def generator(self) -> Generator:
@@ -236,6 +367,12 @@ class RolloutStorage:
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
+        if self.carry_steps > 0:
+            raise ValueError(
+                "The flat mini-batch generator cannot be used with a carry region: it would train on the"
+                " carried rows (an unfinished trial) and on stale rows in front of them. Use"
+                " trial_pair_mini_batch_generator, or construct the storage with carry_steps=0."
+            )
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
@@ -377,17 +514,21 @@ class RolloutStorage:
         tau_K)`` -- so every episode is a target exactly once and receives exactly one PPO loss.
 
         Episode boundaries are **derived from the stored dones**, never assumed to sit at fixed indices: a
-        genuine terminal (e.g. ``abnormal_robot``) resets an environment early and desynchronizes it. Trials
-        that are not fully contained in the rollout (open at either edge) are dropped, and the number of
-        dropped episodes/trials is reported.
+        genuine terminal (e.g. ``abnormal_robot``) resets an environment early and desynchronizes it.
+
+        A trial that is still open at the end of the window is **not** dropped: it is *deferred*, i.e. left in
+        the buffer for :meth:`clear` to carry into the next rollout, and trained on once it completes. The only
+        losses are trials older than :attr:`max_policy_lag` updates and trials longer than the carry region;
+        both are counted and reported separately, because they are real data loss and must never be silent.
 
         Returns (and caches) a dictionary of 1-D tensors indexed by *valid* episode:
 
-        * ``ep_start`` / ``ep_len`` / ``ep_env``: rollout step of the first transition, number of acting steps,
+        * ``ep_start`` / ``ep_len`` / ``ep_env``: buffer row of the first transition, number of acting steps,
           environment index,
         * ``ep_pos``: index of the episode inside its trial (0 == first episode, i.e. the degenerate pair),
+        * ``ep_lag``: how many updates old the episode's trial is (0 == fully on-policy),
         * ``num_pairs``: number of valid episodes == number of pairs,
-        * ``max_len``: longest valid episode, ``dropped_*``: accounting of what was thrown away.
+        * ``max_len``: longest valid episode, ``deferred_*`` / ``dropped_*``: accounting.
         """
         if self._pair_index is not None:
             return self._pair_index
@@ -397,10 +538,19 @@ class RolloutStorage:
         dones = self.dones.reshape(num_steps, num_envs).bool() | self.trial_dones.reshape(num_steps, num_envs).bool()
         trial_dones = self.trial_dones.reshape(num_steps, num_envs).bool()
 
+        # Rows in front of an environment's window hold stale (already consumed) data. Force a segment break
+        # just before the window so that no episode/trial spans the two -- otherwise the first live episode
+        # would inherit the stale rows' start index and look like it began outside the window.
+        rows = torch.arange(num_steps, device=device).unsqueeze(1)
+        window_start = (self.carry_steps - self.carry_len.to(device)).unsqueeze(0)  # [1, N]
+        boundary = rows == (window_start - 1)
+
         # Per-step segment ids: the index (within the environment) of the episode/trial the step belongs to.
         # Exclusive cumulative sum, because a done flags the *last* step of its segment.
-        ep_id = torch.cumsum(dones.long(), dim=0) - dones.long()
-        trial_id = torch.cumsum(trial_dones.long(), dim=0) - trial_dones.long()
+        ep_breaks = (dones | boundary).long()
+        trial_breaks = (trial_dones | boundary).long()
+        ep_id = torch.cumsum(ep_breaks, dim=0) - ep_breaks
+        trial_id = torch.cumsum(trial_breaks, dim=0) - trial_breaks
 
         eps_per_env = ep_id[-1] + 1
         trials_per_env = trial_id[-1] + 1
@@ -436,7 +586,7 @@ class RolloutStorage:
         )
         ep_pos = ep_index - first_ep_of_trial[ep_trial]
 
-        # A trial is usable only if it both started and ended inside this rollout, and all of its episodes closed.
+        # -- classify every trial: consumed / deferred / dropped / trainable --
         trial_env = torch.zeros(num_trials, dtype=torch.long, device=device).scatter_reduce(
             0, ep_trial, ep_env, reduce="amax"
         )
@@ -450,9 +600,30 @@ class RolloutStorage:
             .scatter_reduce(0, ep_trial, ep_closed.long(), reduce="amin")
             .bool()
         )
-        trial_local = torch.arange(num_trials, device=device) - trial_offset[trial_env]
-        trial_started = (trial_local > 0) | self.at_trial_start.to(device)[trial_env]
-        valid_trial = trial_closed & trial_all_closed & trial_started
+        trial_first_row = torch.full((num_trials,), num_steps, dtype=torch.long, device=device).scatter_reduce(
+            0, ep_trial, ep_start, reduce="amin"
+        )
+        trial_last_row = torch.zeros(num_trials, dtype=torch.long, device=device).scatter_reduce(
+            0, ep_trial, ep_last_step, reduce="amax"
+        )
+        trial_window_start = window_start.reshape(-1)[trial_env]
+
+        # How many updates old the trial's behavior policy is, read off its FIRST step: that is where its
+        # memory starts, so every log-prob in it was produced by that policy version.
+        versions = self.policy_versions.reshape(num_steps, num_envs)
+        trial_lag = self.policy_version - versions[trial_first_row, trial_env]
+
+        # Entirely in front of the window: consumed by an earlier update (or never written). Not data loss.
+        trial_stale = trial_last_row < trial_window_start
+        # The window's first row is a genuine trial start unless a carried trial was longer than the carry
+        # region, in which case its first steps -- and with them its memory -- are gone.
+        trial_started = (trial_first_row > trial_window_start) | self.at_trial_start.to(device)[trial_env]
+        live = ~trial_stale
+        # Still running: keep it in the buffer, train on it when it completes. NOT dropped.
+        trial_deferred = live & trial_started & ~trial_closed
+        trial_truncated = live & ~trial_started
+        trial_lagged = live & trial_started & trial_closed & trial_all_closed & (trial_lag > self.max_policy_lag)
+        valid_trial = live & trial_started & trial_closed & trial_all_closed & (trial_lag <= self.max_policy_lag)
 
         keep = valid_trial[ep_trial]
         selected = keep.nonzero(as_tuple=False).squeeze(-1)
@@ -460,6 +631,7 @@ class RolloutStorage:
         ep_len_c = ep_len[selected]
         ep_env_c = ep_env[selected]
         ep_pos_c = ep_pos[selected]
+        ep_lag_c = trial_lag[ep_trial][selected]
 
         # Filtering removes whole trials, so a kept episode's predecessor inside its trial stays at index - 1.
         if selected.numel() > 0:
@@ -469,14 +641,29 @@ class RolloutStorage:
                 assert bool((ep_env_c[prev] == ep_env_c[successor]).all()), "pair source/target env mismatch"
                 assert bool((ep_pos_c[prev] + 1 == ep_pos_c[successor]).all()), "pair source/target are not adjacent"
 
-        dropped_eps = int((~keep).sum().item())
-        dropped_trials = int((~valid_trial).sum().item())
-        dropped_envs = int(torch.unique(ep_env[~keep]).numel()) if dropped_eps else 0
-        if verbose and dropped_eps > 0:
+        # -- accounting. "Dropped" means lost for good; a deferred trial is neither kept nor lost yet. --
+        def episodes_in(trial_mask: torch.Tensor) -> int:
+            return int(trial_mask[ep_trial].sum().item())
+
+        dropped = trial_truncated | trial_lagged
+        dropped_eps = episodes_in(dropped)
+        dropped_trials = int(dropped.sum().item())
+        dropped_envs = int(torch.unique(trial_env[dropped]).numel()) if dropped_trials else 0
+        deferred_trials = int(trial_deferred.sum().item())
+        deferred_eps = episodes_in(trial_deferred)
+        # An environment that contributes nothing to this update is the signature of the failure mode this
+        # buffer exists to prevent (a permanently phase-shifted environment silently going dark).
+        envs_without_data = num_envs - int(torch.unique(ep_env_c).numel())
+        lag0_pairs = int((ep_lag_c == 0).sum().item())
+        if verbose:
             print(
-                f"[RolloutStorage] trial pairs: kept {selected.numel()} episodes in"
-                f" {int(valid_trial.sum().item())} trials; dropped {dropped_eps} episodes in {dropped_trials}"
-                f" incomplete/edge trials across {dropped_envs} environments."
+                f"[RolloutStorage] trial pool: {selected.numel()} episodes in"
+                f" {int(valid_trial.sum().item())} trials ({lag0_pairs} pairs at lag 0);"
+                f" deferred {deferred_eps} episodes in {deferred_trials} open trials;"
+                f" dropped {dropped_eps} episodes in {dropped_trials} trials"
+                f" ({int(trial_lagged.sum().item())} too lagged, {int(trial_truncated.sum().item())} whose"
+                f" start no longer fits the buffer) across {dropped_envs} envs;"
+                f" {envs_without_data}/{num_envs} envs contributed nothing."
             )
 
         self._pair_index = {
@@ -484,12 +671,19 @@ class RolloutStorage:
             "ep_len": ep_len_c,
             "ep_env": ep_env_c,
             "ep_pos": ep_pos_c,
+            "ep_lag": ep_lag_c,
             "num_pairs": int(selected.numel()),
             "num_trials": int(valid_trial.sum().item()),
             "max_len": int(ep_len_c.max().item()) if selected.numel() > 0 else 0,
             "dropped_episodes": dropped_eps,
             "dropped_trials": dropped_trials,
             "dropped_envs": dropped_envs,
+            "dropped_lagged_trials": int(trial_lagged.sum().item()),
+            "dropped_truncated_trials": int(trial_truncated.sum().item()),
+            "deferred_episodes": deferred_eps,
+            "deferred_trials": deferred_trials,
+            "envs_without_data": envs_without_data,
+            "lag0_pairs": lag0_pairs,
         }
         return self._pair_index
 
@@ -665,6 +859,7 @@ class RolloutStorage:
                            advantages, returns, values},                                # [S_tgt, B, ...]
                 "memory": Tensor [B, M, d],          # detached Zbar_e of every pair
                 "positions": LongTensor [B],         # episode index inside its trial (0 == degenerate pair)
+                "lags": LongTensor [B],              # updates since the pair's trial was collected (0 == on-policy)
                 "episode_ids": LongTensor [B],       # index into build_trial_pairs(), for diagnostics/tests
             }
 
@@ -677,14 +872,20 @@ class RolloutStorage:
 
         index = self.build_trial_pairs()
         num_pairs = index["num_pairs"]
-        mini_batch_size = num_pairs // num_mini_batches
-        if mini_batch_size == 0:
+        if num_pairs == 0:
             raise ValueError(
-                f"Only {num_pairs} complete episode pairs survived the rollout, which is fewer than"
-                f" num_mini_batches={num_mini_batches}. Collect longer rollouts or use fewer minibatches."
+                "No trial completed during this rollout, so there is nothing to update on. Every trial is"
+                f" still open ({index['deferred_trials']}) or was dropped ({index['dropped_trials']}). Check"
+                " that trial_done is published and that num_steps_per_env is not far shorter than a trial."
             )
+        # A pool smaller than the requested number of minibatches is a transient (e.g. the first rollout,
+        # where trials have not finished yet), not a configuration error -- shrink the split instead of
+        # throwing the data away.
+        num_mini_batches = min(num_mini_batches, num_pairs)
+        mini_batch_size = num_pairs // num_mini_batches
 
         positions = index["ep_pos"]
+        lags = index["ep_lag"]
         for _ in range(num_epochs):
             checkpoints = self.compute_memory_checkpoints(policy, sweep_chunk_size, memory_dtype)
             shuffled = torch.randperm(num_pairs, device=self.device)
@@ -711,5 +912,6 @@ class RolloutStorage:
                     "target": target,
                     "memory": checkpoints[memory_ids].detach(),
                     "positions": pair_positions,
+                    "lags": lags[episode_ids],
                     "episode_ids": episode_ids,
                 }
