@@ -147,6 +147,12 @@ class OnPolicyRunner:
             # Update policy
             loss_dict = self.alg.update()
 
+            # Commit the deferred observation-normalizer update.
+            # Note: This has to happen *after* update(), so that the rollout is acted and reconstructed under
+            #   identical normalizer statistics (otherwise the PPO ratio is off at epoch 0 by construction).
+            if self.alg.defer_obs_normalization:
+                self.alg.commit_obs_normalization(self.alg.storage.observations)
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it

@@ -11,10 +11,17 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticTrialMemory
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
+
+
+def _zeros_like_obs(obs: TensorDict | torch.Tensor) -> TensorDict | torch.Tensor:
+    """An all-zero copy of an observation (works for both a ``TensorDict`` and a plain tensor)."""
+    if isinstance(obs, torch.Tensor):
+        return torch.zeros_like(obs)
+    return obs.apply(torch.zeros_like)
 
 
 class PPO:
@@ -40,6 +47,11 @@ class PPO:
         desired_kl: float = 0.01,
         device: str = "cpu",
         normalize_advantage_per_mini_batch: bool = False,
+        defer_obs_normalization: bool = False,
+        # Trial-memory parameters (only used when the policy is an ActorCriticTrialMemory)
+        trial_memory_sweep_chunk_size: int | None = None,
+        trial_memory_cache_dtype: str | None = None,
+        terminal_obs_key: str | None = None,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -121,6 +133,30 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        # If set, the observation normalizers are not updated during collection. The runner is then
+        # responsible for calling :meth:`commit_obs_normalization` once the rollout has been consumed,
+        # so that a rollout is acted and reconstructed under identical normalizer statistics.
+        self.defer_obs_normalization = defer_obs_normalization
+
+        # Trial-memory (hierarchical multi-episode) training.
+        # Note: the routing is on the policy *class*, not on ``is_recurrent`` -- the recurrent minibatch
+        #   generator splits on episode dones and would be wrong here (it knows nothing about trials or pairs).
+        self.is_trial_memory = isinstance(policy, ActorCriticTrialMemory)
+        self.trial_memory_sweep_chunk_size = trial_memory_sweep_chunk_size
+        self.trial_memory_cache_dtype = (
+            None if trial_memory_cache_dtype is None else getattr(torch, trial_memory_cache_dtype)
+        )
+        # Key under which the environment publishes the *true* terminal observation in ``extras``. In IsaacLab
+        # the observation returned by ``step()`` is already the post-reset one, so without such a key the
+        # terminal token's observation slot is zeros (see :meth:`process_env_step`).
+        self.terminal_obs_key = terminal_obs_key
+        if self.is_trial_memory:
+            if self.rnd is not None:
+                raise ValueError("RND is not supported with ActorCriticTrialMemory (the pair update has no RND path).")
+            if self.symmetry is not None and (
+                self.symmetry["use_data_augmentation"] or self.symmetry["use_mirror_loss"]
+            ):
+                raise ValueError("Symmetry augmentation is not supported for the trial-memory policy.")
 
     def init_storage(
         self,
@@ -141,7 +177,9 @@ class PPO:
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        if self.policy.is_recurrent:
+        # Note: the trial-memory policy's "hidden state" is the whole memory Z [N, M, d]; storing it per step
+        #   would cost tens of GB and it is recomputed from the raw data anyway, so it is not saved.
+        if self.policy.is_recurrent and not self.is_trial_memory:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
@@ -157,14 +195,19 @@ class PPO:
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         # Update the normalizers
-        self.policy.update_normalization(obs)
-        if self.rnd:
-            self.rnd.update_normalization(obs)
+        # Note: When deferred, the runner commits the update after update() via commit_obs_normalization()
+        if not self.defer_obs_normalization:
+            self.commit_obs_normalization(obs)
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
+        # The rewards the acting path put into its tokens, kept separately from the ones GAE consumes
+        self.transition.raw_rewards = rewards.clone()
         self.transition.dones = dones
+        # Trial boundary. Defaults to the episode done, i.e. one episode per trial.
+        trial_dones = extras.get("trial_done", dones) if extras is not None else dones
+        self.transition.trial_dones = trial_dones.to(self.device)
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -174,15 +217,75 @@ class PPO:
             self.transition.rewards += self.intrinsic_rewards
 
         # Bootstrapping on time outs
+        # Note: Only at a trial end. Inside a trial, GAE keeps bootstrapping through the episode
+        #   boundary itself (next_is_not_terminal stays 1), so adding the value here would count it twice.
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
-            )
+            time_outs = extras["time_outs"].unsqueeze(1).to(self.device).float()
+            trial_ends = self.transition.trial_dones.view(-1, 1).to(self.device).float()
+            self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * time_outs * trial_ends, 1)
+
+        # Advance the trial-memory policy's acting state (before the episode/trial resets below)
+        if self.is_trial_memory:
+            self._advance_trial_memory(obs, rewards, dones, extras)
 
         # Record the transition
+        trial_dones = self.transition.trial_dones
         self.storage.add_transitions(self.transition)
         self.transition.clear()
-        self.policy.reset(dones)
+        # Two distinct reset signals: an episode boundary clears the short-term tokens and the KV cache, a trial
+        # boundary additionally resets the persistent memory Z back to Z_init.
+        if self.is_trial_memory:
+            self.policy.reset(dones, trial_dones=trial_dones)
+        else:
+            self.policy.reset(dones)
+
+    def _advance_trial_memory(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+    ) -> None:
+        """Run the acting-boundary protocol of :class:`ActorCriticTrialMemory` for one environment step.
+
+        Order (documented by the policy): ``record_transition`` -> ``append_terminal_token`` -> ``update_memory``,
+        with the episode/trial resets happening afterwards in :meth:`process_env_step`.
+
+        The terminal token exists so that the memory writer can see the outcome of the attempt; its content is
+        ``(o_{T+1}, a_T, r_T, d_T)``. In IsaacLab the observation handed to this method is already the
+        **post-reset** observation of a terminated environment, so it must not be used: it would leak the next
+        episode's state into ``H_e``. If the environment publishes the true terminal observation under
+        :attr:`terminal_obs_key` we use (and store) that, otherwise the observation slot is zeros on both the
+        acting and the reconstruction path -- the load-bearing content is the final reward and done flag.
+        """
+        terminal_obs = None
+        if self.terminal_obs_key is not None and extras is not None and self.terminal_obs_key in extras:
+            terminal_obs = extras[self.terminal_obs_key].to(self.device)
+            self.transition.terminal_observations = terminal_obs
+
+        # Stash r_T / d_T so that the terminal token can carry them
+        self.policy.record_transition(rewards, dones)
+
+        done_ids = dones.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if done_ids.numel() > 0:
+            token_obs = terminal_obs if terminal_obs is not None else _zeros_like_obs(obs)
+            self.policy.append_terminal_token(token_obs, env_ids=done_ids)
+            self.policy.update_memory(done_ids)
+
+    def commit_obs_normalization(self, obs_batch: TensorDict) -> None:
+        """Update the observation normalizers from a batch of observations.
+
+        Called on every collection step unless :attr:`defer_obs_normalization` is set, in which case the
+        runner calls it once after :meth:`update`, so that acting and reconstruction of a rollout share
+        the same normalizer statistics.
+
+        Args:
+            obs_batch: Observations, either a single step ``[num_envs, ...]`` or a stored rollout
+                ``[num_transitions, num_envs, ...]``. Extra leading dimensions are flattened.
+        """
+        # The normalizers reduce over dim 0 only, so collapse any extra leading (time) dimensions
+        batch_dims = getattr(obs_batch, "batch_dims", 1)
+        if batch_dims > 1:
+            obs_batch = obs_batch.flatten(0, batch_dims - 1)
+        self.policy.update_normalization(obs_batch)
+        if self.rnd:
+            self.rnd.update_normalization(obs_batch)
 
     def compute_returns(self, obs: TensorDict) -> None:
         # Compute value for the last step
@@ -192,6 +295,10 @@ class PPO:
         )
 
     def update(self) -> dict[str, float]:
+        # The trial-memory policy trains on adjacent episode pairs, not on flat transitions
+        if self.is_trial_memory:
+            return self._update_trial_memory()
+
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
@@ -444,6 +551,199 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
 
         return loss_dict
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Trial-memory update (adjacent episode pairs)
+    # ----------------------------------------------------------------------------------------------------------
+
+    def trial_pair_forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct one minibatch of pairs and return the target hidden states and the memory fed to them.
+
+        Implements the pair recipe:
+
+        1. ``Zbar_e`` comes from the per-epoch sweep and is already **stopgrad**,
+        2. with a source: ``H_e^theta = forward_sequence(tau_e, Zbar_e)`` *with grad*, then
+           ``Z_{e+1}^theta = write_memory(Zbar_e, H_e^theta)``,
+        3. without a source (the degenerate ``(None, tau_1)`` pair): ``Z_{e+1}^theta = Z_init``,
+        4. ``H_{e+1}^theta = forward_sequence(tau_{e+1}, Z_{e+1}^theta)`` -- ``Z_{e+1}^theta`` is **not**
+           detached; detaching it would delete the entire memory-learning signal.
+
+        Returns:
+            ``H_{e+1}`` ``[S, B, d]`` and ``Z_{e+1}`` ``[B, M, d]``.
+        """
+        target = batch["target"]
+        param_dtype = self.policy.z_init.dtype
+        # Zbar_e, detached by the generator (the cache may be kept in a smaller dtype than the parameters)
+        incoming = batch["memory"].to(dtype=param_dtype)
+        batch_size = incoming.shape[0]
+
+        # Note: the degenerate pair uses the *differentiable* Z_init rather than its detached copy from the
+        #   sweep, so that a first-episode loss still trains the learned NO_MEMORY tokens (the values are
+        #   identical, only the gradient path differs).
+        memory = self.policy.initial_memory(batch_size, device=incoming.device).clone()
+        source_slots = batch["source_slots"]
+        if batch["source"] is not None and source_slots.numel() > 0:
+            source = batch["source"]
+            source_memory = incoming[source_slots]
+            source_hidden = self.policy.forward_sequence(
+                source["obs"],
+                source["prev_actions"],
+                source["prev_rewards"],
+                source["prev_dones"],
+                memory=source_memory,
+                mask=source["mask"],
+            )
+            written, _ = self.policy.write_memory(
+                source_memory, source_hidden.transpose(0, 1), mask=source["mask"].transpose(0, 1)
+            )
+            memory = memory.index_copy(0, source_slots, written)
+
+        hidden = self.policy.forward_sequence(
+            target["obs"],
+            target["prev_actions"],
+            target["prev_rewards"],
+            target["prev_dones"],
+            memory=memory,
+            mask=target["mask"],
+        )
+        return hidden, memory
+
+    def _update_trial_memory(self) -> dict[str, float]:
+        """PPO over adjacent episode pairs: the clipped loss is taken on the target episode only."""
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_entropy = 0.0
+        # Probability-ratio diagnostics -- the reconstruction canary of the design doc lives here
+        mean_ratio = 0.0
+        mean_ratio_std = 0.0
+        mean_ratio_clip_frac = 0.0
+        ratio_min = float("inf")
+        ratio_max = float("-inf")
+        num_updates = 0
+
+        generator = self.storage.trial_pair_mini_batch_generator(
+            self.policy,
+            self.num_mini_batches,
+            self.num_learning_epochs,
+            sweep_chunk_size=self.trial_memory_sweep_chunk_size,
+            memory_dtype=self.trial_memory_cache_dtype,
+        )
+
+        for batch in generator:
+            target = batch["target"]
+            hidden, _ = self.trial_pair_forward(batch)
+
+            # Every quantity below lives on the target episode's acting steps only (no terminal token, no padding)
+            loss_mask = target["loss_mask"]
+            distribution = self.policy.update_distribution_from_hidden(hidden)
+            actions_log_prob = distribution.log_prob(target["actions"]).sum(dim=-1)[loss_mask]
+            entropy_batch = distribution.entropy().sum(dim=-1)[loss_mask]
+            mu_batch = distribution.mean[loss_mask]
+            sigma_batch = distribution.stddev[loss_mask]
+            value_batch = self.policy.value_from_hidden(hidden)[loss_mask]
+
+            # The PPO denominator is always the stored behavior log-prob; it is never recomputed.
+            old_actions_log_prob_batch = target["old_actions_log_prob"][loss_mask].squeeze(-1)
+            advantages_batch = target["advantages"][loss_mask].squeeze(-1)
+            returns_batch = target["returns"][loss_mask]
+            target_values_batch = target["values"][loss_mask]
+            old_mu_batch = target["old_mu"][loss_mask]
+            old_sigma_batch = target["old_sigma"][loss_mask]
+
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+
+            # Compute KL divergence and adapt the learning rate
+            if self.desired_kl is not None and self.schedule == "adaptive":
+                with torch.inference_mode():
+                    kl = torch.sum(
+                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
+                        / (2.0 * torch.square(sigma_batch))
+                        - 0.5,
+                        axis=-1,
+                    )
+                    kl_mean = torch.mean(kl)
+
+                    if self.is_multi_gpu:
+                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                        kl_mean /= self.gpu_world_size
+
+                    if self.gpu_global_rank == 0:
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                    if self.is_multi_gpu:
+                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                        torch.distributed.broadcast(lr_tensor, src=0)
+                        self.learning_rate = lr_tensor.item()
+
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+
+            # Surrogate loss
+            ratio = torch.exp(actions_log_prob - old_actions_log_prob_batch)
+            surrogate = -advantages_batch * ratio
+            surrogate_clipped = -advantages_batch * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+            # Probability-ratio diagnostics
+            with torch.no_grad():
+                flat_ratio = ratio.detach().reshape(-1)
+                mean_ratio += flat_ratio.mean().item()
+                mean_ratio_std += flat_ratio.std().item()
+                mean_ratio_clip_frac += ((flat_ratio - 1.0).abs() > self.clip_param).float().mean().item()
+                ratio_min = min(ratio_min, flat_ratio.min().item())
+                ratio_max = max(ratio_max, flat_ratio.max().item())
+
+            # Value function loss
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # Gradient step
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.is_multi_gpu:
+                # Not every parameter is reached by every minibatch (Z_init is only trained by the degenerate
+                # pairs), and reduce_parameters() flattens exactly the parameters that have a gradient -- so
+                # ranks would disagree on the buffer layout. Materialize the missing gradients as zeros.
+                for param in self.policy.parameters():
+                    if param.grad is None:
+                        param.grad = torch.zeros_like(param)
+                self.reduce_parameters()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += entropy_batch.mean().item()
+            num_updates += 1
+
+        num_updates = max(num_updates, 1)
+        self.storage.clear()
+
+        return {
+            "value_function": mean_value_loss / num_updates,
+            "surrogate": mean_surrogate_loss / num_updates,
+            "entropy": mean_entropy / num_updates,
+            "ratio_mean": mean_ratio / num_updates,
+            "ratio_std": mean_ratio_std / num_updates,
+            "ratio_min": ratio_min,
+            "ratio_max": ratio_max,
+            "ratio_clip_frac": mean_ratio_clip_frac / num_updates,
+        }
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
