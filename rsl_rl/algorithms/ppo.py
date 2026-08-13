@@ -58,6 +58,7 @@ class PPO:
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
+        adaptive_lr_max: float = 1e-2,
         device: str = "cpu",
         normalize_advantage_per_mini_batch: bool = False,
         defer_obs_normalization: bool = False,
@@ -146,6 +147,12 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
+        # Ceiling for the adaptive-KL LR controller. Upstream hardcodes 1e-2, which is ~100x the
+        # base LR: with gSDE the first minibatches on fresh data read KL ~ 0, so the controller
+        # multiplies LR x1.5 per minibatch (epochs x minibatches chances per update) and can blast
+        # a transformer trunk apart mid-update before KL catches up (run-225872 postmortem:
+        # sustained surrogate ~0.25 / clip_frac 0.7 / ratio_max 28 at nominal lr 1e-4).
+        self.adaptive_lr_max = float(adaptive_lr_max)
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
@@ -485,7 +492,7 @@ class PPO:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            self.learning_rate = min(self.adaptive_lr_max, self.learning_rate * 1.5)
 
                     # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
@@ -798,7 +805,7 @@ class PPO:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            self.learning_rate = min(self.adaptive_lr_max, self.learning_rate * 1.5)
 
                     if self.is_multi_gpu:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
@@ -910,6 +917,9 @@ class PPO:
             "ratio_max_dev_lag0_first_mb": first_batch_lag0_dev,
             # Trial-pool accounting. Anything but zeros in the ``dropped``/``envs_without_data`` lines means
             # collected experience is being thrown away.
+            # The LIVE adaptive LR after this update -- the run-225872 collapse (LR silently ramping
+            # x1.5/minibatch to the ceiling) was invisible without it.
+            "adaptive_lr": float(self.learning_rate),
             "pool_pairs": float(pool["num_pairs"]),
             "pool_pairs_lag0": float(pool["lag0_pairs"]),
             "pool_trials": float(pool["num_trials"]),
