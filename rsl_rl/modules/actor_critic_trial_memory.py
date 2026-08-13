@@ -262,6 +262,7 @@ class ActorCriticTrialMemory(nn.Module):
         activation: str = "gelu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
+        detach_critic_trunk: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the trial-memory actor-critic.
@@ -324,6 +325,11 @@ class ActorCriticTrialMemory(nn.Module):
 
         self.num_actor_obs = num_actor_obs
         self.num_actions = num_actions
+        # Detach the trunk readout before the value head: the value loss then trains ONLY the
+        # critic head and can never rewrite the shared trunk. Added after run 225872, where the
+        # unfreeze handed a ~20-magnitude residual value loss (vs ~0.05 surrogate) the trunk and
+        # bulldozed the 85% BC policy to 14% in two updates.
+        self.detach_critic_trunk = bool(detach_critic_trunk)
         self.d_model = d_model
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -663,9 +669,13 @@ class ActorCriticTrialMemory(nn.Module):
         self._update_distribution(hidden)
         return hidden, self.distribution.sample()
 
+    def _critic_input(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The value head's view of the trunk readout (detached when ``detach_critic_trunk``)."""
+        return hidden.detach() if self.detach_critic_trunk else hidden
+
     def evaluate_sequence(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """:meth:`forward_sequence` followed by the value head. Returns values ``[S, B, 1]``."""
-        return self.critic(self.forward_sequence(*args, **kwargs))
+        return self.critic(self._critic_input(self.forward_sequence(*args, **kwargs)))
 
     def action_mean_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         """Policy mean from a hidden state produced by either forward path."""
@@ -678,7 +688,7 @@ class ActorCriticTrialMemory(nn.Module):
 
     def value_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
         """Value from a hidden state produced by either forward path."""
-        return self.critic(hidden)
+        return self.critic(self._critic_input(hidden))
 
     def write_memory(
         self,
@@ -807,9 +817,9 @@ class ActorCriticTrialMemory(nn.Module):
         value at the end of a rollout, after :meth:`record_transition` -- it peeks a token without committing it.
         """
         if use_cached_hidden and self._last_hidden is not None:
-            return self.critic(self._last_hidden)
+            return self.critic(self._critic_input(self._last_hidden))
         hidden = self.forward_step(obs, prev_actions, prev_rewards, prev_dones, commit=False)
-        return self.critic(hidden)
+        return self.critic(self._critic_input(hidden))
 
     def record_transition(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
         """Stash ``r_{t}`` / ``d_{t}`` so the *next* token can carry them. Call once per environment step."""
