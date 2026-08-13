@@ -533,6 +533,96 @@ class RolloutStorage:
         if self._pair_index is not None:
             return self._pair_index
 
+        seg = self._segment_rollout()
+        num_envs, device = self.num_envs, self.device
+        ep_start, ep_len, ep_env, ep_pos = seg["ep_start"], seg["ep_len"], seg["ep_env"], seg["ep_pos"]
+        ep_trial = seg["ep_trial"]
+        trial_env, trial_lag = seg["trial_env"], seg["trial_lag"]
+        trial_closed, trial_all_closed = seg["trial_closed"], seg["trial_all_closed"]
+        trial_first_row, trial_last_row = seg["trial_first_row"], seg["trial_last_row"]
+        trial_window_start = seg["trial_window_start"]
+
+        # Entirely in front of the window: consumed by an earlier update (or never written). Not data loss.
+        trial_stale = trial_last_row < trial_window_start
+        # The window's first row is a genuine trial start unless a carried trial was longer than the carry
+        # region, in which case its first steps -- and with them its memory -- are gone.
+        trial_started = (trial_first_row > trial_window_start) | self.at_trial_start.to(device)[trial_env]
+        live = ~trial_stale
+        # Still running: keep it in the buffer, train on it when it completes. NOT dropped.
+        trial_deferred = live & trial_started & ~trial_closed
+        trial_truncated = live & ~trial_started
+        trial_lagged = live & trial_started & trial_closed & trial_all_closed & (trial_lag > self.max_policy_lag)
+        valid_trial = live & trial_started & trial_closed & trial_all_closed & (trial_lag <= self.max_policy_lag)
+
+        keep = valid_trial[ep_trial]
+        selected = keep.nonzero(as_tuple=False).squeeze(-1)
+        ep_start_c = ep_start[selected]
+        ep_len_c = ep_len[selected]
+        ep_env_c = ep_env[selected]
+        ep_pos_c = ep_pos[selected]
+        ep_lag_c = trial_lag[ep_trial][selected]
+
+        # Filtering removes whole trials, so a kept episode's predecessor inside its trial stays at index - 1.
+        if selected.numel() > 0:
+            successor = ep_pos_c > 0
+            if bool(successor.any()):
+                prev = successor.nonzero(as_tuple=False).squeeze(-1) - 1
+                assert bool((ep_env_c[prev] == ep_env_c[successor]).all()), "pair source/target env mismatch"
+                assert bool((ep_pos_c[prev] + 1 == ep_pos_c[successor]).all()), "pair source/target are not adjacent"
+
+        # -- accounting. "Dropped" means lost for good; a deferred trial is neither kept nor lost yet. --
+        def episodes_in(trial_mask: torch.Tensor) -> int:
+            return int(trial_mask[ep_trial].sum().item())
+
+        dropped = trial_truncated | trial_lagged
+        dropped_eps = episodes_in(dropped)
+        dropped_trials = int(dropped.sum().item())
+        dropped_envs = int(torch.unique(trial_env[dropped]).numel()) if dropped_trials else 0
+        deferred_trials = int(trial_deferred.sum().item())
+        deferred_eps = episodes_in(trial_deferred)
+        # An environment that contributes nothing to this update is the signature of the failure mode this
+        # buffer exists to prevent (a permanently phase-shifted environment silently going dark).
+        envs_without_data = num_envs - int(torch.unique(ep_env_c).numel())
+        lag0_pairs = int((ep_lag_c == 0).sum().item())
+        if verbose:
+            print(
+                f"[RolloutStorage] trial pool: {selected.numel()} episodes in"
+                f" {int(valid_trial.sum().item())} trials ({lag0_pairs} pairs at lag 0);"
+                f" deferred {deferred_eps} episodes in {deferred_trials} open trials;"
+                f" dropped {dropped_eps} episodes in {dropped_trials} trials"
+                f" ({int(trial_lagged.sum().item())} too lagged, {int(trial_truncated.sum().item())} whose"
+                f" start no longer fits the buffer) across {dropped_envs} envs;"
+                f" {envs_without_data}/{num_envs} envs contributed nothing."
+            )
+
+        self._pair_index = {
+            "ep_start": ep_start_c,
+            "ep_len": ep_len_c,
+            "ep_env": ep_env_c,
+            "ep_pos": ep_pos_c,
+            "ep_lag": ep_lag_c,
+            "num_pairs": int(selected.numel()),
+            "num_trials": int(valid_trial.sum().item()),
+            "max_len": int(ep_len_c.max().item()) if selected.numel() > 0 else 0,
+            "dropped_episodes": dropped_eps,
+            "dropped_trials": dropped_trials,
+            "dropped_envs": dropped_envs,
+            "dropped_lagged_trials": int(trial_lagged.sum().item()),
+            "dropped_truncated_trials": int(trial_truncated.sum().item()),
+            "deferred_episodes": deferred_eps,
+            "deferred_trials": deferred_trials,
+            "envs_without_data": envs_without_data,
+            "lag0_pairs": lag0_pairs,
+        }
+        return self._pair_index
+
+    def _segment_rollout(self) -> dict[str, torch.Tensor | int]:
+        """Split the buffer into episodes and trials, with **no** filtering (stale rows included).
+
+        The raw segmentation shared by :meth:`build_trial_pairs` (which then keeps only trainable trials) and
+        :meth:`live_episode_index` (which keeps every trial that still holds live data, including the open one).
+        Everything is derived from the stored dones -- boundaries are never assumed at fixed indices.
+        """
         num_steps, num_envs, device = self.num_transitions_per_env, self.num_envs, self.device
         # A trial end always closes the episode it ends, even if the caller only flagged the trial.
         dones = self.dones.reshape(num_steps, num_envs).bool() | self.trial_dones.reshape(num_steps, num_envs).bool()
@@ -613,98 +703,80 @@ class RolloutStorage:
         versions = self.policy_versions.reshape(num_steps, num_envs)
         trial_lag = self.policy_version - versions[trial_first_row, trial_env]
 
-        # Entirely in front of the window: consumed by an earlier update (or never written). Not data loss.
-        trial_stale = trial_last_row < trial_window_start
-        # The window's first row is a genuine trial start unless a carried trial was longer than the carry
-        # region, in which case its first steps -- and with them its memory -- are gone.
-        trial_started = (trial_first_row > trial_window_start) | self.at_trial_start.to(device)[trial_env]
-        live = ~trial_stale
-        # Still running: keep it in the buffer, train on it when it completes. NOT dropped.
-        trial_deferred = live & trial_started & ~trial_closed
-        trial_truncated = live & ~trial_started
-        trial_lagged = live & trial_started & trial_closed & trial_all_closed & (trial_lag > self.max_policy_lag)
-        valid_trial = live & trial_started & trial_closed & trial_all_closed & (trial_lag <= self.max_policy_lag)
-
-        keep = valid_trial[ep_trial]
-        selected = keep.nonzero(as_tuple=False).squeeze(-1)
-        ep_start_c = ep_start[selected]
-        ep_len_c = ep_len[selected]
-        ep_env_c = ep_env[selected]
-        ep_pos_c = ep_pos[selected]
-        ep_lag_c = trial_lag[ep_trial][selected]
-
-        # Filtering removes whole trials, so a kept episode's predecessor inside its trial stays at index - 1.
-        if selected.numel() > 0:
-            successor = ep_pos_c > 0
-            if bool(successor.any()):
-                prev = successor.nonzero(as_tuple=False).squeeze(-1) - 1
-                assert bool((ep_env_c[prev] == ep_env_c[successor]).all()), "pair source/target env mismatch"
-                assert bool((ep_pos_c[prev] + 1 == ep_pos_c[successor]).all()), "pair source/target are not adjacent"
-
-        # -- accounting. "Dropped" means lost for good; a deferred trial is neither kept nor lost yet. --
-        def episodes_in(trial_mask: torch.Tensor) -> int:
-            return int(trial_mask[ep_trial].sum().item())
-
-        dropped = trial_truncated | trial_lagged
-        dropped_eps = episodes_in(dropped)
-        dropped_trials = int(dropped.sum().item())
-        dropped_envs = int(torch.unique(trial_env[dropped]).numel()) if dropped_trials else 0
-        deferred_trials = int(trial_deferred.sum().item())
-        deferred_eps = episodes_in(trial_deferred)
-        # An environment that contributes nothing to this update is the signature of the failure mode this
-        # buffer exists to prevent (a permanently phase-shifted environment silently going dark).
-        envs_without_data = num_envs - int(torch.unique(ep_env_c).numel())
-        lag0_pairs = int((ep_lag_c == 0).sum().item())
-        if verbose:
-            print(
-                f"[RolloutStorage] trial pool: {selected.numel()} episodes in"
-                f" {int(valid_trial.sum().item())} trials ({lag0_pairs} pairs at lag 0);"
-                f" deferred {deferred_eps} episodes in {deferred_trials} open trials;"
-                f" dropped {dropped_eps} episodes in {dropped_trials} trials"
-                f" ({int(trial_lagged.sum().item())} too lagged, {int(trial_truncated.sum().item())} whose"
-                f" start no longer fits the buffer) across {dropped_envs} envs;"
-                f" {envs_without_data}/{num_envs} envs contributed nothing."
-            )
-
-        self._pair_index = {
-            "ep_start": ep_start_c,
-            "ep_len": ep_len_c,
-            "ep_env": ep_env_c,
-            "ep_pos": ep_pos_c,
-            "ep_lag": ep_lag_c,
-            "num_pairs": int(selected.numel()),
-            "num_trials": int(valid_trial.sum().item()),
-            "max_len": int(ep_len_c.max().item()) if selected.numel() > 0 else 0,
-            "dropped_episodes": dropped_eps,
-            "dropped_trials": dropped_trials,
-            "dropped_envs": dropped_envs,
-            "dropped_lagged_trials": int(trial_lagged.sum().item()),
-            "dropped_truncated_trials": int(trial_truncated.sum().item()),
-            "deferred_episodes": deferred_eps,
-            "deferred_trials": deferred_trials,
-            "envs_without_data": envs_without_data,
-            "lag0_pairs": lag0_pairs,
+        return {
+            "ep_start": ep_start,
+            "ep_len": ep_len,
+            "ep_env": ep_env,
+            "ep_pos": ep_pos,
+            "ep_trial": ep_trial,
+            "ep_last_step": ep_last_step,
+            "ep_closed": ep_closed,
+            "ep_ends_trial": ep_ends_trial,
+            "num_eps": num_eps,
+            "num_trials": num_trials,
+            "trial_env": trial_env,
+            "trial_closed": trial_closed,
+            "trial_all_closed": trial_all_closed,
+            "trial_first_row": trial_first_row,
+            "trial_last_row": trial_last_row,
+            "trial_window_start": trial_window_start,
+            "trial_lag": trial_lag,
+            "window_start": window_start.reshape(-1),
         }
-        return self._pair_index
+
+    def live_episode_index(self) -> dict[str, torch.Tensor | int]:
+        """Every episode that still holds live data, **including** the ones of open (deferred) trials.
+
+        Same layout as :meth:`build_trial_pairs` (``ep_start`` / ``ep_len`` / ``ep_env`` / ``ep_pos`` plus
+        ``num_pairs`` / ``max_len``, so that :meth:`episode_batch` can consume it), but the only filter is
+        "the trial has at least one row inside the environment's window". This is what the critic value sweep
+        needs: GAE runs over the whole buffer and the advantage normalization reduces over every live row, so
+        the still-open trial's rows need a value too -- they simply are not trained on yet.
+
+        A trial whose start was truncated away (``at_trial_start`` False for a carried trial longer than the
+        carry region) is kept here and its first live episode is treated as position 0, i.e. its memory
+        restarts from ``Z_init``. That is an approximation, but such a trial is dropped by
+        :meth:`build_trial_pairs` when it completes, so it never reaches a PPO loss.
+        """
+        seg = self._segment_rollout()
+        ep_trial = seg["ep_trial"]
+        live_trial = seg["trial_last_row"] >= seg["trial_window_start"]
+        selected = live_trial[ep_trial].nonzero(as_tuple=False).squeeze(-1)
+        ep_len = seg["ep_len"][selected]
+        return {
+            "ep_start": seg["ep_start"][selected],
+            "ep_len": ep_len,
+            "ep_env": seg["ep_env"][selected],
+            "ep_pos": seg["ep_pos"][selected],
+            "ep_closed": seg["ep_closed"][selected],
+            "num_pairs": int(selected.numel()),
+            "max_len": int(ep_len.max().item()) if selected.numel() > 0 else 0,
+        }
 
     def episode_batch(
-        self, episode_ids: torch.Tensor, include_terminal_token: bool, include_targets: bool
+        self,
+        episode_ids: torch.Tensor,
+        include_terminal_token: bool,
+        include_targets: bool,
+        index: dict[str, torch.Tensor | int] | None = None,
     ) -> dict[str, torch.Tensor | TensorDict]:
         """Gather a padded ``[S, B, ...]`` batch of episodes from the flat rollout buffers.
 
         Args:
-            episode_ids: Indices into the arrays returned by :meth:`build_trial_pairs`.
+            episode_ids: Indices into the arrays of ``index``.
             include_terminal_token: Whether to append the terminal token ``x_{T+1} = Embed(o_{T+1}, a_T, r_T,
                 d_T)``. Sources need it (the writer must see the episode outcome); targets do not, since it emits
                 no action and takes no loss.
             include_targets: Whether to also gather the PPO targets (actions, old log-probs, advantages, ...).
+            index: Episode index to resolve ``episode_ids`` against. Defaults to the trainable pool of
+                :meth:`build_trial_pairs`; the critic value sweep passes :meth:`live_episode_index` instead.
 
         Returns:
             A dictionary with the token inputs (``obs``, ``prev_actions``, ``prev_rewards``, ``prev_dones``), the
             validity ``mask`` ``[S, B]`` and -- with ``include_targets`` -- the per-step PPO targets plus
             ``loss_mask`` ``[S, B]``, which is ``True`` only on the acting steps.
         """
-        index = self.build_trial_pairs()
+        index = self.build_trial_pairs() if index is None else index
         num_steps, num_envs, device = self.num_transitions_per_env, self.num_envs, self.device
         starts = index["ep_start"][episode_ids]
         lengths = index["ep_len"][episode_ids]
@@ -716,8 +788,12 @@ class RolloutStorage:
         is_terminal = offsets == lengths.unsqueeze(0)  # [S, B] the extra terminal row
         token_mask = action_mask | is_terminal if include_terminal_token else action_mask
 
-        current = (starts.unsqueeze(0) + offsets).clamp(max=num_steps - 1)
-        previous = (current - 1).clamp(min=0)
+        # Clamp the *unclamped* row index separately for the two gathers: an episode that ends on the very last
+        # buffer row has its terminal token at row ``num_steps``, and reading ``previous`` off the clamped
+        # ``current`` would then take row ``num_steps - 2`` instead of the episode's actual last step.
+        raw_rows = starts.unsqueeze(0) + offsets
+        current = raw_rows.clamp(max=num_steps - 1)
+        previous = (raw_rows - 1).clamp(min=0, max=num_steps - 1)
         current_flat = current * num_envs + envs.unsqueeze(0)
         previous_flat = previous * num_envs + envs.unsqueeze(0)
         # The token at t carries (o_t, a_{t-1}, r_{t-1}, d_{t-1}); the first token of an episode carries zeros,
@@ -786,7 +862,16 @@ class RolloutStorage:
         Returns:
             ``Zbar`` ``[num_pairs, M, d]``, detached, indexed like :meth:`build_trial_pairs`.
         """
-        index = self.build_trial_pairs()
+        return self._memory_checkpoints(self.build_trial_pairs(), policy, chunk_size, dtype)
+
+    def _memory_checkpoints(
+        self,
+        index: dict[str, torch.Tensor | int],
+        policy,
+        chunk_size: int | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """:meth:`compute_memory_checkpoints` over an arbitrary episode ``index`` (pool or live set)."""
         num_pairs = index["num_pairs"]
         param_dtype = policy.z_init.dtype
         cache_dtype = param_dtype if dtype is None else dtype
@@ -819,7 +904,9 @@ class RolloutStorage:
                 for start in range(0, sources.numel(), chunk):
                     source_ids = sources[start : start + chunk]
                     target_ids = targets[start : start + chunk]
-                    batch = self.episode_batch(source_ids, include_terminal_token=True, include_targets=False)
+                    batch = self.episode_batch(
+                        source_ids, include_terminal_token=True, include_targets=False, index=index
+                    )
                     incoming = memory[source_ids].to(param_dtype)
                     hidden = policy.forward_sequence(
                         batch["obs"],
@@ -834,6 +921,187 @@ class RolloutStorage:
                     )
                     memory[target_ids] = outgoing.to(cache_dtype)
         return memory
+
+    def compute_critic_values(self, policy, chunk_size: int | None = None, last_obs=None) -> torch.Tensor:
+        """Fill :attr:`values` for every live row with one batched sweep of the **separate** critic trunk.
+
+        Used instead of a per-step ``policy.evaluate()`` during collection: with ``critic_trunk="separate"`` the
+        value function has no incremental path, so the values are produced here, after the rollout, in the same
+        chunked/``no_grad`` shape as :meth:`compute_memory_checkpoints`:
+
+        1. segment every live episode (:meth:`live_episode_index`) -- including the still-open trial's, whose
+           rows GAE and the advantage normalization both touch,
+        2. roll the writer through each trial to get every episode's incoming memory ``Zbar`` (actor-side, the
+           memory the episode was acted with; it enters the critic detached),
+        3. one :meth:`~rsl_rl.modules.ActorCriticTrialMemory.forward_sequence_critic` per chunk, scattered back
+           into :attr:`values`.
+
+        Args:
+            policy: The trial-memory policy, built with ``critic_trunk="separate"``.
+            chunk_size: Maximum number of episodes forwarded at once. ``None`` means all of them.
+            last_obs: The observation returned by the final ``env.step()`` of the rollout. When given, the GAE
+                bootstrap value is computed exactly, as one extra token appended to each environment's open
+                episode; without it the bootstrap is zero.
+
+        Returns:
+            ``last_values`` ``[num_envs, 1]``, the GAE bootstrap for :meth:`compute_returns`.
+        """
+        device, num_steps, num_envs = self.device, self.num_transitions_per_env, self.num_envs
+        last_values = torch.zeros(num_envs, 1, device=device, dtype=self.values.dtype)
+        index = self.live_episode_index()
+        num_episodes = index["num_pairs"]
+        if num_episodes == 0:
+            return last_values
+
+        max_tokens = getattr(policy, "max_tokens", None)
+        if max_tokens is not None and index["max_len"] + 1 > max_tokens:
+            raise ValueError(
+                f"An episode of {index['max_len']} steps does not fit the policy's {max_tokens} token slots"
+                " (T + 1). Check max_episode_length."
+            )
+
+        param_dtype = policy.z_init.dtype
+        memory = self._memory_checkpoints(index, policy, chunk_size)
+        starts, envs = index["ep_start"], index["ep_env"]
+        chunk = num_episodes if chunk_size is None else int(chunk_size)
+
+        with torch.no_grad():
+            for begin in range(0, num_episodes, chunk):
+                episode_ids = torch.arange(begin, min(begin + chunk, num_episodes), device=device)
+                batch = self.episode_batch(
+                    episode_ids, include_terminal_token=False, include_targets=False, index=index
+                )
+                values = policy.forward_sequence_critic(
+                    batch["obs"],
+                    batch["prev_actions"],
+                    batch["prev_rewards"],
+                    batch["prev_dones"],
+                    memory=memory[episode_ids].to(param_dtype),
+                    mask=batch["mask"],
+                )
+                # Scatter [S, B, 1] back onto the (row, env) grid the buffer is indexed by.
+                mask = batch["mask"]
+                offsets = torch.arange(mask.shape[0], device=device).unsqueeze(1)
+                rows = starts[episode_ids].unsqueeze(0) + offsets
+                flat = rows.clamp(max=num_steps - 1) * num_envs + envs[episode_ids].unsqueeze(0)
+                self.values.reshape(-1, 1)[flat[mask]] = values[mask].to(self.values.dtype)
+
+            if last_obs is not None:
+                last_values = self._bootstrap_values(policy, index, memory, last_obs)
+        return last_values
+
+    def _bootstrap_values(
+        self, policy, index: dict[str, torch.Tensor | int], memory: torch.Tensor, last_obs
+    ) -> torch.Tensor:
+        """``V(s_{end})`` per environment, for the GAE bootstrap at the rollout boundary.
+
+        The pending observation is one extra token on top of the environment's last stored episode:
+
+        * the episode is still running (``done`` False on the last stored row) -- the token continues it, so the
+          whole episode prefix is re-run with the extra row appended and its value is read off that row,
+        * the episode ended on the last stored row -- the token is the FIRST token of the next episode
+          (``prev_action``/``prev_reward``/``prev_done`` zero, episode-start marker set, position 0), with the
+          memory the acting path would have moved on to: ``Z_init`` if the trial also ended, else
+          ``G(Zbar_e, H_e)``. (When the trial ended the bootstrap is multiplied by zero in
+          :meth:`compute_returns` anyway; it is computed for uniformity.)
+        """
+        device, num_steps, num_envs = self.device, self.num_transitions_per_env, self.num_envs
+        param_dtype = policy.z_init.dtype
+        last_values = torch.zeros(num_envs, 1, device=device, dtype=self.values.dtype)
+        end = self.carry_steps + self.step  # exclusive
+        if end == 0:
+            return last_values
+        starts, lengths, envs = index["ep_start"], index["ep_len"], index["ep_env"]
+
+        # The last live episode of every environment (episodes are ordered by (env, time)).
+        episode_ids = torch.arange(index["num_pairs"], device=device)
+        last_episode = torch.full((num_envs,), -1, dtype=torch.long, device=device).scatter_reduce(
+            0, envs, episode_ids, reduce="amax", include_self=True
+        )
+        has_episode = last_episode >= 0
+        # Only environments whose last episode actually ends at the rollout boundary can be bootstrapped.
+        at_boundary = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        valid = has_episode.nonzero(as_tuple=False).squeeze(-1)
+        ends = starts[last_episode[valid]] + lengths[last_episode[valid]]
+        at_boundary[valid] = ends == end
+        env_ids = at_boundary.nonzero(as_tuple=False).squeeze(-1)
+        if env_ids.numel() == 0:
+            return last_values
+
+        obs = policy.get_actor_obs(last_obs)
+        episode_of_env = last_episode[env_ids]
+        just_done = self.dones.reshape(num_steps, num_envs)[end - 1, env_ids].bool()
+
+        # -- environments whose episode is still running: prefix + one appended token --
+        running = (~just_done).nonzero(as_tuple=False).squeeze(-1)
+        if running.numel() > 0:
+            ids = episode_of_env[running]
+            running_envs = env_ids[running]
+            batch = self.episode_batch(ids, include_terminal_token=False, include_targets=False, index=index)
+            lengths_r = lengths[ids]
+            num_tokens = int(lengths_r.max().item()) + 1
+            pad = num_tokens - batch["mask"].shape[0]
+            offsets = torch.arange(num_tokens, device=device).unsqueeze(1)
+            is_pending = offsets == lengths_r.unsqueeze(0)  # [S, B]
+            token_mask = (offsets < lengths_r.unsqueeze(0)) | is_pending
+
+            # The pending row carries (o_end, a_{end-1}, r_{end-1}, d_{end-1}) -- exactly what the acting path's
+            # non-committing bootstrap token carries. Everything is worked in the concatenated observation
+            # tensor, so the pending observation and the stored prefix are gathered the same way.
+            def _append(value: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
+                if pad > 0:
+                    filler = torch.zeros_like(value[:1]).repeat(pad, *([1] * (value.dim() - 1)))
+                    value = torch.cat([value, filler])
+                return torch.where(_broadcast_mask(is_pending, value.dim()), row.unsqueeze(0), value)
+
+            flat_last = (end - 1) * num_envs + running_envs
+            token_obs = _append(policy.get_actor_obs(batch["obs"]), obs[running_envs])
+            prev_actions = _append(batch["prev_actions"], self.actions.reshape(-1, *self.actions_shape)[flat_last])
+            prev_rewards = _append(batch["prev_rewards"], self.raw_rewards.reshape(-1, 1)[flat_last])
+            prev_dones = _append(batch["prev_dones"], self.dones.reshape(-1, 1)[flat_last].float())
+            values = policy.forward_sequence_critic(
+                token_obs,
+                prev_actions,
+                prev_rewards,
+                prev_dones,
+                memory=memory[ids].to(param_dtype),
+                mask=token_mask,
+            )
+            last_values[running_envs] = values[is_pending].to(self.values.dtype)
+
+        # -- environments that just reset: the pending token starts a fresh episode --
+        reset = just_done.nonzero(as_tuple=False).squeeze(-1)
+        if reset.numel() > 0:
+            ids = episode_of_env[reset]
+            reset_envs = env_ids[reset]
+            trial_over = self.trial_dones.reshape(num_steps, num_envs)[end - 1, reset_envs].bool()
+            batch = self.episode_batch(ids, include_terminal_token=True, include_targets=False, index=index)
+            hidden = policy.forward_sequence(
+                batch["obs"],
+                batch["prev_actions"],
+                batch["prev_rewards"],
+                batch["prev_dones"],
+                memory=memory[ids].to(param_dtype),
+                mask=batch["mask"],
+            )
+            written, _ = policy.write_memory(
+                memory[ids].to(param_dtype), hidden.transpose(0, 1), mask=batch["mask"].transpose(0, 1)
+            )
+            initial = policy.initial_memory(int(reset.numel()), device=device).to(param_dtype)
+            next_memory = torch.where(trial_over.view(-1, 1, 1), initial, written)
+            num_reset = int(reset.numel())
+            zeros_action = torch.zeros(1, num_reset, *self.actions_shape, device=device, dtype=self.actions.dtype)
+            zeros_scalar = torch.zeros(1, num_reset, 1, device=device, dtype=self.rewards.dtype)
+            values = policy.forward_sequence_critic(
+                obs[reset_envs].unsqueeze(0),
+                zeros_action,
+                zeros_scalar,
+                zeros_scalar,
+                memory=next_memory,
+                mask=torch.ones(1, num_reset, dtype=torch.bool, device=device),
+            )
+            last_values[reset_envs] = values[0].to(self.values.dtype)
+        return last_values
 
     def trial_pair_mini_batch_generator(
         self,

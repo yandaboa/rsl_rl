@@ -21,6 +21,17 @@ Layout of one trunk input::
 * the policy head and the value head both consume the same ``h_t``. The critic is memory-conditioned, **not**
   privileged -- see ``META_MEMORY_DESIGN.md`` section 4.
 
+The critic has two possible trunks, selected by ``critic_trunk``:
+
+* ``"shared"`` (default, the original architecture): the value head sits on the actor's ``h_t``,
+* ``"separate"``: a full duplicate token pathway (``critic_token_embed`` / ``critic_blocks`` / ...), consuming the
+  same tokens and the same memory ``Z`` (entering **detached**), so that the value loss can fit a real value
+  function without ever touching the actor's representation. Every module of it is named ``critic_*`` so that
+  ``train.py``'s critic-warmup freeze filter (``n.startswith("critic")``) trains all of it. This exists because
+  the shared trunk made the BC -> RL recipe collapse at the warmup unfreeze: a value head on frozen features
+  plateaus at a ~20-magnitude loss, and the coherent trial-level advantages that plateau implies destroy the
+  policy on the first actor update.
+
 There are two forward paths and they are required to agree numerically:
 
 * incremental (acting) -- :meth:`forward_step` / :meth:`act` / :meth:`act_inference`, one token per call, backed
@@ -263,6 +274,7 @@ class ActorCriticTrialMemory(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         detach_critic_trunk: bool = False,
+        critic_trunk: str = "shared",
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the trial-memory actor-critic.
@@ -290,6 +302,13 @@ class ActorCriticTrialMemory(nn.Module):
             init_noise_std: Initial action noise standard deviation. Under ``"gsde"`` this is *not* the realized
                 action std -- see :meth:`_update_distribution` and ``calibrate_gsde_init.py``: the realized std is
                 ``init_noise_std * ||h_t||``, and ``||h_t|| = sqrt(d_model)`` for a fresh ``final_norm``.
+            detach_critic_trunk: Detach the trunk readout before the value head, so the value loss trains the
+                value head only. Only meaningful with ``critic_trunk="shared"``; ``"separate"`` supersedes it
+                (there is nothing shared left to protect).
+            critic_trunk: ``"shared"`` (the value head sits on the actor's ``h_t``) or ``"separate"`` (a full
+                duplicate ``critic_*`` token pathway; see the module docstring). ``"separate"`` has **no**
+                incremental/acting path -- :meth:`evaluate` and :meth:`value_from_hidden` raise, and values are
+                produced in batch by :meth:`forward_sequence_critic`.
             noise_std_type: ``"scalar"``, ``"log"`` or ``"gsde"``. The first two are a state-independent diagonal
                 Gaussian; ``"gsde"`` (generalized State-Dependent Exploration, https://arxiv.org/abs/2005.05719)
                 makes the std a function of the trunk readout ``h_t`` -- this is what the repo's validated BC -> RL
@@ -365,6 +384,26 @@ class ActorCriticTrialMemory(nn.Module):
         self.actor = MLP(d_model, num_actions, list(actor_hidden_dims), activation)
         self.critic = MLP(d_model, 1, list(critic_hidden_dims), activation)
 
+        # Optional fully separate critic pathway. Same shapes as the actor pathway, every module prefixed
+        # ``critic_`` so that the warm-start freeze filter (``n.startswith("critic")``) trains all of it, and no
+        # actor parameter is reachable from the value loss (the memory Z enters detached, see
+        # :meth:`forward_sequence_critic`). Batched-only: there is no KV cache and no acting state for it.
+        self.critic_trunk = str(critic_trunk)
+        if self.critic_trunk not in ("shared", "separate"):
+            raise ValueError(f"Unknown critic_trunk '{critic_trunk}'. Expected 'shared' or 'separate'.")
+        if self.critic_trunk == "separate":
+            if len(embed_hidden_dims) == 0:
+                self.critic_token_embed = nn.Linear(token_input_dim, d_model)
+            else:
+                self.critic_token_embed = MLP(token_input_dim, d_model, list(embed_hidden_dims), activation)
+            self.critic_pos_embed = nn.Parameter(torch.zeros(self.max_tokens, d_model))
+            self.critic_start_embed = nn.Parameter(torch.zeros(d_model))
+            self.critic_memory_pos_embed = nn.Parameter(torch.zeros(num_memory_tokens, d_model))
+            self.critic_blocks = nn.ModuleList([
+                TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)
+            ])
+            self.critic_final_norm = nn.LayerNorm(d_model)
+
         # Observation normalization (single stream, shared by both heads)
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
@@ -394,7 +433,10 @@ class ActorCriticTrialMemory(nn.Module):
         self._init_weights()
         self._reset_runtime_state()
 
-        print(f"Trial-memory trunk: L={num_layers} d={d_model} heads={num_heads} M={num_memory_tokens}")
+        print(
+            f"Trial-memory trunk: L={num_layers} d={d_model} heads={num_heads} M={num_memory_tokens}"
+            f" critic_trunk={self.critic_trunk}"
+        )
         print(f"Actor head: {self.actor}")
         print(f"Critic head: {self.critic}")
 
@@ -419,6 +461,13 @@ class ActorCriticTrialMemory(nn.Module):
         nn.init.normal_(self.memory_pos_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.start_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.z_init, mean=0.0, std=0.02)
+        if getattr(self, "critic_trunk", "shared") == "separate":
+            for block in self.critic_blocks:
+                block.attn.out_proj.weight.data.mul_(residual_scale)
+                block.ff[-1].weight.data.mul_(residual_scale)
+            nn.init.normal_(self.critic_pos_embed, mean=0.0, std=0.02)
+            nn.init.normal_(self.critic_memory_pos_embed, mean=0.0, std=0.02)
+            nn.init.normal_(self.critic_start_embed, mean=0.0, std=0.02)
 
     def _reset_runtime_state(self) -> None:
         """Drop every acting-time buffer (they are lazily re-allocated on the first :meth:`forward_step`)."""
@@ -549,6 +598,19 @@ class ActorCriticTrialMemory(nn.Module):
     # Token embedding + trunk
     # ------------------------------------------------------------------------------------------------------------
 
+    def _pathway(self, critic: bool = False) -> tuple[Any, ...]:
+        """The token pathway to run: the actor's, or (``critic=True``) the separate ``critic_*`` duplicate.
+
+        Returns ``(token_embed, pos_embed, start_embed, memory_pos_embed, blocks, final_norm)``.
+        """
+        if not critic:
+            return (self.token_embed, self.pos_embed, self.start_embed, self.memory_pos_embed, self.blocks,
+                    self.final_norm)
+        if self.critic_trunk != "separate":
+            raise RuntimeError("The critic token pathway only exists with critic_trunk='separate'.")
+        return (self.critic_token_embed, self.critic_pos_embed, self.critic_start_embed,
+                self.critic_memory_pos_embed, self.critic_blocks, self.critic_final_norm)
+
     def _embed_tokens(
         self,
         obs: torch.Tensor,
@@ -558,20 +620,29 @@ class ActorCriticTrialMemory(nn.Module):
         positions: torch.Tensor,
         is_start: torch.Tensor,
         normalize_obs: bool = True,
+        critic: bool = False,
     ) -> torch.Tensor:
-        """Build ``x = Embed(o, a_prev, r_prev, d_prev) + pos + start_marker``. All inputs share leading dims."""
+        """Build ``x = Embed(o, a_prev, r_prev, d_prev) + pos + start_marker``. All inputs share leading dims.
+
+        Note: both pathways normalize with the SAME ``actor_obs_normalizer`` -- there is one observation stream,
+        and the normalizer holds buffers only, so nothing differentiable is shared by this.
+        """
+        token_embed, pos_embed, start_embed, _, _, _ = self._pathway(critic)
         if normalize_obs:
             obs = self.actor_obs_normalizer(obs)
         features = torch.cat([obs, prev_actions, prev_rewards, prev_dones], dim=-1)
-        tokens = self.token_embed(features)
-        tokens = tokens + self.pos_embed[positions]
-        return tokens + is_start.unsqueeze(-1).to(tokens.dtype) * self.start_embed
+        tokens = token_embed(features)
+        tokens = tokens + pos_embed[positions]
+        return tokens + is_start.unsqueeze(-1).to(tokens.dtype) * start_embed
 
-    def _memory_kv_states(self, memory: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def _memory_kv_states(
+        self, memory: torch.Tensor, critic: bool = False
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Run the ``M`` memory tokens through the trunk and collect the per-layer keys/values they expose."""
-        states = memory + self.memory_pos_embed
+        _, _, _, memory_pos_embed, blocks, _ = self._pathway(critic)
+        states = memory + memory_pos_embed
         memory_kv = []
-        for block in self.blocks:
+        for block in blocks:
             states, keys, values = block.memory_forward(states)
             memory_kv.append((keys, values))
         return memory_kv
@@ -630,6 +701,28 @@ class ActorCriticTrialMemory(nn.Module):
         Returns:
             ``h`` ``[S, B, d]``. Rows where ``mask`` is ``False`` are meaningless and must be ignored by the caller.
         """
+        return self._forward_sequence(
+            obs, prev_actions, prev_rewards, prev_dones, memory, mask, episode_start, normalize_obs, critic=False
+        )
+
+    def _forward_sequence(
+        self,
+        obs: TensorDict | torch.Tensor,
+        prev_actions: torch.Tensor,
+        prev_rewards: torch.Tensor,
+        prev_dones: torch.Tensor,
+        memory: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        episode_start: torch.Tensor | None = None,
+        normalize_obs: bool = True,
+        critic: bool = False,
+    ) -> torch.Tensor:
+        """The batched trunk forward, shared by the actor pathway and the separate critic pathway.
+
+        The two differ ONLY in which set of modules :meth:`_pathway` hands back; the arithmetic (and hence the
+        PPO reconstruction canary on the actor path) is identical.
+        """
+        _, _, _, _, blocks, final_norm = self._pathway(critic)
         obs = self.get_actor_obs(obs)
         num_steps, batch_size = obs.shape[0], obs.shape[1]
         if num_steps > self.max_tokens:
@@ -644,14 +737,14 @@ class ActorCriticTrialMemory(nn.Module):
 
         positions = torch.arange(num_steps, device=device).unsqueeze(1).expand(num_steps, batch_size)
         tokens = self._embed_tokens(
-            obs, prev_actions, prev_rewards, prev_dones, positions, episode_start, normalize_obs
+            obs, prev_actions, prev_rewards, prev_dones, positions, episode_start, normalize_obs, critic=critic
         )
         # [S, B, d] -> [B, S, d]
         hidden = tokens.transpose(0, 1)
 
         attn_mask = self._sequence_attn_mask(num_steps, None if mask is None else mask.transpose(0, 1), device)
-        memory_kv = self._memory_kv_states(memory)
-        for block, (memory_keys, memory_values) in zip(self.blocks, memory_kv):
+        memory_kv = self._memory_kv_states(memory, critic=critic)
+        for block, (memory_keys, memory_values) in zip(blocks, memory_kv):
             normed, keys, values = block.token_kv(hidden)
             hidden = block.token_forward(
                 hidden,
@@ -660,8 +753,44 @@ class ActorCriticTrialMemory(nn.Module):
                 torch.cat([memory_values, values], dim=1),
                 attn_mask,
             )
-        hidden = self.final_norm(hidden)
+        hidden = final_norm(hidden)
         return hidden.transpose(0, 1)
+
+    def forward_sequence_critic(
+        self,
+        obs: TensorDict | torch.Tensor,
+        prev_actions: torch.Tensor,
+        prev_rewards: torch.Tensor,
+        prev_dones: torch.Tensor,
+        memory: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        episode_start: torch.Tensor | None = None,
+        normalize_obs: bool = True,
+    ) -> torch.Tensor:
+        """Values ``[S, B, 1]`` of a padded episode, through the **separate** critic pathway.
+
+        Mirrors :meth:`forward_sequence` (same tokens, same attention mask, same memory ``Z``) but runs the
+        ``critic_*`` modules and ends in the value head. ``memory`` enters **detached**: the writer, ``z_init``
+        and the actor trunk that produced ``Z`` must never see a value gradient -- that separation is the entire
+        point of the separate trunk.
+        """
+        if self.critic_trunk != "separate":
+            raise RuntimeError(
+                "forward_sequence_critic() requires critic_trunk='separate'; with the shared trunk use"
+                " evaluate_sequence()/value_from_hidden()."
+            )
+        hidden = self._forward_sequence(
+            obs,
+            prev_actions,
+            prev_rewards,
+            prev_dones,
+            memory.detach(),
+            mask,
+            episode_start,
+            normalize_obs,
+            critic=True,
+        )
+        return self.critic(hidden)
 
     def act_sequence(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """:meth:`forward_sequence` followed by the policy head. Returns ``(hidden, sampled_actions)``."""
@@ -674,7 +803,13 @@ class ActorCriticTrialMemory(nn.Module):
         return hidden.detach() if self.detach_critic_trunk else hidden
 
     def evaluate_sequence(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-        """:meth:`forward_sequence` followed by the value head. Returns values ``[S, B, 1]``."""
+        """:meth:`forward_sequence` followed by the value head. Returns values ``[S, B, 1]``.
+
+        With ``critic_trunk="separate"`` this forwards to :meth:`forward_sequence_critic` (identical signature),
+        so it never silently returns an actor-trunk value.
+        """
+        if self.critic_trunk == "separate":
+            return self.forward_sequence_critic(*args, **kwargs)
         return self.critic(self._critic_input(self.forward_sequence(*args, **kwargs)))
 
     def action_mean_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -687,7 +822,12 @@ class ActorCriticTrialMemory(nn.Module):
         return self.distribution
 
     def value_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Value from a hidden state produced by either forward path."""
+        """Value from a hidden state produced by either forward path (``critic_trunk="shared"`` only)."""
+        if self.critic_trunk == "separate":
+            raise RuntimeError(
+                "value_from_hidden() is meaningless with critic_trunk='separate': the value head consumes the"
+                " CRITIC trunk's readout, not the actor's. Use forward_sequence_critic() on the same tokens."
+            )
         return self.critic(self._critic_input(hidden))
 
     def write_memory(
@@ -815,7 +955,15 @@ class ActorCriticTrialMemory(nn.Module):
 
         Right after :meth:`act` this reuses the cached ``h_t`` (no extra token). Otherwise -- e.g. the bootstrap
         value at the end of a rollout, after :meth:`record_transition` -- it peeks a token without committing it.
+
+        Only available with ``critic_trunk="shared"``: the separate critic pathway is batched-only (no KV cache),
+        so PPO fills the values with a :meth:`forward_sequence_critic` sweep after collection instead.
         """
+        if self.critic_trunk == "separate":
+            raise RuntimeError(
+                "evaluate() is not available with critic_trunk='separate' (the critic pathway has no incremental"
+                " path). PPO must fill the values with a batched forward_sequence_critic sweep."
+            )
         if use_cached_hidden and self._last_hidden is not None:
             return self.critic(self._critic_input(self._last_hidden))
         hidden = self.forward_step(obs, prev_actions, prev_rewards, prev_dones, commit=False)

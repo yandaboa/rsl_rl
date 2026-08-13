@@ -165,6 +165,13 @@ class PPO:
         # Note: the routing is on the policy *class*, not on ``is_recurrent`` -- the recurrent minibatch
         #   generator splits on episode dones and would be wrong here (it knows nothing about trials or pairs).
         self.is_trial_memory = isinstance(policy, ActorCriticTrialMemory)
+        # With a separate critic trunk the value function has NO incremental path: nothing can be evaluated
+        # per collection step, so the values (and with them the timeout bootstrap and the GAE bootstrap) are
+        # produced by a batched sweep in :meth:`compute_returns`. See ActorCriticTrialMemory's ``critic_trunk``.
+        self.separate_critic_trunk = self.is_trial_memory and getattr(policy, "critic_trunk", "shared") == "separate"
+        # Per-step ``time_outs`` of the current rollout, needed to re-apply the timeout bootstrap after the
+        # sweep (at collection time the values are still zero, so the bootstrap there is a no-op).
+        self._time_out_flags: torch.Tensor | None = None
         self.trial_memory_sweep_chunk_size = trial_memory_sweep_chunk_size
         # Rows reserved for a trial that is still open when a rollout ends, so that it is carried into the
         # next rollout instead of being thrown away (see RolloutStorage's ``carry_steps``). ``None`` (or any
@@ -273,6 +280,10 @@ class PPO:
             carry_steps=carry_steps,
             max_policy_lag=self.max_policy_lag,
         )
+        if self.separate_critic_trunk:
+            self._time_out_flags = torch.zeros(
+                self.storage.num_transitions_per_env, num_envs, 1, device=self.device
+            )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         # Note: the trial-memory policy's "hidden state" is the whole memory Z [N, M, d]; storing it per step
@@ -281,7 +292,15 @@ class PPO:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()
+        if self.separate_critic_trunk:
+            # No per-step critic: placeholder zeros, overwritten by the sweep in compute_returns(). They also
+            # make the collection-time timeout bootstrap below an exact no-op, which is why it is re-applied
+            # (from ``raw_rewards``) once the real values exist.
+            self.transition.values = torch.zeros(
+                self.transition.actions.shape[0], 1, device=self.device, dtype=self.transition.actions.dtype
+            )
+        else:
+            self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -321,6 +340,19 @@ class PPO:
             time_outs = extras["time_outs"].unsqueeze(1).to(self.device).float()
             trial_ends = self.transition.trial_dones.view(-1, 1).to(self.device).float()
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * time_outs * trial_ends, 1)
+        else:
+            time_outs = None
+
+        # Remember the timeout flags of this rollout so that the bootstrap can be re-applied once the batched
+        # critic sweep has produced the values (with the placeholder zeros the line above changed nothing).
+        if self._time_out_flags is not None:
+            if self.storage.step == 0:
+                self._time_out_flags.zero_()
+            row = self.storage.row
+            if time_outs is None:
+                self._time_out_flags[row].zero_()
+            else:
+                self._time_out_flags[row].copy_(time_outs)
 
         # Advance the trial-memory policy's acting state (before the episode/trial resets below)
         if self.is_trial_memory:
@@ -386,11 +418,38 @@ class PPO:
             self.rnd.update_normalization(obs_batch)
 
     def compute_returns(self, obs: TensorDict) -> None:
-        # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
+        if self.separate_critic_trunk:
+            # Batched critic sweep instead of the per-step values: fills storage.values for every live row and
+            # returns the GAE bootstrap. Deliberately NOT under autocast -- it is a once-per-rollout no_grad
+            # pass whose output becomes the regression target of the whole update, so it stays in fp32.
+            last_values = self.storage.compute_critic_values(
+                self.policy, chunk_size=self.trial_memory_sweep_chunk_size, last_obs=obs
+            )
+            self._reapply_timeout_bootstrap()
+        else:
+            # Compute value for the last step
+            last_values = self.policy.evaluate(obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
+
+    def _reapply_timeout_bootstrap(self) -> None:
+        """Re-apply the trial-gated timeout bootstrap now that the swept values exist.
+
+        Identical arithmetic to the collection-time line in :meth:`process_env_step`
+        (``rewards += gamma * values * time_outs * trial_ends``), just recomputed from ``raw_rewards`` -- which
+        is exactly what that buffer is for. Recomputing from the raw rewards (rather than adding to the stored
+        ones) also makes this idempotent, so a carried row that is swept again in a later rollout never
+        accumulates two bootstraps.
+        """
+        storage = self.storage
+        time_outs = self._time_out_flags
+        if time_outs is None:
+            return
+        trial_ends = storage.trial_dones.float()
+        # Same association as the collection-time expression, so the result is bit-identical to what a
+        # per-step critic would have produced: raw + gamma * ((values * time_outs) * trial_ends).
+        storage.rewards.copy_(storage.raw_rewards + self.gamma * (storage.values * time_outs * trial_ends))
 
     def update(self) -> dict[str, float]:
         # The trial-memory policy trains on adjacent episode pairs, not on flat transitions
@@ -750,7 +809,7 @@ class PPO:
             # the heads. Everything downstream of it is per-step scalars, so it is upcast to fp32 below -- that is
             # both the AMP convention (losses in fp32, scaled) and what keeps the ratio diagnostics meaningful.
             with self._autocast():
-                hidden, _ = self.trial_pair_forward(batch)
+                hidden, memory = self.trial_pair_forward(batch)
 
                 # Every quantity below lives on the target episode's acting steps only (no terminal token,
                 # no padding)
@@ -760,7 +819,21 @@ class PPO:
                 entropy_batch = distribution.entropy().sum(dim=-1)[loss_mask]
                 mu_batch = distribution.mean[loss_mask]
                 sigma_batch = distribution.stddev[loss_mask]
-                value_batch = self.policy.value_from_hidden(hidden)[loss_mask]
+                if self.separate_critic_trunk:
+                    # Second trunk, same tokens: the value head consumes the critic pathway's readout, never
+                    # the actor's. ``memory`` is Z_{e+1}, the memory the TARGET episode was acted with (not the
+                    # source's Zbar_e); forward_sequence_critic detaches it, so no value gradient reaches the
+                    # writer, z_init or the actor trunk.
+                    value_batch = self.policy.forward_sequence_critic(
+                        target["obs"],
+                        target["prev_actions"],
+                        target["prev_rewards"],
+                        target["prev_dones"],
+                        memory=memory,
+                        mask=target["mask"],
+                    )[loss_mask]
+                else:
+                    value_batch = self.policy.value_from_hidden(hidden)[loss_mask]
 
             # Out of autocast: the loss arithmetic runs in fp32. The upcast is a no-op for anything that is not
             # half precision, so the fp32 path (and the fp64 exactness tests) are unchanged.
