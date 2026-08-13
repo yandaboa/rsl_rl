@@ -59,6 +59,7 @@ class PPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         adaptive_lr_max: float = 1e-2,
+        kl_early_stop_factor: float | None = None,
         device: str = "cpu",
         normalize_advantage_per_mini_batch: bool = False,
         defer_obs_normalization: bool = False,
@@ -153,6 +154,10 @@ class PPO:
         # a transformer trunk apart mid-update before KL catches up (run-225872 postmortem:
         # sustained surrogate ~0.25 / clip_frac 0.7 / ratio_max 28 at nominal lr 1e-4).
         self.adaptive_lr_max = float(adaptive_lr_max)
+        # Abort an update's remaining minibatches once the measured KL exceeds
+        # ``kl_early_stop_factor * desired_kl`` (None = off). Batch-size-invariant overshoot guard;
+        # only wired into the trial-pair update path.
+        self.kl_early_stop_factor = None if kl_early_stop_factor is None else float(kl_early_stop_factor)
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
@@ -792,6 +797,7 @@ class PPO:
         # minibatch, so even the rest of epoch 0 is already off-policy and its ratio is *supposed* to move.
         first_batch_lag0_dev = 0.0
         num_updates = 0
+        kl_early_stopped = False
         # Snapshot the pool accounting before update() consumes and clears the storage
         pool = dict(self.storage.build_trial_pairs())
 
@@ -887,6 +893,21 @@ class PPO:
 
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
+
+                # KL early stop: once this update has moved the policy past ``factor x desired_kl``,
+                # abort the remaining minibatches (this batch's step included -- the KL above is
+                # measured BEFORE stepping on it). The per-minibatch LR throttle reacts too slowly at
+                # scale: large coherent batches give Adam full-size normalized steps, so epochs x
+                # minibatches steps overshoot before KL feedback catches up (the 226401 collapse:
+                # success 0.65 -> 0.14 in two updates while the LR sat at its floor). ``kl_mean`` is
+                # already all-reduced, so every rank breaks in the same place.
+                if (
+                    self.kl_early_stop_factor is not None
+                    and num_updates > 0  # never abort before one step (also keeps the /num_updates means valid)
+                    and kl_mean > self.kl_early_stop_factor * self.desired_kl
+                ):
+                    kl_early_stopped = True
+                    break
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - old_actions_log_prob_batch)
@@ -993,6 +1014,10 @@ class PPO:
             # The LIVE adaptive LR after this update -- the run-225872 collapse (LR silently ramping
             # x1.5/minibatch to the ceiling) was invisible without it.
             "adaptive_lr": float(self.learning_rate),
+            # 1.0 when the KL early stop aborted this update; ``num_updates`` (via pool metrics and
+            # the per-update means) shows how many minibatches actually ran.
+            "kl_early_stopped": 1.0 if kl_early_stopped else 0.0,
+            "kl_minibatches_run": float(num_updates),
             "pool_pairs": float(pool["num_pairs"]),
             "pool_pairs_lag0": float(pool["lag0_pairs"]),
             "pool_trials": float(pool["num_trials"]),
