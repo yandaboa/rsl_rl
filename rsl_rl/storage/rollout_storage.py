@@ -616,6 +616,56 @@ class RolloutStorage:
         }
         return self._pair_index
 
+    def advantage_outcome_audit(self) -> dict[str, float]:
+        """Does the advantage a row carries agree with how that row's episode actually ended?
+
+        Over every row of every *trainable* (i.e. completed, see :meth:`build_trial_pairs`) episode in the
+        buffer:
+
+        * ``adv/return_corr`` -- Pearson correlation between the per-row advantage and the total **raw** return
+          of the episode the row belongs to. A trial-level credit assignment that has degenerated into "the
+          whole trial was good/bad" shows up here as a correlation near 1; a value function that has stopped
+          tracking outcomes shows up as one near 0,
+        * ``adv/frac_pos_in_top_quartile_episodes`` / ``adv/frac_pos_in_bottom_quartile_episodes`` -- the
+          fraction of rows with a positive advantage inside the best / worst quarter of episodes (ranked by
+          raw return within this batch). Healthy PPO reinforces most of the good episodes and few of the bad
+          ones; the two numbers collapsing onto each other means the advantages no longer separate outcomes.
+
+        Returns an empty dict when there is nothing to audit.
+        """
+        index = self.build_trial_pairs()
+        num_episodes = index["num_pairs"]
+        if num_episodes == 0 or self.training_type != "rl":
+            return {}
+        device, num_steps, num_envs = self.device, self.num_transitions_per_env, self.num_envs
+        starts, lengths, envs = index["ep_start"], index["ep_len"], index["ep_env"]
+
+        offsets = torch.arange(int(lengths.max().item()), device=device).unsqueeze(1)  # [S, 1]
+        mask = offsets < lengths.unsqueeze(0)  # [S, B]
+        flat = (starts.unsqueeze(0) + offsets).clamp(max=num_steps - 1) * num_envs + envs.unsqueeze(0)
+        advantages = self.advantages.reshape(-1)[flat]  # [S, B]
+        rewards = self.raw_rewards.reshape(-1)[flat]
+        episode_return = (rewards * mask.to(rewards.dtype)).sum(dim=0)  # [B]
+
+        row_advantage = advantages[mask]
+        row_return = episode_return.unsqueeze(0).expand_as(advantages)[mask]
+        centered_advantage = row_advantage - row_advantage.mean()
+        centered_return = row_return - row_return.mean()
+        denominator = centered_advantage.norm() * centered_return.norm()
+        correlation = 0.0 if float(denominator) <= 0.0 else float((centered_advantage @ centered_return) / denominator)
+
+        # Episodes ranked by outcome; the quartiles are at least one episode wide.
+        quartile = max(1, num_episodes // 4)
+        order = torch.argsort(episode_return)
+        audit = {"adv/return_corr": correlation}
+        for label, episode_ids in (
+            ("adv/frac_pos_in_top_quartile_episodes", order[-quartile:]),
+            ("adv/frac_pos_in_bottom_quartile_episodes", order[:quartile]),
+        ):
+            selected = advantages[:, episode_ids][mask[:, episode_ids]]
+            audit[label] = float((selected > 0).to(torch.float32).mean()) if selected.numel() > 0 else 0.0
+        return audit
+
     def _segment_rollout(self) -> dict[str, torch.Tensor | int]:
         """Split the buffer into episodes and trials, with **no** filtering (stale rows included).
 

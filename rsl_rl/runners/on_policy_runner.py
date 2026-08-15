@@ -342,6 +342,10 @@ class OnPolicyRunner:
             loaded_dict["model_state_dict"] = ckpt_sd
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"], strict=strict)
+        # Freeze the policy as it was loaded: every ``drift/*`` metric is measured against this copy, so that
+        # "how far has PPO moved the BC initialization" is answerable at any point of the run.
+        if hasattr(self.alg, "capture_reference_policy"):
+            self.alg.capture_reference_policy()
         # Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])

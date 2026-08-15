@@ -70,6 +70,8 @@ class PPO:
         max_policy_lag: int = 1,
         terminal_obs_key: str | None = None,
         amp_dtype: str | None = None,
+        log_policy_drift: bool = True,
+        log_advantage_audit: bool = True,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -192,6 +194,14 @@ class PPO:
         # the observation returned by ``step()`` is already the post-reset one, so without such a key the
         # terminal token's observation slot is zeros (see :meth:`process_env_step`).
         self.terminal_obs_key = terminal_obs_key
+        # Diagnostics (trial-memory update only; both are once-per-update, not per minibatch).
+        # ``log_policy_drift`` measures how far the policy has moved from the one that was loaded (the BC
+        # initialization), ``log_advantage_audit`` whether the advantages still agree with episode outcomes.
+        self.log_policy_drift = bool(log_policy_drift)
+        self.log_advantage_audit = bool(log_advantage_audit)
+        # Frozen copy of the policy as it was loaded. Captured by the runner's load(), or lazily on the first
+        # update for a from-scratch run.
+        self.reference_policy: ActorCriticTrialMemory | None = None
         if self.is_trial_memory:
             if self.rnd is not None:
                 raise ValueError("RND is not supported with ActorCriticTrialMemory (the pair update has no RND path).")
@@ -259,6 +269,105 @@ class PPO:
                 except StopIteration:
                     return
             yield batch
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Instrumentation (trial-memory update)
+    # ----------------------------------------------------------------------------------------------------------
+
+    def capture_reference_policy(self) -> None:
+        """Freeze the current policy as the drift reference (the runner calls this right after a load)."""
+        if not self.is_trial_memory or not self.log_policy_drift:
+            return
+        self.reference_policy = self.policy.frozen_copy()
+
+    @staticmethod
+    def _param_group(name: str) -> str | None:
+        """Which diagnostic bucket a parameter belongs to (``None`` == not tracked).
+
+        ``critic`` is matched first so that the whole ``critic_*`` pathway lands there rather than being split
+        across ``embed`` / ``blocks`` -- the same partition ``train.py``'s critic-warmup freeze filter uses.
+        """
+        if name.startswith("critic"):
+            return "critic"
+        if name in ("std", "log_std"):
+            return "sigma"
+        if name.startswith(("token_embed.", "pos_embed", "start_embed")):
+            return "embed"
+        if name.startswith(("blocks.", "final_norm.")):
+            return "blocks"
+        if name.startswith("actor."):
+            return "action_head"
+        if name == "z_init" or name.startswith(("memory_read.", "memory_pos_embed")):
+            return "memory_read"
+        if name.startswith("writer."):
+            return "writer"
+        return None
+
+    def _snapshot_param_groups(self) -> dict[str, dict[str, torch.Tensor]]:
+        """A flat detached copy of every tracked parameter, grouped, taken before an update's first epoch."""
+        snapshot: dict[str, dict[str, torch.Tensor]] = {}
+        for name, parameter in self.policy.named_parameters():
+            group = self._param_group(name)
+            if group is not None:
+                snapshot.setdefault(group, {})[name] = parameter.detach().clone()
+        return snapshot
+
+    def _param_group_update_norms(self, snapshot: dict[str, dict[str, torch.Tensor]] | None) -> dict[str, float]:
+        """``||theta_after - theta_before|| / ||theta_before||`` per group, over the whole update."""
+        if not snapshot:
+            return {}
+        current = dict(self.policy.named_parameters())
+        norms = {}
+        for group, parameters in snapshot.items():
+            delta_sq = torch.zeros((), device=self.device)
+            base_sq = torch.zeros((), device=self.device)
+            for name, before in parameters.items():
+                after = current[name].detach()
+                delta_sq = delta_sq + (after - before).pow(2).sum()
+                base_sq = base_sq + before.pow(2).sum()
+            norms[f"update_norm/{group}"] = float(delta_sq.sqrt() / (base_sq.sqrt() + 1e-8))
+        return norms
+
+    def _policy_drift(
+        self,
+        batch: dict,
+        mu_batch: torch.Tensor,
+        sigma_batch: torch.Tensor,
+        loss_mask: torch.Tensor,
+        row_lags: torch.Tensor,
+    ) -> dict[str, float]:
+        """How far the policy has moved from :attr:`reference_policy`, on this minibatch's lag-0 rows.
+
+        Called once per update, on the first minibatch, *before* any optimizer step of that update. The memory
+        checkpoints come from the current policy's sweep (the reference is not swept separately), so this is a
+        drift measure of the trunk and the heads, not of the writer.
+        """
+        if self.reference_policy is None:
+            return {}
+        rows = row_lags == 0
+        if not bool(rows.any()):
+            return {}
+        with torch.no_grad():
+            with self._autocast():
+                reference_hidden, _ = self.trial_pair_forward(batch, policy=self.reference_policy)
+                reference_distribution = self.reference_policy.update_distribution_from_hidden(reference_hidden)
+                reference_mu = reference_distribution.mean[loss_mask][rows]
+                reference_sigma = reference_distribution.stddev[loss_mask][rows]
+            reference_mu = upcast_from_half(reference_mu)
+            reference_sigma = upcast_from_half(reference_sigma)
+            mu = mu_batch[rows].detach()
+            sigma = sigma_batch[rows].detach()
+            kl = torch.sum(
+                torch.log(sigma / reference_sigma + 1.0e-5)
+                + (torch.square(reference_sigma) + torch.square(reference_mu - mu)) / (2.0 * torch.square(sigma))
+                - 0.5,
+                dim=-1,
+            ).mean()
+            return {
+                "drift/kl_vs_init": float(kl),
+                "drift/mean_abs_dmu": float((mu - reference_mu).abs().mean()),
+                "drift/sigma_ratio": float((sigma / reference_sigma).mean()),
+            }
 
     def init_storage(
         self,
@@ -719,7 +828,9 @@ class PPO:
     # Trial-memory update (adjacent episode pairs)
     # ----------------------------------------------------------------------------------------------------------
 
-    def trial_pair_forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def trial_pair_forward(
+        self, batch: dict, policy: ActorCriticTrialMemory | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct one minibatch of pairs and return the target hidden states and the memory fed to them.
 
         Implements the pair recipe:
@@ -731,11 +842,17 @@ class PPO:
         4. ``H_{e+1}^theta = forward_sequence(tau_{e+1}, Z_{e+1}^theta)`` -- ``Z_{e+1}^theta`` is **not**
            detached; detaching it would delete the entire memory-learning signal.
 
+        Args:
+            batch: One minibatch of the trial-pair generator.
+            policy: The policy to reconstruct with. Defaults to the trained policy; the drift diagnostic passes
+                the frozen reference instead.
+
         Returns:
             ``H_{e+1}`` ``[S, B, d]`` and ``Z_{e+1}`` ``[B, M, d]``.
         """
+        policy = self.policy if policy is None else policy
         target = batch["target"]
-        param_dtype = self.policy.z_init.dtype
+        param_dtype = policy.z_init.dtype
         # Zbar_e, detached by the generator (the cache may be kept in a smaller dtype than the parameters)
         incoming = batch["memory"].to(dtype=param_dtype)
         batch_size = incoming.shape[0]
@@ -743,12 +860,12 @@ class PPO:
         # Note: the degenerate pair uses the *differentiable* Z_init rather than its detached copy from the
         #   sweep, so that a first-episode loss still trains the learned NO_MEMORY tokens (the values are
         #   identical, only the gradient path differs).
-        memory = self.policy.initial_memory(batch_size, device=incoming.device).clone()
+        memory = policy.initial_memory(batch_size, device=incoming.device).clone()
         source_slots = batch["source_slots"]
         if batch["source"] is not None and source_slots.numel() > 0:
             source = batch["source"]
             source_memory = incoming[source_slots]
-            source_hidden = self.policy.forward_sequence(
+            source_hidden = policy.forward_sequence(
                 source["obs"],
                 source["prev_actions"],
                 source["prev_rewards"],
@@ -756,12 +873,12 @@ class PPO:
                 memory=source_memory,
                 mask=source["mask"],
             )
-            written, _ = self.policy.write_memory(
+            written, _ = policy.write_memory(
                 source_memory, source_hidden.transpose(0, 1), mask=source["mask"].transpose(0, 1)
             )
             memory = memory.index_copy(0, source_slots, written)
 
-        hidden = self.policy.forward_sequence(
+        hidden = policy.forward_sequence(
             target["obs"],
             target["prev_actions"],
             target["prev_rewards"],
@@ -798,8 +915,25 @@ class PPO:
         first_batch_lag0_dev = 0.0
         num_updates = 0
         kl_early_stopped = False
+        # Lag-aware KL. Most rows of a minibatch are legitimately off-policy (a trial spans several rollouts),
+        # and their ratios drift for that reason alone -- feeding them to the adaptive-LR rule or to the early
+        # stop makes stale data look like policy divergence. Only rows at lag <= 1 drive the control loop.
+        kl_fresh_sum = 0.0
+        kl_all_sum = 0.0
+        kl_batches = 0
+        # Worst ratio per lag bucket. 0.0 means "no row of this bucket was seen" (the buckets are disjoint and
+        # a real ratio is positive), which is also what keeps every logged value finite.
+        bucket_ratio_max = {"lag_0_1": 0.0, "lag_2_4": 0.0, "lag_5plus": 0.0}
         # Snapshot the pool accounting before update() consumes and clears the storage
         pool = dict(self.storage.build_trial_pairs())
+        # -- once-per-update instrumentation (all of it cheap: one param copy, one segmentation pass) --
+        group_snapshot = self._snapshot_param_groups()
+        advantage_audit = self.storage.advantage_outcome_audit() if self.log_advantage_audit else {}
+        if self.log_policy_drift and self.reference_policy is None:
+            # From-scratch run (or a load that predates the reference): the policy about to take its first
+            # step IS the initialization, so freezing it here is the same reference the runner would capture.
+            self.capture_reference_policy()
+        drift: dict[str, float] = {}
 
         generator = self.storage.trial_pair_mini_batch_generator(
             self.policy,
@@ -856,6 +990,9 @@ class PPO:
             target_values_batch = target["values"][loss_mask]
             old_mu_batch = target["old_mu"][loss_mask]
             old_sigma_batch = target["old_sigma"][loss_mask]
+            # Per-ROW policy lag: a pair's lag applies to every acting step of its target episode.
+            row_lags = batch["lags"].unsqueeze(0).expand_as(loss_mask)[loss_mask]
+            fresh_rows = row_lags <= 1
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -874,11 +1011,20 @@ class PPO:
                         - 0.5,
                         axis=-1,
                     )
-                    kl_mean = torch.mean(kl)
+                    kl_all = torch.mean(kl)
+                    # ``kl_fresh`` is the control signal: rows whose behavior policy is at most one update old.
+                    # An empty fresh set (every trial in this minibatch is stale) falls back to all rows rather
+                    # than silently freezing the controller.
+                    kl_mean = torch.mean(kl[fresh_rows]) if bool(fresh_rows.any()) else kl_all.clone()
 
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+                        torch.distributed.all_reduce(kl_all, op=torch.distributed.ReduceOp.SUM)
+                        kl_all /= self.gpu_world_size
+                    kl_fresh_sum += float(kl_mean)
+                    kl_all_sum += float(kl_all)
+                    kl_batches += 1
 
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
@@ -909,6 +1055,11 @@ class PPO:
                     kl_early_stopped = True
                     break
 
+            # Reference-policy drift, measured on the first minibatch's lag-0 rows -- the only point in the
+            # update where the parameters are still exactly the ones that acted.
+            if num_updates == 0 and self.log_policy_drift:
+                drift = self._policy_drift(batch, mu_batch, sigma_batch, loss_mask, row_lags)
+
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - old_actions_log_prob_batch)
             surrogate = -advantages_batch * ratio
@@ -923,8 +1074,16 @@ class PPO:
                 mean_ratio_clip_frac += ((flat_ratio - 1.0).abs() > self.clip_param).float().mean().item()
                 ratio_min = min(ratio_min, flat_ratio.min().item())
                 ratio_max = max(ratio_max, flat_ratio.max().item())
+                # Worst ratio per lag bucket: how far each generation of stale data has drifted.
+                for label, bucket in (
+                    ("lag_0_1", fresh_rows),
+                    ("lag_2_4", (row_lags >= 2) & (row_lags <= 4)),
+                    ("lag_5plus", row_lags >= 5),
+                ):
+                    if bool(bucket.any()):
+                        bucket_ratio_max[label] = max(bucket_ratio_max[label], flat_ratio[bucket].max().item())
                 # ... and the same, restricted to the fully on-policy trials (the actual canary)
-                lag0 = (batch["lags"] == 0).unsqueeze(0).expand_as(loss_mask)[loss_mask]
+                lag0 = row_lags == 0
                 if bool(lag0.any()):
                     lag0_ratio = flat_ratio[lag0]
                     lag0_ratio_sum += lag0_ratio.mean().item()
@@ -991,7 +1150,8 @@ class PPO:
         self.storage.policy_version += 1
 
         lag0_batches = max(lag0_batches, 1)
-        return {
+        kl_batches = max(kl_batches, 1)
+        loss_dict = {
             "value_function": mean_value_loss / num_updates,
             "surrogate": mean_surrogate_loss / num_updates,
             "entropy": mean_entropy / num_updates,
@@ -1018,6 +1178,13 @@ class PPO:
             # the per-update means) shows how many minibatches actually ran.
             "kl_early_stopped": 1.0 if kl_early_stopped else 0.0,
             "kl_minibatches_run": float(num_updates),
+            # The KL the adaptive LR and the early stop actually see (lag <= 1 rows) next to the KL over the
+            # whole minibatch: a large gap between the two is stale data, not policy divergence.
+            "kl_fresh": kl_fresh_sum / kl_batches,
+            "kl_all": kl_all_sum / kl_batches,
+            "ratio_max_lag_0_1": bucket_ratio_max["lag_0_1"],
+            "ratio_max_lag_2_4": bucket_ratio_max["lag_2_4"],
+            "ratio_max_lag_5plus": bucket_ratio_max["lag_5plus"],
             "pool_pairs": float(pool["num_pairs"]),
             "pool_pairs_lag0": float(pool["lag0_pairs"]),
             "pool_trials": float(pool["num_trials"]),
@@ -1027,6 +1194,13 @@ class PPO:
             "pool_dropped_truncated_trials": float(pool["dropped_truncated_trials"]),
             "pool_envs_without_data": float(pool["envs_without_data"]),
         }
+        # Instrumentation pack: per-group relative parameter movement over this update, drift against the
+        # loaded policy, the advantage/outcome audit and the memory gates.
+        loss_dict.update(self._param_group_update_norms(group_snapshot))
+        loss_dict.update(drift)
+        loss_dict.update(advantage_audit)
+        loss_dict.update(self.policy.memory_gate_values())
+        return loss_dict
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
