@@ -891,6 +891,12 @@ class RolloutStorage:
                 "returns": _mask_leading(self.returns.reshape(-1, 1)[current_flat], action_mask),
                 "values": _mask_leading(self.values.reshape(-1, 1)[current_flat], action_mask),
                 "loss_mask": action_mask,
+                # Per-ROW policy lag ``[S, B]``: how many updates ago *this step* was collected. NOT the
+                # trial's lag (which is read off the trial's first step): a trial that spans several rollouts
+                # closes -- and is trained on -- many updates after it started, so its last rows can be fully
+                # on-policy while its first rows are many updates old. Rows outside ``loss_mask`` are
+                # meaningless, exactly like every other entry here.
+                "row_lags": self.policy_version - self.policy_versions.reshape(-1)[current_flat],
             })
         return batch
 
@@ -1174,16 +1180,28 @@ class RolloutStorage:
                 "source_slots": LongTensor [n_src],   # row of "target"/"memory" each source belongs to
                 "target": {obs, prev_actions, prev_rewards, prev_dones, mask, loss_mask,
                            actions, old_actions_log_prob, old_mu, old_sigma,
-                           advantages, returns, values},                                # [S_tgt, B, ...]
+                           advantages, returns, values,
+                           row_lags},                                                   # [S_tgt, B, ...]
                 "memory": Tensor [B, M, d],          # detached Zbar_e of every pair
                 "positions": LongTensor [B],         # episode index inside its trial (0 == degenerate pair)
-                "lags": LongTensor [B],              # updates since the pair's trial was collected (0 == on-policy)
+                "lags": LongTensor [B],              # updates since the pair's TRIAL started (0 == on-policy)
                 "episode_ids": LongTensor [B],       # index into build_trial_pairs(), for diagnostics/tests
             }
 
         ``"source"`` is ``None`` when every pair in the minibatch is degenerate. Pairs whose source is missing
         (``positions == 0``) are simply absent from ``source_slots``; the caller must use the learned ``Z_init``
         for those rows.
+
+        Two different lags are yielded and they are not interchangeable:
+
+        * ``target["row_lags"]`` ``[S, B]`` -- per step, "how many updates ago was this row collected". This is
+          what the lag-aware KL control uses: at ``num_steps_per_env=32`` with a 240-step carry region a trial
+          closes seven or eight updates after its first step, so its *trial* lag is never <= 1 while its last
+          rollout's rows are perfectly fresh,
+        * ``lags`` ``[B]`` -- per pair, the lag of the whole trial (measured at its first step). This is the
+          right one for the reconstruction canary: a pair is only guaranteed to reproduce its behavior
+          log-probs when its *whole* trial, and therefore the memory checkpoint it is rebuilt from, is
+          on-policy.
         """
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")

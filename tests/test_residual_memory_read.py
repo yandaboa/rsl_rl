@@ -427,6 +427,129 @@ def _stale_rollout(num_envs: int, stale_envs: list[int], lag: int, seed: int, **
     return ppo, {"num_envs": num_envs, "stale_envs": stale_envs}
 
 
+# A trial that does NOT fit one collection window: 3 episodes of 6 steps collected 4 steps at a time, i.e.
+# the production regime (num_steps_per_env=32 against a 240-step trial) in miniature.
+WINDOW = 4
+CARRY = 20
+LONG_EP = 6
+LONG_TRIAL = 3 * LONG_EP  # 18 steps == 4.5 windows
+NUM_WINDOWS = 5
+
+
+def _collect_windowed(ppo: PPO, num_envs: int, num_windows: int, seed: int = 0) -> None:
+    """Collect ``num_windows`` rollouts of ``WINDOW`` steps, advancing the policy version between them.
+
+    The trial spans several windows, so it is carried across every rollout boundary and only becomes
+    trainable in the last one -- exactly the situation in which the *trial's* lag and a *row's* lag differ.
+    Between windows the storage is rolled and the version bumped by hand, which is what ``update()`` does at
+    its end; ``update()`` itself cannot run there because no trial has completed yet.
+    """
+    total = num_windows * WINDOW
+    dones = torch.zeros(total, num_envs, dtype=torch.bool, device=DEVICE)
+    trial_dones = torch.zeros_like(dones)
+    for episode in range(1, 4):
+        dones[episode * LONG_EP - 1] = True
+    trial_dones[LONG_TRIAL - 1] = True
+
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+    randn = lambda *shape: torch.randn(*shape, generator=generator, device=DEVICE)  # noqa: E731
+    obs = TensorDict({"policy": randn(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
+    with torch.no_grad():
+        for window in range(num_windows):
+            for local in range(WINDOW):
+                step = window * WINDOW + local
+                ppo.act(obs)
+                next_obs = TensorDict({"policy": randn(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
+                extras = {"time_outs": dones[step], "trial_done": trial_dones[step]}
+                ppo.process_env_step(next_obs, randn(num_envs), dones[step], extras)
+                obs = next_obs
+            ppo.compute_returns(obs)
+            if window < num_windows - 1:
+                ppo.storage.clear()
+                ppo.storage.policy_version += 1
+
+
+def test_row_lags_ramp_across_collection_windows() -> None:
+    """A trial spanning 5 windows must carry a per-row lag ramp, not one trial-wide lag.
+
+    This is the regime the lag-aware KL exists for: the pair's ``lags`` entry is 4 for every row (the trial
+    STARTED four updates ago), so a trial-level ``lag <= 1`` mask would be empty and the KL control would
+    silently fall back to "all rows" on every update.
+    """
+    num_envs = 2
+    policy = _make_rl_policy(num_envs, seed=17)
+    ppo = PPO(
+        policy,
+        num_learning_epochs=1,
+        num_mini_batches=1,
+        learning_rate=1e-4,
+        schedule="adaptive",
+        desired_kl=0.01,
+        kl_early_stop_factor=2.0,
+        gamma=0.999,
+        lam=0.99,
+        device=DEVICE,
+        defer_obs_normalization=True,
+        trial_carry_steps=CARRY,
+        max_policy_lag=9,
+    )
+    sample_obs = TensorDict({"policy": torch.zeros(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
+    ppo.init_storage("rl", num_envs, WINDOW, sample_obs, [ACTION_DIM])
+    _collect_windowed(ppo, num_envs, NUM_WINDOWS, seed=19)
+
+    storage = ppo.storage
+    index = storage.build_trial_pairs()
+    assert index["num_pairs"] == 3 * num_envs, f"expected one closed trial per env, got {index}"
+
+    batch = next(storage.trial_pair_mini_batch_generator(policy, num_mini_batches=1, num_epochs=1))
+    loss_mask = batch["target"]["loss_mask"]
+    row_lags = batch["target"]["row_lags"][loss_mask]
+    # Window w was collected at version w and the pool is consumed at version 4, so its rows are at lag 4 - w.
+    # Windows 0..3 contribute 4 trial rows each, window 4 contributes the trial's last 2 steps.
+    counts = torch.bincount(row_lags, minlength=5).tolist()
+    assert counts == [2 * num_envs, 4 * num_envs, 4 * num_envs, 4 * num_envs, 4 * num_envs], (
+        f"row lags did not ramp across the carry boundaries: {counts}"
+    )
+    # ... and the trial-level lag is a single stale number for every one of those rows.
+    assert bool((batch["lags"] == 4).all()), f"trial lags: {batch['lags'].tolist()}"
+
+    fresh_fraction = float((row_lags <= 1).to(torch.float32).mean())
+    assert 0.2 < fresh_fraction < 0.5, f"fresh rows are {fresh_fraction:.2%}; neither ~0 nor ~all was expected"
+
+    # Only the rows older than one update are desynchronized, so a correct kl_fresh sees none of them.
+    stale = storage.policy_versions.squeeze(-1) <= storage.policy_version - 2
+    storage.mu[stale] += 2.0
+    loss_dict = ppo.update()
+
+    assert loss_dict["kl_all"] > 0.5, f"the stale rows did not move kl_all ({loss_dict['kl_all']}); test is vacuous"
+    assert loss_dict["kl_fresh"] < 1e-3, f"kl_fresh picked up rows collected more than one update ago: {loss_dict}"
+    assert loss_dict["kl_early_stopped"] == 0.0
+    assert ppo.learning_rate > 1e-4, "the adaptive LR reacted to kl_all instead of kl_fresh"
+    assert loss_dict["ratio_max_lag_0_1"] > 0.0 and loss_dict["ratio_max_lag_2_4"] > 0.0
+    assert loss_dict["ratio_max_lag_5plus"] == 0.0
+    # The drift metric picks its rows the same way, so it must not go missing in this regime.
+    assert "drift/kl_vs_init" in loss_dict, "the drift diagnostic found no fresh row and disappeared"
+    assert loss_dict["drift/mean_abs_dmu"] == 0.0
+    print(
+        f"[ok] per-row lags across {NUM_WINDOWS} windows: bincount {counts}, trial lag 4 for all,"
+        f" {fresh_fraction:.1%} of rows fresh, kl_fresh {loss_dict['kl_fresh']:.2e} vs kl_all"
+        f" {loss_dict['kl_all']:.2f}"
+    )
+
+
+def test_row_lags_are_zero_within_a_single_window() -> None:
+    """The old situation must be unchanged: a trial that closes inside its own rollout is fully on-policy."""
+    num_envs = 4
+    policy = _make_rl_policy(num_envs, seed=21)
+    ppo = _make_rl_ppo(policy, num_envs)
+    _collect(ppo, num_envs, seed=22)
+    batch = next(ppo.storage.trial_pair_mini_batch_generator(policy, num_mini_batches=1, num_epochs=1))
+    row_lags = batch["target"]["row_lags"][batch["target"]["loss_mask"]]
+    assert row_lags.numel() == num_envs * T_TRIAL and bool((row_lags == 0).all()), "a fresh rollout is not lag 0"
+    assert bool((batch["lags"] == 0).all())
+    print(f"[ok] single-window trial: all {row_lags.numel()} rows at lag 0")
+
+
 def test_lag_aware_kl_ignores_stale_rows() -> None:
     """``kl_fresh`` must aggregate lag <= 1 rows only, and it -- not ``kl_all`` -- must drive LR and early stop."""
     num_envs = 4
@@ -570,6 +693,8 @@ if __name__ == "__main__":
     test_step_matches_sequence_in_residual_mode()
     test_cached_read_kv_follows_the_memory()
     test_legacy_kv_prepend_is_unchanged()
+    test_row_lags_ramp_across_collection_windows()
+    test_row_lags_are_zero_within_a_single_window()
     test_lag_aware_kl_ignores_stale_rows()
     test_instrumentation_pack_is_logged()
     test_reference_policy_copy_is_frozen_and_light()

@@ -336,17 +336,18 @@ class PPO:
         loss_mask: torch.Tensor,
         row_lags: torch.Tensor,
     ) -> dict[str, float]:
-        """How far the policy has moved from :attr:`reference_policy`, on this minibatch's lag-0 rows.
+        """How far the policy has moved from :attr:`reference_policy`, on this minibatch's freshest rows.
 
-        Called once per update, on the first minibatch, *before* any optimizer step of that update. The memory
-        checkpoints come from the current policy's sweep (the reference is not swept separately), so this is a
-        drift measure of the trunk and the heads, not of the writer.
+        Called once per update, on the first minibatch, *before* any optimizer step of that update. Both
+        policies are run on the SAME tokens and the same memory checkpoints, so the memory drift cancels and
+        this measures the trunk and the heads only (not the writer). ``row_lags`` selects rows at lag <= 1,
+        falling back to the freshest rows present so that the metric never silently disappears.
         """
-        if self.reference_policy is None:
+        if self.reference_policy is None or row_lags.numel() == 0:
             return {}
-        rows = row_lags == 0
+        rows = row_lags <= 1
         if not bool(rows.any()):
-            return {}
+            rows = row_lags == row_lags.min()
         with torch.no_grad():
             with self._autocast():
                 reference_hidden, _ = self.trial_pair_forward(batch, policy=self.reference_policy)
@@ -990,8 +991,12 @@ class PPO:
             target_values_batch = target["values"][loss_mask]
             old_mu_batch = target["old_mu"][loss_mask]
             old_sigma_batch = target["old_sigma"][loss_mask]
-            # Per-ROW policy lag: a pair's lag applies to every acting step of its target episode.
-            row_lags = batch["lags"].unsqueeze(0).expand_as(loss_mask)[loss_mask]
+            # Per-ROW policy lag, NOT the pair's trial lag. A trial that spans several rollouts is only
+            # trained on once it closes, which at the production cadence (32 collected steps against a
+            # 240-step carry region) is seven or eight updates after its first step -- so its trial lag is
+            # never <= 1 and a trial-level fresh mask would be empty on every single update, silently
+            # degrading the KL control back to "all rows". Its last rollout's rows, however, are at lag 0.
+            row_lags = target["row_lags"][loss_mask]
             fresh_rows = row_lags <= 1
 
             if self.normalize_advantage_per_mini_batch:
@@ -1082,8 +1087,10 @@ class PPO:
                 ):
                     if bool(bucket.any()):
                         bucket_ratio_max[label] = max(bucket_ratio_max[label], flat_ratio[bucket].max().item())
-                # ... and the same, restricted to the fully on-policy trials (the actual canary)
-                lag0 = row_lags == 0
+                # ... and the same, restricted to the fully on-policy TRIALS (the actual canary). Trial lag,
+                # not row lag: a fresh row inside an old trial is rebuilt from a memory checkpoint that the
+                # current writer produced, not the one that acted, so its ratio is legitimately != 1.
+                lag0 = (batch["lags"] == 0).unsqueeze(0).expand_as(loss_mask)[loss_mask]
                 if bool(lag0.any()):
                     lag0_ratio = flat_ratio[lag0]
                     lag0_ratio_sum += lag0_ratio.mean().item()
