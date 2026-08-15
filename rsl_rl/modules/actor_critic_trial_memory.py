@@ -12,7 +12,12 @@ densely (causally) over that episode's tokens; across episodes information flows
 
 How ``Z`` enters the trunk is selected by ``memory_interface``:
 
-* ``"residual_read"`` (default): the blocks are a plain causal transformer over the environment tokens
+* ``"kv_prepend_first"`` (default): ``Z`` is prepended to the keys/values of the **first** block only, so the
+  memory is read once, at the bottom of the trunk, and blocks ``1 .. L-1`` are pure causal attention over the
+  environment tokens. The memory tokens themselves traverse no block: their layer-0 keys/values are
+  ``project_kv(norm_attn(Z + memory_pos_embed))``, i.e. bit-identical to what ``"kv_prepend"`` exposes at
+  layer 0,
+* ``"residual_read"``: the blocks are a plain causal transformer over the environment tokens
   ``x_1 .. x_t`` and the memory is read exactly **once**, by a gated residual cross-attention layer
   (:class:`MemoryReadLayer`) sitting after block ``memory_read_layer``. Its two gates start at zero, so at
   initialization the trunk is *bit-for-bit* the memory-free one whatever ``Z`` contains -- a BC'd trunk keeps
@@ -78,6 +83,9 @@ from rsl_rl.utils import resolve_nn_activation
 # Which parameter holds the action noise, per ``noise_std_type``, and its shape (``A`` = num_actions,
 # ``d`` = d_model). A checkpoint written under one noise type cannot be loaded into another.
 _NOISE_PARAM_NAME = {"scalar": "std", "log": "log_std", "gsde": "log_std"}
+
+# See the module docstring: where the memory Z enters the trunk.
+_MEMORY_INTERFACES = ("kv_prepend_first", "residual_read", "kv_prepend")
 
 
 class MultiHeadAttention(nn.Module):
@@ -334,7 +342,7 @@ class ActorCriticTrialMemory(nn.Module):
         noise_std_type: str = "scalar",
         detach_critic_trunk: bool = False,
         critic_trunk: str = "shared",
-        memory_interface: str = "residual_read",
+        memory_interface: str = "kv_prepend_first",
         memory_read_layer: int = -1,
         **kwargs: dict[str, Any],
     ) -> None:
@@ -366,12 +374,12 @@ class ActorCriticTrialMemory(nn.Module):
             detach_critic_trunk: Detach the trunk readout before the value head, so the value loss trains the
                 value head only. Only meaningful with ``critic_trunk="shared"``; ``"separate"`` supersedes it
                 (there is nothing shared left to protect).
-            memory_interface: How the memory ``Z`` enters the trunk. ``"residual_read"`` (default) runs a plain
-                causal trunk over the environment tokens and reads ``Z`` exactly once, through a gated residual
-                cross-attention :class:`MemoryReadLayer` that is an identity at init. ``"kv_prepend"`` is the
-                legacy interface, where ``Z`` is prepended to the keys/values of *every* self-attention layer.
-            memory_read_layer: Which block the read layer runs after (``residual_read`` only). ``-1`` (default)
-                resolves to ``num_layers // 2``.
+            memory_interface: How the memory ``Z`` enters the trunk (see the module docstring).
+                ``"kv_prepend_first"`` (default) prepends ``Z`` to the keys/values of the FIRST block only,
+                ``"residual_read"`` reads it through a gated :class:`MemoryReadLayer` that is an identity at
+                init, ``"kv_prepend"`` is the legacy every-layer interface.
+            memory_read_layer: Which block the read layer runs after (``residual_read`` only; ignored by the
+                other interfaces). ``-1`` (default) resolves to ``num_layers // 2``.
             critic_trunk: ``"shared"`` (the value head sits on the actor's ``h_t``) or ``"separate"`` (a full
                 duplicate ``critic_*`` token pathway; see the module docstring). ``"separate"`` has **no**
                 incremental/acting path -- :meth:`evaluate` and :meth:`value_from_hidden` raise, and values are
@@ -444,14 +452,15 @@ class ActorCriticTrialMemory(nn.Module):
         self.blocks = nn.ModuleList([TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)])
         self.final_norm = nn.LayerNorm(d_model)
 
-        # Memory interface. "residual_read" keeps the blocks above a plain causal transformer and reads Z through
-        # a single gated cross-attention layer; "kv_prepend" is the legacy per-layer memory K/V.
+        # Where Z meets the token stream: block 0's K/V only (default), a gated read layer, or every block.
         self.memory_interface = str(memory_interface)
-        if self.memory_interface not in ("residual_read", "kv_prepend"):
+        if self.memory_interface not in _MEMORY_INTERFACES:
             raise ValueError(
-                f"Unknown memory_interface '{memory_interface}'. Expected 'residual_read' or 'kv_prepend'."
+                f"Unknown memory_interface '{memory_interface}'. Expected one of {sorted(_MEMORY_INTERFACES)}."
             )
         self.residual_memory_read = self.memory_interface == "residual_read"
+        self.memory_first_layer_only = self.memory_interface == "kv_prepend_first"
+        # memory_read_layer is meaningless outside "residual_read"; it is resolved but never used there.
         resolved_read_layer = num_layers // 2 if int(memory_read_layer) < 0 else int(memory_read_layer)
         if self.residual_memory_read and not 0 <= resolved_read_layer < num_layers:
             raise ValueError(
@@ -583,8 +592,8 @@ class ActorCriticTrialMemory(nn.Module):
         self._num_envs: int | None = None
         self._memory: torch.Tensor | None = None
         self._memory_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-        # Cached keys/values of Z for the residual read layer, recomputed only when Z changes (a write or a
-        # trial reset), never per step.
+        # Cached keys/values of Z for the single-site interfaces (the read layer, or block 0 under
+        # ``kv_prepend_first``), recomputed only when Z changes -- never per step.
         self._read_kv: tuple[torch.Tensor, torch.Tensor] | None = None
         self._key_cache: list[torch.Tensor] | None = None
         self._value_cache: list[torch.Tensor] | None = None
@@ -794,6 +803,22 @@ class ActorCriticTrialMemory(nn.Module):
         _, _, _, memory_pos_embed, _, _ = self._pathway(critic)
         return self._read_layer(critic).memory_kv(memory + memory_pos_embed)
 
+    def _first_block_memory_kv(self, memory: torch.Tensor, critic: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keys/values ``Z`` exposes to block 0 under ``kv_prepend_first``.
+
+        Identical to what :meth:`TrunkBlock.memory_forward` exposes at layer 0 -- it too projects the *normed*
+        memory, before the memory self-attention updates it -- so layer 0 matches the legacy interface exactly.
+        """
+        _, _, _, memory_pos_embed, blocks, _ = self._pathway(critic)
+        block = blocks[0]
+        return block.attn.project_kv(block.norm_attn(memory + memory_pos_embed))
+
+    def _single_site_memory_kv(self, memory: torch.Tensor, critic: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """The one set of memory keys/values the single-site interfaces need (read layer, or block 0)."""
+        if self.residual_memory_read:
+            return self._memory_read_kv(memory, critic=critic)
+        return self._first_block_memory_kv(memory, critic=critic)
+
     def memory_gate_values(self) -> dict[str, float]:
         """The realized gate values ``tanh(g)`` of every read layer, for logging. Empty in legacy mode."""
         if not self.residual_memory_read:
@@ -829,18 +854,18 @@ class ActorCriticTrialMemory(nn.Module):
     # ------------------------------------------------------------------------------------------------------------
 
     def _sequence_attn_mask(
-        self, num_tokens: int, mask: torch.Tensor | None, device: torch.device
+        self, num_tokens: int, mask: torch.Tensor | None, device: torch.device, prepend_memory: bool = True
     ) -> torch.Tensor:
-        """Assemble the ``[memory | tokens]`` attention mask, ``[S, M + S]`` or ``[B, S, M + S]``, ``True`` = attend.
+        """The attention mask of one block, ``True`` = attend.
 
-        With ``memory_interface="residual_read"`` there is no memory stripe: the blocks only ever see environment
-        tokens, so the mask is the pure causal/windowed one, ``[S, S]`` or ``[B, S, S]``.
+        ``[S, M + S]`` / ``[B, S, M + S]`` with the always-attend memory stripe, ``[S, S]`` / ``[B, S, S]``
+        without it (blocks that do not see the memory).
         """
         positions = torch.arange(num_tokens, device=device)
         causal = positions.unsqueeze(1) >= positions.unsqueeze(0)
         if self.attention_window < num_tokens:
             causal = causal & ((positions.unsqueeze(1) - positions.unsqueeze(0)) < self.attention_window)
-        if self.residual_memory_read:
+        if not prepend_memory:
             return causal if mask is None else (causal.unsqueeze(0) & mask.bool().unsqueeze(1))
         if mask is None:
             memory_mask = torch.ones(num_tokens, self.num_memory_tokens, device=device, dtype=torch.bool)
@@ -920,10 +945,11 @@ class ActorCriticTrialMemory(nn.Module):
         # [S, B, d] -> [B, S, d]
         hidden = tokens.transpose(0, 1)
 
-        attn_mask = self._sequence_attn_mask(num_steps, None if mask is None else mask.transpose(0, 1), device)
+        token_mask = None if mask is None else mask.transpose(0, 1)
         if self.residual_memory_read:
-            # Plain causal trunk over the environment tokens; the memory enters once, after block
-            # ``memory_read_layer``, through the gated read layer (an identity while its gates are zero).
+            # Plain causal trunk; the memory enters once, after block ``memory_read_layer``, through the gated
+            # read layer (an identity while its gates are zero).
+            attn_mask = self._sequence_attn_mask(num_steps, token_mask, device, prepend_memory=False)
             read = self._read_layer(critic)
             read_keys, read_values = self._memory_read_kv(memory, critic=critic)
             for layer, block in enumerate(blocks):
@@ -931,7 +957,25 @@ class ActorCriticTrialMemory(nn.Module):
                 hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
                 if layer == self.memory_read_layer:
                     hidden = read(hidden, read_keys, read_values)
+        elif self.memory_first_layer_only:
+            # Block 0 attends over [memory | tokens], every block above it over tokens only.
+            memory_attn_mask = self._sequence_attn_mask(num_steps, token_mask, device, prepend_memory=True)
+            attn_mask = self._sequence_attn_mask(num_steps, token_mask, device, prepend_memory=False)
+            memory_keys, memory_values = self._first_block_memory_kv(memory, critic=critic)
+            for layer, block in enumerate(blocks):
+                normed, keys, values = block.token_kv(hidden)
+                if layer == 0:
+                    hidden = block.token_forward(
+                        hidden,
+                        normed,
+                        torch.cat([memory_keys, keys], dim=1),
+                        torch.cat([memory_values, values], dim=1),
+                        memory_attn_mask,
+                    )
+                else:
+                    hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
         else:
+            attn_mask = self._sequence_attn_mask(num_steps, token_mask, device, prepend_memory=True)
             memory_kv = self._memory_kv_states(memory, critic=critic)
             for block, (memory_keys, memory_values) in zip(blocks, memory_kv):
                 normed, keys, values = block.token_kv(hidden)
@@ -1072,39 +1116,43 @@ class ActorCriticTrialMemory(nn.Module):
             normalize_obs,
         )  # [N, 1, d]
 
-        if self.residual_memory_read:
-            # One K/V projection of Z per *write*, not per step: ``_read_kv`` is invalidated exactly where
-            # ``_memory`` changes (initialize_state / update_memory / reset_trial).
-            if self._read_kv is None:
-                read_keys, read_values = self._memory_read_kv(self._memory)
-                self._read_kv = (read_keys.detach(), read_values.detach())
-        elif self._memory_kv is None:
-            self._memory_kv = [(k.detach(), v.detach()) for k, v in self._memory_kv_states(self._memory)]
+        every_layer = self.memory_interface == "kv_prepend"
+        if every_layer:
+            if self._memory_kv is None:
+                self._memory_kv = [(k.detach(), v.detach()) for k, v in self._memory_kv_states(self._memory)]
+        elif self._read_kv is None:
+            # One projection of Z per *write*, not per step: invalidated exactly where ``_memory`` changes
+            # (initialize_state / update_memory / reset_trial).
+            keys, values = self._single_site_memory_kv(self._memory)
+            self._read_kv = (keys.detach(), values.detach())
 
-        # Keys visible to this query: memory tokens (legacy interface only) + committed tokens inside the
-        # window + itself (last).
+        # Keys visible to this query: memory tokens (where the interface exposes them) + committed tokens
+        # inside the window + itself (last).
         key_positions = torch.arange(self.max_tokens, device=obs.device)
         window_ok = key_positions.unsqueeze(0) > (positions.unsqueeze(1) - self.attention_window)
         cache_mask = self._token_valid & window_ok  # [N, max_tokens]
-        num_always = 1 if self.residual_memory_read else self.num_memory_tokens + 1
-        ones = torch.ones(num_envs, num_always, device=obs.device, dtype=torch.bool)
-        if self.residual_memory_read:
-            attn_mask = torch.cat([cache_mask, ones], dim=-1).unsqueeze(1)
-        else:
-            attn_mask = torch.cat([ones[:, : self.num_memory_tokens], cache_mask, ones[:, -1:]], dim=-1).unsqueeze(1)
+        ones = torch.ones(num_envs, 1, device=obs.device, dtype=torch.bool)
+        attn_mask = torch.cat([cache_mask, ones], dim=-1).unsqueeze(1)
+        memory_attn_mask = None
+        if every_layer or self.memory_first_layer_only:
+            memory_ones = torch.ones(num_envs, self.num_memory_tokens, device=obs.device, dtype=torch.bool)
+            memory_attn_mask = torch.cat([memory_ones, cache_mask, ones], dim=-1).unsqueeze(1)
 
         hidden = tokens
         scatter_index = positions.view(num_envs, 1, 1).expand(num_envs, 1, self.d_model)
         for layer, block in enumerate(self.blocks):
             normed, keys, values = block.token_kv(hidden)
-            if self.residual_memory_read:
-                all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
-                all_values = torch.cat([self._value_cache[layer], values], dim=1)
-            else:
-                memory_keys, memory_values = self._memory_kv[layer]
+            sees_memory = every_layer or (self.memory_first_layer_only and layer == 0)
+            if sees_memory:
+                memory_keys, memory_values = self._memory_kv[layer] if every_layer else self._read_kv
                 all_keys = torch.cat([memory_keys, self._key_cache[layer], keys], dim=1)
                 all_values = torch.cat([memory_values, self._value_cache[layer], values], dim=1)
-            hidden = block.token_forward(hidden, normed, all_keys, all_values, attn_mask)
+            else:
+                all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
+                all_values = torch.cat([self._value_cache[layer], values], dim=1)
+            hidden = block.token_forward(
+                hidden, normed, all_keys, all_values, memory_attn_mask if sees_memory else attn_mask
+            )
             if commit:
                 self._key_cache[layer].scatter_(1, scatter_index, keys.detach())
                 self._value_cache[layer].scatter_(1, scatter_index, values.detach())

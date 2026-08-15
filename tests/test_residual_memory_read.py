@@ -141,7 +141,20 @@ def _random_memory(policy: ActorCriticTrialMemory, num_envs: int = NUM_ENVS, see
 
 
 def test_defaults_and_placement() -> None:
-    """The default interface is the residual read, placed at ``num_layers // 2``; the legacy one is opt-in."""
+    """``kv_prepend_first`` is the constructor default; the other two interfaces are opt-in."""
+    default = _make_policy(memory_interface="kv_prepend_first", perturb=False)
+    assert default.memory_interface == "kv_prepend_first" and default.memory_first_layer_only
+    assert not default.residual_memory_read and not hasattr(default, "memory_read")
+    assert default.memory_gate_values() == {}
+    # ... and it really is what the constructor picks when the caller says nothing.
+    sample_obs = TensorDict({"policy": torch.zeros(2, OBS_DIM)}, batch_size=[2], device=DEVICE)
+    bare = ActorCriticTrialMemory(
+        obs=sample_obs, obs_groups={"policy": ["policy"], "critic": ["policy"]}, num_actions=ACTION_DIM
+    )
+    assert bare.memory_interface == "kv_prepend_first"
+    # memory_read_layer is meaningless here and must be ignored, not rejected.
+    assert _make_policy(memory_interface="kv_prepend_first", memory_read_layer=99, perturb=False) is not None
+
     residual = _make_policy(perturb=False)
     assert residual.memory_interface == "residual_read" and residual.residual_memory_read
     assert residual.memory_read_layer == residual.num_layers // 2
@@ -152,8 +165,8 @@ def test_defaults_and_placement() -> None:
     assert explicit.memory_read_layer == 0
 
     legacy = _make_policy(memory_interface="kv_prepend", perturb=False)
-    assert not legacy.residual_memory_read and not hasattr(legacy, "memory_read")
-    assert legacy.memory_gate_values() == {}
+    assert not legacy.residual_memory_read and not legacy.memory_first_layer_only
+    assert not hasattr(legacy, "memory_read") and legacy.memory_gate_values() == {}
 
     separate = _make_policy(critic_trunk="separate", perturb=False)
     gates = separate.memory_gate_values()
@@ -166,7 +179,83 @@ def test_defaults_and_placement() -> None:
         pass
     else:
         raise AssertionError("an unknown memory_interface must raise")
-    print("[ok] residual_read is the default, placed after block num_layers // 2; kv_prepend still available")
+    print("[ok] kv_prepend_first is the default; residual_read (block num_layers // 2) and kv_prepend available")
+
+
+def test_prepend_first_matches_legacy_at_layer_zero() -> None:
+    """The memory K/V block 0 sees must be exactly the legacy interface's layer-0 keys/values."""
+    for critic_trunk in ("shared", "separate"):
+        policy = _make_policy(memory_interface="kv_prepend_first", critic_trunk=critic_trunk, seed=6)
+        memory = _random_memory(policy, seed=51)
+        with torch.no_grad():
+            keys, values = policy._first_block_memory_kv(memory)
+            # What TrunkBlock.memory_forward exposes at layer 0: the projection of the NORMED memory, taken
+            # before the memory self-attention updates it.
+            _, legacy_keys, legacy_values = policy.blocks[0].memory_forward(memory + policy.memory_pos_embed)
+        assert torch.equal(keys, legacy_keys) and torch.equal(values, legacy_values)
+
+        if critic_trunk == "separate":
+            with torch.no_grad():
+                keys, values = policy._first_block_memory_kv(memory, critic=True)
+                _, legacy_keys, legacy_values = policy.critic_blocks[0].memory_forward(
+                    memory + policy.critic_memory_pos_embed
+                )
+            assert torch.equal(keys, legacy_keys) and torch.equal(values, legacy_values), "critic mirror differs"
+    print("[ok] kv_prepend_first exposes exactly the legacy layer-0 memory keys/values (actor and critic)")
+
+
+def test_prepend_first_step_matches_sequence_and_uses_the_memory() -> None:
+    """Acting path == batched path, and the output genuinely depends on ``Z`` -- full and windowed attention."""
+    episode = _make_episode(T_EPISODE + 1, seed=52)
+    for window, label in ((None, "full (W >= T)"), (3, "windowed (W = 3)")):
+        policy = _make_policy(memory_interface="kv_prepend_first", attention_window=window, seed=7)
+        memory = _random_memory(policy, seed=53)
+        with torch.no_grad():
+            incremental = _roll_incrementally(policy, episode, memory=memory)
+            batched = _roll_batched(policy, episode, memory)
+            other = _roll_batched(policy, episode, _random_memory(policy, seed=54))
+        error = (incremental - batched).abs().max().item()
+        assert error < 1e-10, f"incremental vs batched mismatch ({label}): {error:.3e}"
+        moved = (batched - other).abs().max().item()
+        assert moved > 1e-6, f"the output does not depend on Z ({label}): {moved:.3e}"
+        # The cached layer-0 memory K/V follows the writer, exactly like the read layer's does.
+        assert policy._read_kv is not None and policy._memory_kv is None
+        with torch.no_grad():
+            policy.update_memory()
+        assert policy._read_kv is None, "update_memory() left a stale layer-0 memory K/V"
+        print(f"[ok] kv_prepend_first: incremental == batched ({error:.3e}), |dh| vs other Z = {moved:.3e}, {label}")
+
+
+def test_prepend_first_confines_the_memory_to_block_zero() -> None:
+    """Only block 0 may attend over the memory: every block above it must see ``S`` keys, not ``M + S``."""
+    episode = _make_episode(T_EPISODE + 1, seed=55)
+    num_tokens = T_EPISODE + 1
+    expected = {
+        # Per block, the number of keys its self-attention attends over, in call order.
+        "kv_prepend_first": [NUM_MEMORY + num_tokens, num_tokens],
+        "residual_read": [num_tokens, num_tokens],
+        # Legacy runs the memory through each block first (M keys), then the tokens over [memory | tokens].
+        "kv_prepend": [NUM_MEMORY, NUM_MEMORY, NUM_MEMORY + num_tokens, NUM_MEMORY + num_tokens],
+    }
+    for interface, key_counts in expected.items():
+        policy = _make_policy(memory_interface=interface, seed=8)
+        observed: list[int] = []
+        handles = [
+            block.attn.register_forward_pre_hook(lambda module, args, sink=observed: sink.append(args[1].shape[1]))
+            for block in policy.blocks
+        ]
+        with torch.no_grad():
+            _roll_batched(policy, episode, _random_memory(policy, seed=56))
+        for handle in handles:
+            handle.remove()
+        assert observed == key_counts, f"{interface}: attended over {observed} keys per block, expected {key_counts}"
+
+    # ... and the gradient statement that follows from it: Z still trains, through block 0 only.
+    policy = _make_policy(memory_interface="kv_prepend_first", seed=8)
+    memory = _random_memory(policy, seed=57).requires_grad_(True)
+    _roll_batched(policy, episode, memory).square().mean().backward()
+    assert float(memory.grad.abs().sum()) > 0.0, "no gradient reached Z"
+    print(f"[ok] key counts per block: {expected['kv_prepend_first']} (kv_prepend_first) -- memory only at block 0")
 
 
 def test_identity_at_init() -> None:
@@ -346,13 +435,15 @@ K = 3
 T_TRIAL = K * T_EPISODE
 
 
-def _make_rl_policy(num_envs: int, seed: int = 0) -> ActorCriticTrialMemory:
+def _make_rl_policy(num_envs: int, seed: int = 0, **policy_kwargs) -> ActorCriticTrialMemory:
+    """A float32 policy for the PPO-side tests. Defaults to the module's default memory interface."""
     torch.manual_seed(seed)
     sample_obs = TensorDict({"policy": torch.zeros(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
     policy = ActorCriticTrialMemory(
         obs=sample_obs,
         obs_groups={"policy": ["policy"], "critic": ["policy"]},
         num_actions=ACTION_DIM,
+        **policy_kwargs,
         d_model=D_MODEL,
         num_layers=2,
         num_heads=4,
@@ -688,7 +779,8 @@ def test_lag_aware_kl_ignores_stale_rows() -> None:
 def test_instrumentation_pack_is_logged() -> None:
     """Every key of the instrumentation pack is present, finite and reacts to a real update."""
     num_envs = 4
-    policy = _make_rl_policy(num_envs, seed=9)
+    # residual_read, so that the gate logging is covered too (the other interfaces have no gates).
+    policy = _make_rl_policy(num_envs, seed=9, memory_interface="residual_read")
     ppo = _make_rl_ppo(policy, num_envs, learning_rate=1e-3, num_learning_epochs=2, num_mini_batches=2)
     _collect(ppo, num_envs, seed=10)
     loss_dict = ppo.update()
@@ -733,6 +825,14 @@ def test_instrumentation_pack_is_logged() -> None:
     second = ppo.update()
     assert second["drift/mean_abs_dmu"] > 0.0, "the drift never grows; the reference is being re-captured"
 
+    # The default interface has no gates, so those two keys are simply absent there.
+    plain = _make_rl_policy(num_envs, seed=9)
+    plain_ppo = _make_rl_ppo(plain, num_envs, learning_rate=1e-3)
+    _collect(plain_ppo, num_envs, seed=10)
+    plain_dict = plain_ppo.update()
+    assert not any(key.startswith("memory_gate") for key in plain_dict), "kv_prepend_first reported gates"
+    assert "update_norm/memory_read" in plain_dict, "the z_init / memory_pos_embed group must still be tracked"
+
     # ... and the flags actually switch the diagnostics off.
     quiet_policy = _make_rl_policy(num_envs, seed=9)
     quiet = _make_rl_ppo(
@@ -771,6 +871,9 @@ def test_reference_policy_copy_is_frozen_and_light() -> None:
 
 if __name__ == "__main__":
     test_defaults_and_placement()
+    test_prepend_first_matches_legacy_at_layer_zero()
+    test_prepend_first_step_matches_sequence_and_uses_the_memory()
+    test_prepend_first_confines_the_memory_to_block_zero()
     test_identity_at_init()
     test_gate_open_lets_the_memory_through()
     test_gate_gates_the_gradient_to_the_writer()
