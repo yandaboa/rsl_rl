@@ -10,9 +10,23 @@ densely (causally) over that episode's tokens; across episodes information flows
 ``M`` persistent memory tokens ``Z``, which are written once per episode boundary by a cross-attention writer
 ``G`` and are otherwise frozen for the whole episode.
 
-Layout of one trunk input::
+How ``Z`` enters the trunk is selected by ``memory_interface``:
 
-    [ Z_1 .. Z_M | x_1 .. x_t ]        x_t = Embed(o_t, a_{t-1}, r_{t-1}, d_{t-1})
+* ``"residual_read"`` (default): the blocks are a plain causal transformer over the environment tokens
+  ``x_1 .. x_t`` and the memory is read exactly **once**, by a gated residual cross-attention layer
+  (:class:`MemoryReadLayer`) sitting after block ``memory_read_layer``. Its two gates start at zero, so at
+  initialization the trunk is *bit-for-bit* the memory-free one whatever ``Z`` contains -- a BC'd trunk keeps
+  its function on the first PPO update, and later drift is confined to one layer instead of perturbing all
+  ``L`` of them at once,
+* ``"kv_prepend"`` (legacy): ``Z`` is prepended to the keys/values of every self-attention layer, i.e. the
+  trunk input is
+
+  .. code::
+
+      [ Z_1 .. Z_M | x_1 .. x_t ]        x_t = Embed(o_t, a_{t-1}, r_{t-1}, d_{t-1})
+
+The rest of this docstring describes the legacy layout; under ``residual_read`` the memory-token statements
+apply to the read layer's cross-attention instead (and its keys/values are cached per write, not per layer).
 
 * memory tokens attend to memory tokens only (bidirectionally, never causally masked among themselves), so their
   per-layer states depend on ``Z`` alone -- which is what makes them cacheable for the whole episode,
@@ -47,6 +61,7 @@ Reset semantics need two distinct signals, a single ``dones`` flag cannot expres
 
 from __future__ import annotations
 
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -188,6 +203,50 @@ class TrunkBlock(nn.Module):
         return hidden + self.ff(self.norm_ff(hidden))
 
 
+class MemoryReadLayer(nn.Module):
+    """A single gated residual cross-attention read of the memory ``Z`` (Flamingo-style), exact identity at init.
+
+    The alternative to prepending ``Z`` to the K/V of *every* self-attention layer: the trunk stays a plain causal
+    transformer over environment tokens and the memory enters exactly once, through this layer::
+
+        q       = LN_q(h)                              # env tokens [B, S, d]
+        k, v    = proj(LN_kv(Z + memory_pos_embed))    # memory     [B, M, d]
+        h       = h + tanh(gate_attn) * MHA(q, k, v)
+        h       = h + tanh(gate_ff)   * FF(LN_ff(h))
+
+    Both gates are scalars initialized to zero, so ``tanh(gate) == 0`` and the layer is a bit-exact identity at
+    init *whatever* ``Z`` contains. That is what lets a BC'd trunk keep its function on the first PPO update: the
+    memory can only start influencing the policy once the optimizer has moved a gate off zero, and the drift is
+    confined to this one layer instead of perturbing all ``L`` of them at once.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, ff_dim: int, activation: str) -> None:
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, num_heads)
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_dim), resolve_nn_activation(activation), nn.Linear(ff_dim, d_model)
+        )
+        self.gate_attn = nn.Parameter(torch.zeros(()))
+        self.gate_ff = nn.Parameter(torch.zeros(()))
+
+    def memory_kv(self, memory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project the (position-embedded) memory ``[B, M, d]`` into this layer's keys and values.
+
+        Split out of :meth:`forward` so that the acting path can cache it: ``Z`` only changes when the writer
+        runs, i.e. once per episode, while ``forward`` runs once per environment step.
+        """
+        return self.attn.project_kv(self.norm_kv(memory))
+
+    def forward(self, hidden: torch.Tensor, keys: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        """Read ``keys``/``values`` (already projected by :meth:`memory_kv`) into the token stream ``[B, S, d]``."""
+        attended, _ = self.attn(self.norm_q(hidden), keys, values, attn_mask=None)
+        hidden = hidden + torch.tanh(self.gate_attn) * attended
+        return hidden + torch.tanh(self.gate_ff) * self.ff(self.norm_ff(hidden))
+
+
 class MemoryWriter(nn.Module):
     """The writer ``G``: ``Z_{e+1} = G(Z_e, H_e)`` as a residual cross-attention block plus a residual MLP.
 
@@ -275,6 +334,8 @@ class ActorCriticTrialMemory(nn.Module):
         noise_std_type: str = "scalar",
         detach_critic_trunk: bool = False,
         critic_trunk: str = "shared",
+        memory_interface: str = "residual_read",
+        memory_read_layer: int = -1,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the trial-memory actor-critic.
@@ -305,6 +366,12 @@ class ActorCriticTrialMemory(nn.Module):
             detach_critic_trunk: Detach the trunk readout before the value head, so the value loss trains the
                 value head only. Only meaningful with ``critic_trunk="shared"``; ``"separate"`` supersedes it
                 (there is nothing shared left to protect).
+            memory_interface: How the memory ``Z`` enters the trunk. ``"residual_read"`` (default) runs a plain
+                causal trunk over the environment tokens and reads ``Z`` exactly once, through a gated residual
+                cross-attention :class:`MemoryReadLayer` that is an identity at init. ``"kv_prepend"`` is the
+                legacy interface, where ``Z`` is prepended to the keys/values of *every* self-attention layer.
+            memory_read_layer: Which block the read layer runs after (``residual_read`` only). ``-1`` (default)
+                resolves to ``num_layers // 2``.
             critic_trunk: ``"shared"`` (the value head sits on the actor's ``h_t``) or ``"separate"`` (a full
                 duplicate ``critic_*`` token pathway; see the module docstring). ``"separate"`` has **no**
                 incremental/acting path -- :meth:`evaluate` and :meth:`value_from_hidden` raise, and values are
@@ -377,6 +444,24 @@ class ActorCriticTrialMemory(nn.Module):
         self.blocks = nn.ModuleList([TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)])
         self.final_norm = nn.LayerNorm(d_model)
 
+        # Memory interface. "residual_read" keeps the blocks above a plain causal transformer and reads Z through
+        # a single gated cross-attention layer; "kv_prepend" is the legacy per-layer memory K/V.
+        self.memory_interface = str(memory_interface)
+        if self.memory_interface not in ("residual_read", "kv_prepend"):
+            raise ValueError(
+                f"Unknown memory_interface '{memory_interface}'. Expected 'residual_read' or 'kv_prepend'."
+            )
+        self.residual_memory_read = self.memory_interface == "residual_read"
+        resolved_read_layer = num_layers // 2 if int(memory_read_layer) < 0 else int(memory_read_layer)
+        if self.residual_memory_read and not 0 <= resolved_read_layer < num_layers:
+            raise ValueError(
+                f"memory_read_layer={memory_read_layer} resolves to block {resolved_read_layer}, which is outside"
+                f" [0, {num_layers - 1}]."
+            )
+        self.memory_read_layer = resolved_read_layer
+        if self.residual_memory_read:
+            self.memory_read = MemoryReadLayer(d_model, num_heads, ff_dim, activation)
+
         # Memory writer G
         self.writer = MemoryWriter(d_model, num_heads, ff_dim, activation)
 
@@ -403,6 +488,10 @@ class ActorCriticTrialMemory(nn.Module):
                 TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)
             ])
             self.critic_final_norm = nn.LayerNorm(d_model)
+            if self.residual_memory_read:
+                # The critic's own read layer, with its own gates: mirrors the actor's placement but is trained
+                # (and drifts) independently. Memory still enters detached, see forward_sequence_critic.
+                self.critic_memory_read = MemoryReadLayer(d_model, num_heads, ff_dim, activation)
 
         # Observation normalization (single stream, shared by both heads)
         self.actor_obs_normalization = actor_obs_normalization
@@ -435,7 +524,8 @@ class ActorCriticTrialMemory(nn.Module):
 
         print(
             f"Trial-memory trunk: L={num_layers} d={d_model} heads={num_heads} M={num_memory_tokens}"
-            f" critic_trunk={self.critic_trunk}"
+            f" critic_trunk={self.critic_trunk} memory_interface={self.memory_interface}"
+            + (f" (read after block {self.memory_read_layer})" if self.residual_memory_read else "")
         )
         print(f"Actor head: {self.actor}")
         print(f"Critic head: {self.critic}")
@@ -469,11 +559,33 @@ class ActorCriticTrialMemory(nn.Module):
             nn.init.normal_(self.critic_memory_pos_embed, mean=0.0, std=0.02)
             nn.init.normal_(self.critic_start_embed, mean=0.0, std=0.02)
 
+    # Every attribute :meth:`_reset_runtime_state` owns. Kept as a list so that a frozen copy of the policy
+    # (:meth:`frozen_copy`) can be taken without duplicating the multi-GB acting-time buffers.
+    _RUNTIME_STATE_ATTRS: tuple[str, ...] = (
+        "_num_envs",
+        "_memory",
+        "_memory_kv",
+        "_read_kv",
+        "_key_cache",
+        "_value_cache",
+        "_hidden_history",
+        "_token_valid",
+        "_positions",
+        "_prev_actions",
+        "_prev_rewards",
+        "_prev_dones",
+        "_is_start",
+        "_last_hidden",
+    )
+
     def _reset_runtime_state(self) -> None:
         """Drop every acting-time buffer (they are lazily re-allocated on the first :meth:`forward_step`)."""
         self._num_envs: int | None = None
         self._memory: torch.Tensor | None = None
         self._memory_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        # Cached keys/values of Z for the residual read layer, recomputed only when Z changes (a write or a
+        # trial reset), never per step.
+        self._read_kv: tuple[torch.Tensor, torch.Tensor] | None = None
         self._key_cache: list[torch.Tensor] | None = None
         self._value_cache: list[torch.Tensor] | None = None
         self._hidden_history: torch.Tensor | None = None
@@ -485,12 +597,44 @@ class ActorCriticTrialMemory(nn.Module):
         self._is_start: torch.Tensor | None = None
         self._last_hidden: torch.Tensor | None = None
 
+    def frozen_copy(self) -> ActorCriticTrialMemory:
+        """A detached deep copy of this policy in eval mode, **without** its acting-time buffers.
+
+        Used as the reference ("policy at load time") for the drift diagnostics. The acting state is swapped out
+        before the copy is taken and restored afterwards, because at 16k environments the KV cache alone is tens
+        of gigabytes -- copying it would be the single largest allocation in the run.
+        """
+        # The live action distribution holds non-leaf tensors (the last h_t and its base Normal), which
+        # deepcopy refuses; it is pure scratch space, so it is swapped out with the rest of the runtime state
+        # and re-armed on the copy.
+        saved = {name: getattr(self, name, None) for name in self._RUNTIME_STATE_ATTRS}
+        saved["distribution"] = self.distribution
+        for name in saved:
+            setattr(self, name, None)
+        try:
+            reference = copy.deepcopy(self)
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+        reference._reset_runtime_state()
+        # A fresh gSDE distribution *without* re-drawing the exploration matrix: the matrix feeds only
+        # ``get_noise``, which this policy never calls, and re-drawing it would consume global RNG draws and
+        # therefore change the minibatch shuffle of the run this copy is only supposed to observe.
+        reference.distribution = (
+            GSDENoiseDistribution(action_dim=self.num_actions) if self.noise_std_type == "gsde" else None
+        )
+        reference.eval()
+        for parameter in reference.parameters():
+            parameter.requires_grad_(False)
+        return reference
+
     def initialize_state(self, num_envs: int, device: torch.device | str, dtype: torch.dtype | None = None) -> None:
         """Allocate the acting-time state for ``num_envs`` environments and set ``Z = Z_init``."""
         dtype = self.z_init.dtype if dtype is None else dtype
         self._num_envs = num_envs
         self._memory = self.z_init.detach().to(device=device, dtype=dtype).unsqueeze(0).repeat(num_envs, 1, 1)
         self._memory_kv = None
+        self._read_kv = None
         self._key_cache = [
             torch.zeros(num_envs, self.max_tokens, self.d_model, device=device, dtype=dtype)
             for _ in range(self.num_layers)
@@ -635,6 +779,34 @@ class ActorCriticTrialMemory(nn.Module):
         tokens = tokens + pos_embed[positions]
         return tokens + is_start.unsqueeze(-1).to(tokens.dtype) * start_embed
 
+    def _read_layer(self, critic: bool = False) -> MemoryReadLayer:
+        """The gated residual read layer of the requested pathway (``residual_read`` only)."""
+        if not self.residual_memory_read:
+            raise RuntimeError("There is no memory read layer with memory_interface='kv_prepend'.")
+        if critic:
+            if self.critic_trunk != "separate":
+                raise RuntimeError("The critic read layer only exists with critic_trunk='separate'.")
+            return self.critic_memory_read
+        return self.memory_read
+
+    def _memory_read_kv(self, memory: torch.Tensor, critic: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keys/values of ``Z + memory_pos_embed`` for the read layer of the requested pathway."""
+        _, _, _, memory_pos_embed, _, _ = self._pathway(critic)
+        return self._read_layer(critic).memory_kv(memory + memory_pos_embed)
+
+    def memory_gate_values(self) -> dict[str, float]:
+        """The realized gate values ``tanh(g)`` of every read layer, for logging. Empty in legacy mode."""
+        if not self.residual_memory_read:
+            return {}
+        gates = {
+            "memory_gate_attn": float(torch.tanh(self.memory_read.gate_attn.detach()).item()),
+            "memory_gate_ff": float(torch.tanh(self.memory_read.gate_ff.detach()).item()),
+        }
+        if self.critic_trunk == "separate":
+            gates["critic_memory_gate_attn"] = float(torch.tanh(self.critic_memory_read.gate_attn.detach()).item())
+            gates["critic_memory_gate_ff"] = float(torch.tanh(self.critic_memory_read.gate_ff.detach()).item())
+        return gates
+
     def _memory_kv_states(
         self, memory: torch.Tensor, critic: bool = False
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -659,11 +831,17 @@ class ActorCriticTrialMemory(nn.Module):
     def _sequence_attn_mask(
         self, num_tokens: int, mask: torch.Tensor | None, device: torch.device
     ) -> torch.Tensor:
-        """Assemble the ``[memory | tokens]`` attention mask, ``[S, M + S]`` or ``[B, S, M + S]``, ``True`` = attend."""
+        """Assemble the ``[memory | tokens]`` attention mask, ``[S, M + S]`` or ``[B, S, M + S]``, ``True`` = attend.
+
+        With ``memory_interface="residual_read"`` there is no memory stripe: the blocks only ever see environment
+        tokens, so the mask is the pure causal/windowed one, ``[S, S]`` or ``[B, S, S]``.
+        """
         positions = torch.arange(num_tokens, device=device)
         causal = positions.unsqueeze(1) >= positions.unsqueeze(0)
         if self.attention_window < num_tokens:
             causal = causal & ((positions.unsqueeze(1) - positions.unsqueeze(0)) < self.attention_window)
+        if self.residual_memory_read:
+            return causal if mask is None else (causal.unsqueeze(0) & mask.bool().unsqueeze(1))
         if mask is None:
             memory_mask = torch.ones(num_tokens, self.num_memory_tokens, device=device, dtype=torch.bool)
             return torch.cat([memory_mask, causal], dim=-1)
@@ -743,16 +921,27 @@ class ActorCriticTrialMemory(nn.Module):
         hidden = tokens.transpose(0, 1)
 
         attn_mask = self._sequence_attn_mask(num_steps, None if mask is None else mask.transpose(0, 1), device)
-        memory_kv = self._memory_kv_states(memory, critic=critic)
-        for block, (memory_keys, memory_values) in zip(blocks, memory_kv):
-            normed, keys, values = block.token_kv(hidden)
-            hidden = block.token_forward(
-                hidden,
-                normed,
-                torch.cat([memory_keys, keys], dim=1),
-                torch.cat([memory_values, values], dim=1),
-                attn_mask,
-            )
+        if self.residual_memory_read:
+            # Plain causal trunk over the environment tokens; the memory enters once, after block
+            # ``memory_read_layer``, through the gated read layer (an identity while its gates are zero).
+            read = self._read_layer(critic)
+            read_keys, read_values = self._memory_read_kv(memory, critic=critic)
+            for layer, block in enumerate(blocks):
+                normed, keys, values = block.token_kv(hidden)
+                hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
+                if layer == self.memory_read_layer:
+                    hidden = read(hidden, read_keys, read_values)
+        else:
+            memory_kv = self._memory_kv_states(memory, critic=critic)
+            for block, (memory_keys, memory_values) in zip(blocks, memory_kv):
+                normed, keys, values = block.token_kv(hidden)
+                hidden = block.token_forward(
+                    hidden,
+                    normed,
+                    torch.cat([memory_keys, keys], dim=1),
+                    torch.cat([memory_values, values], dim=1),
+                    attn_mask,
+                )
         hidden = final_norm(hidden)
         return hidden.transpose(0, 1)
 
@@ -883,26 +1072,44 @@ class ActorCriticTrialMemory(nn.Module):
             normalize_obs,
         )  # [N, 1, d]
 
-        if self._memory_kv is None:
+        if self.residual_memory_read:
+            # One K/V projection of Z per *write*, not per step: ``_read_kv`` is invalidated exactly where
+            # ``_memory`` changes (initialize_state / update_memory / reset_trial).
+            if self._read_kv is None:
+                read_keys, read_values = self._memory_read_kv(self._memory)
+                self._read_kv = (read_keys.detach(), read_values.detach())
+        elif self._memory_kv is None:
             self._memory_kv = [(k.detach(), v.detach()) for k, v in self._memory_kv_states(self._memory)]
 
-        # Keys visible to this query: memory tokens (always) + committed tokens inside the window + itself (last).
+        # Keys visible to this query: memory tokens (legacy interface only) + committed tokens inside the
+        # window + itself (last).
         key_positions = torch.arange(self.max_tokens, device=obs.device)
         window_ok = key_positions.unsqueeze(0) > (positions.unsqueeze(1) - self.attention_window)
         cache_mask = self._token_valid & window_ok  # [N, max_tokens]
-        ones = torch.ones(num_envs, self.num_memory_tokens + 1, device=obs.device, dtype=torch.bool)
-        attn_mask = torch.cat([ones[:, : self.num_memory_tokens], cache_mask, ones[:, -1:]], dim=-1).unsqueeze(1)
+        num_always = 1 if self.residual_memory_read else self.num_memory_tokens + 1
+        ones = torch.ones(num_envs, num_always, device=obs.device, dtype=torch.bool)
+        if self.residual_memory_read:
+            attn_mask = torch.cat([cache_mask, ones], dim=-1).unsqueeze(1)
+        else:
+            attn_mask = torch.cat([ones[:, : self.num_memory_tokens], cache_mask, ones[:, -1:]], dim=-1).unsqueeze(1)
 
         hidden = tokens
         scatter_index = positions.view(num_envs, 1, 1).expand(num_envs, 1, self.d_model)
-        for layer, (block, (memory_keys, memory_values)) in enumerate(zip(self.blocks, self._memory_kv)):
+        for layer, block in enumerate(self.blocks):
             normed, keys, values = block.token_kv(hidden)
-            all_keys = torch.cat([memory_keys, self._key_cache[layer], keys], dim=1)
-            all_values = torch.cat([memory_values, self._value_cache[layer], values], dim=1)
+            if self.residual_memory_read:
+                all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
+                all_values = torch.cat([self._value_cache[layer], values], dim=1)
+            else:
+                memory_keys, memory_values = self._memory_kv[layer]
+                all_keys = torch.cat([memory_keys, self._key_cache[layer], keys], dim=1)
+                all_values = torch.cat([memory_values, self._value_cache[layer], values], dim=1)
             hidden = block.token_forward(hidden, normed, all_keys, all_values, attn_mask)
             if commit:
                 self._key_cache[layer].scatter_(1, scatter_index, keys.detach())
                 self._value_cache[layer].scatter_(1, scatter_index, values.detach())
+            if self.residual_memory_read and layer == self.memory_read_layer:
+                hidden = self.memory_read(hidden, self._read_kv[0], self._read_kv[1])
         hidden = self.final_norm(hidden)
 
         if commit:
@@ -1029,6 +1236,7 @@ class ActorCriticTrialMemory(nn.Module):
         self._memory = self._memory.clone()
         self._memory[env_ids] = new_memory.detach()
         self._memory_kv = None
+        self._read_kv = None
         return weights
 
     def _checkout_state(self, env_ids: torch.Tensor) -> dict[str, Any]:
@@ -1037,6 +1245,7 @@ class ActorCriticTrialMemory(nn.Module):
             "num_envs": self._num_envs,
             "memory": self._memory,
             "memory_kv": self._memory_kv,
+            "read_kv": self._read_kv,
             "key_cache": self._key_cache,
             "value_cache": self._value_cache,
             "hidden_history": self._hidden_history,
@@ -1053,6 +1262,10 @@ class ActorCriticTrialMemory(nn.Module):
             self._memory_kv = None
         else:
             self._memory_kv = [(keys[env_ids], values[env_ids]) for keys, values in saved["memory_kv"]]
+        if saved["read_kv"] is None:
+            self._read_kv = None
+        else:
+            self._read_kv = (saved["read_kv"][0][env_ids], saved["read_kv"][1][env_ids])
         self._key_cache = [cache[env_ids] for cache in saved["key_cache"]]
         self._value_cache = [cache[env_ids] for cache in saved["value_cache"]]
         self._hidden_history = saved["hidden_history"][env_ids]
@@ -1080,6 +1293,7 @@ class ActorCriticTrialMemory(nn.Module):
         self._num_envs = saved["num_envs"]
         self._memory = saved["memory"]
         self._memory_kv = saved["memory_kv"]
+        self._read_kv = saved["read_kv"]
         self._key_cache = saved["key_cache"]
         self._value_cache = saved["value_cache"]
         self._hidden_history = saved["hidden_history"]
@@ -1129,6 +1343,7 @@ class ActorCriticTrialMemory(nn.Module):
         self._memory = self._memory.clone()
         self._memory[env_ids] = self.z_init.detach().to(device=self._memory.device, dtype=self._memory.dtype)
         self._memory_kv = None
+        self._read_kv = None
 
     def reset(self, dones: torch.Tensor | None = None, trial_dones: torch.Tensor | None = None, **kwargs: Any) -> None:
         """Convenience wrapper: clear short-term state on ``dones``, clear ``Z`` on ``trial_dones``."""

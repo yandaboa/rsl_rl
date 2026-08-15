@@ -7,7 +7,13 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
-from .actor_critic_trial_memory import ActorCriticTrialMemory, MemoryWriter, MultiHeadAttention, TrunkBlock
+from .actor_critic_trial_memory import (
+    ActorCriticTrialMemory,
+    MemoryReadLayer,
+    MemoryWriter,
+    MultiHeadAttention,
+    TrunkBlock,
+)
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
@@ -17,6 +23,7 @@ __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
     "ActorCriticTrialMemory",
+    "MemoryReadLayer",
     "MemoryWriter",
     "MultiHeadAttention",
     "RandomNetworkDistillation",

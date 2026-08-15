@@ -247,6 +247,9 @@ def test_warmup_freeze_filter_covers_the_critic_pathway() -> None:
         "critic_blocks.",
         "critic_final_norm.",
     )
+    if separate.residual_memory_read:
+        # The residual memory interface adds the critic's own gated read layer (gates included).
+        prefixes = prefixes + ("critic_memory_read.",)
     assert all(name.startswith(prefixes) for name in trainable), f"unexpected critic parameter: {trainable}"
     for prefix in prefixes:
         assert any(name.startswith(prefix) for name in trainable), f"no parameter under {prefix}"
