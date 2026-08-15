@@ -6,6 +6,7 @@
 """Implementation of different learning algorithms."""
 
 from .distillation import Distillation
+from .episode_context_ppo import EpisodeContextPPO
 from .ppo import PPO
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO", "Distillation", "EpisodeContextPPO"]
