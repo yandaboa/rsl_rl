@@ -436,50 +436,10 @@ LONG_TRIAL = 3 * LONG_EP  # 18 steps == 4.5 windows
 NUM_WINDOWS = 5
 
 
-def _collect_windowed(ppo: PPO, num_envs: int, num_windows: int, seed: int = 0) -> None:
-    """Collect ``num_windows`` rollouts of ``WINDOW`` steps, advancing the policy version between them.
-
-    The trial spans several windows, so it is carried across every rollout boundary and only becomes
-    trainable in the last one -- exactly the situation in which the *trial's* lag and a *row's* lag differ.
-    Between windows the storage is rolled and the version bumped by hand, which is what ``update()`` does at
-    its end; ``update()`` itself cannot run there because no trial has completed yet.
-    """
-    total = num_windows * WINDOW
-    dones = torch.zeros(total, num_envs, dtype=torch.bool, device=DEVICE)
-    trial_dones = torch.zeros_like(dones)
-    for episode in range(1, 4):
-        dones[episode * LONG_EP - 1] = True
-    trial_dones[LONG_TRIAL - 1] = True
-
-    generator = torch.Generator(device=DEVICE).manual_seed(seed)
-    randn = lambda *shape: torch.randn(*shape, generator=generator, device=DEVICE)  # noqa: E731
-    obs = TensorDict({"policy": randn(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
-    with torch.no_grad():
-        for window in range(num_windows):
-            for local in range(WINDOW):
-                step = window * WINDOW + local
-                ppo.act(obs)
-                next_obs = TensorDict({"policy": randn(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
-                extras = {"time_outs": dones[step], "trial_done": trial_dones[step]}
-                ppo.process_env_step(next_obs, randn(num_envs), dones[step], extras)
-                obs = next_obs
-            ppo.compute_returns(obs)
-            if window < num_windows - 1:
-                ppo.storage.clear()
-                ppo.storage.policy_version += 1
-
-
-def test_row_lags_ramp_across_collection_windows() -> None:
-    """A trial spanning 5 windows must carry a per-row lag ramp, not one trial-wide lag.
-
-    This is the regime the lag-aware KL exists for: the pair's ``lags`` entry is 4 for every row (the trial
-    STARTED four updates ago), so a trial-level ``lag <= 1`` mask would be empty and the KL control would
-    silently fall back to "all rows" on every update.
-    """
-    num_envs = 2
-    policy = _make_rl_policy(num_envs, seed=17)
-    ppo = PPO(
-        policy,
+def _make_windowed_ppo(num_envs: int, seed: int, **kwargs) -> PPO:
+    """A PPO whose collection window (``WINDOW``) is much shorter than a trial (``LONG_TRIAL``)."""
+    policy = _make_rl_policy(num_envs, seed=seed)
+    defaults = dict(
         num_learning_epochs=1,
         num_mini_batches=1,
         learning_rate=1e-4,
@@ -493,8 +453,66 @@ def test_row_lags_ramp_across_collection_windows() -> None:
         trial_carry_steps=CARRY,
         max_policy_lag=9,
     )
+    defaults.update(kwargs)
+    ppo = PPO(policy, **defaults)
     sample_obs = TensorDict({"policy": torch.zeros(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
     ppo.init_storage("rl", num_envs, WINDOW, sample_obs, [ACTION_DIM])
+    return ppo
+
+
+def _collect_windowed(
+    ppo: PPO, num_envs: int, num_windows: int, seed: int = 0, update_between: bool = False
+) -> list[dict[str, float]]:
+    """Collect ``num_windows`` rollouts of ``WINDOW`` steps. The last one is left for the caller to update on.
+
+    The trial spans several windows, so it is carried across every rollout boundary and only becomes
+    trainable in the last one -- exactly the situation in which the *trial's* lag and a *row's* lag differ.
+
+    Between windows, either a real ``update()`` runs (``update_between``, i.e. what the runner does: those
+    updates find nothing to train on) or the storage is rolled and the version bumped by hand, which is what
+    a *productive* update does at its end -- the way to simulate several real updates happening while one
+    long trial is in flight.
+    """
+    total = num_windows * WINDOW
+    dones = torch.zeros(total, num_envs, dtype=torch.bool, device=DEVICE)
+    trial_dones = torch.zeros_like(dones)
+    for episode in range(1, 4):
+        dones[episode * LONG_EP - 1] = True
+    trial_dones[LONG_TRIAL - 1] = True
+
+    generator = torch.Generator(device=DEVICE).manual_seed(seed)
+    randn = lambda *shape: torch.randn(*shape, generator=generator, device=DEVICE)  # noqa: E731
+    obs = TensorDict({"policy": randn(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
+    loss_dicts = []
+    for window in range(num_windows):
+        with torch.no_grad():
+            for local in range(WINDOW):
+                step = window * WINDOW + local
+                ppo.act(obs)
+                next_obs = TensorDict({"policy": randn(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
+                extras = {"time_outs": dones[step], "trial_done": trial_dones[step]}
+                ppo.process_env_step(next_obs, randn(num_envs), dones[step], extras)
+                obs = next_obs
+            ppo.compute_returns(obs)
+        if window < num_windows - 1:
+            if update_between:
+                loss_dicts.append(ppo.update())
+            else:
+                ppo.storage.clear()
+                ppo.storage.policy_version += 1
+    return loss_dicts
+
+
+def test_row_lags_ramp_across_collection_windows() -> None:
+    """A trial spanning 5 windows must carry a per-row lag ramp, not one trial-wide lag.
+
+    This is the regime the lag-aware KL exists for: the pair's ``lags`` entry is 4 for every row (the trial
+    STARTED four updates ago), so a trial-level ``lag <= 1`` mask would be empty and the KL control would
+    silently fall back to "all rows" on every update.
+    """
+    num_envs = 2
+    ppo = _make_windowed_ppo(num_envs, seed=17)
+    policy = ppo.policy
     _collect_windowed(ppo, num_envs, NUM_WINDOWS, seed=19)
 
     storage = ppo.storage
@@ -535,6 +553,72 @@ def test_row_lags_ramp_across_collection_windows() -> None:
         f" {fresh_fraction:.1%} of rows fresh, kl_fresh {loss_dict['kl_fresh']:.2e} vs kl_all"
         f" {loss_dict['kl_all']:.2f}"
     )
+
+
+def test_deferred_trials_make_update_a_no_op() -> None:
+    """A rollout shorter than a trial must warm up, not crash: no pairs but everything deferred == no-op."""
+    num_envs = 2
+    ppo = _make_windowed_ppo(num_envs, seed=23)
+    policy = ppo.policy
+    parameters_before = [parameter.detach().clone() for parameter in policy.parameters()]
+
+    # The first NUM_WINDOWS - 1 updates see 0 pairs and ``num_envs`` still-open trials.
+    warmup = _collect_windowed(ppo, num_envs, NUM_WINDOWS, seed=29, update_between=True)
+    assert len(warmup) == NUM_WINDOWS - 1
+    for iteration, loss_dict in enumerate(warmup):
+        assert loss_dict["update_skipped"] == 1.0, f"update {iteration} did not report itself as skipped"
+        assert loss_dict["pool_pairs"] == 0.0 and loss_dict["pool_deferred_trials"] == float(num_envs)
+        assert loss_dict["pool_dropped_episodes"] == 0.0, "a deferred trial was counted as dropped"
+        for key in ("value_function", "surrogate", "entropy", "kl_fresh", "kl_all", "update_norm/blocks"):
+            assert loss_dict[key] == 0.0, f"{key} is not zero on a skipped update"
+        assert loss_dict["adaptive_lr"] == ppo.learning_rate
+        for key, value in loss_dict.items():
+            assert torch.isfinite(torch.tensor(value)), f"{key} = {value} is not finite"
+    for before, after in zip(parameters_before, policy.parameters()):
+        assert torch.equal(before, after), "a skipped update moved a parameter"
+    # The invariant that matters for the carry region: no parameter moved, so no row aged.
+    assert ppo.storage.policy_version == 0, "a no-op update aged the carried rows"
+    assert ppo.reference_policy is None, "the drift reference was captured before a single real update"
+
+    # The trial closes in the last window, and now the update trains -- on rows that are ALL at lag 0,
+    # because none of the warm-up updates changed the policy.
+    batch = next(ppo.storage.trial_pair_mini_batch_generator(policy, num_mini_batches=1, num_epochs=1))
+    row_lags = batch["target"]["row_lags"][batch["target"]["loss_mask"]]
+    assert row_lags.numel() == LONG_TRIAL * num_envs and bool((row_lags == 0).all()), (
+        f"warm-up updates inflated the row lags: {torch.bincount(row_lags).tolist()}"
+    )
+    loss_dict = ppo.update()
+    assert loss_dict["update_skipped"] == 0.0
+    assert loss_dict["pool_pairs"] == 3.0 * num_envs, f"the closed trial did not train: {loss_dict}"
+    assert loss_dict["kl_minibatches_run"] == 1.0
+    assert ppo.storage.policy_version == 1, "a real update must advance the policy version"
+    assert any(not torch.equal(b, a) for b, a in zip(parameters_before, policy.parameters())), "nothing trained"
+    print(
+        f"[ok] {len(warmup)} warm-up updates skipped ({num_envs} deferred trials each, version pinned at 0),"
+        f" then {int(loss_dict['pool_pairs'])} pairs trained at row lag 0"
+    )
+
+
+def test_no_trainable_and_no_deferred_data_still_raises() -> None:
+    """The genuine misconfiguration -- nothing trainable and nothing pending -- must still fail loudly."""
+    num_envs = 4
+    policy = _make_rl_policy(num_envs, seed=31)
+    ppo = _make_rl_ppo(policy, num_envs, max_policy_lag=1)
+    _collect(ppo, num_envs, seed=32)
+    # Every trial closed, but under a behavior policy far older than max_policy_lag: dropped, not deferred.
+    ppo.storage.policy_versions.fill_(0)
+    ppo.storage.policy_version = 5
+    ppo.storage._pair_index = None
+    pool = ppo.storage.build_trial_pairs(verbose=False)
+    assert pool["num_pairs"] == 0 and pool["deferred_trials"] == 0 and pool["dropped_lagged_trials"] > 0
+
+    try:
+        ppo.update()
+    except ValueError as error:
+        assert "No trial completed during this rollout" in str(error), f"unexpected message: {error}"
+    else:
+        raise AssertionError("zero pairs with nothing deferred must raise, not silently no-op")
+    print("[ok] zero pairs with zero deferred trials still raises the configuration error")
 
 
 def test_row_lags_are_zero_within_a_single_window() -> None:
@@ -694,6 +778,8 @@ if __name__ == "__main__":
     test_cached_read_kv_follows_the_memory()
     test_legacy_kv_prepend_is_unchanged()
     test_row_lags_ramp_across_collection_windows()
+    test_deferred_trials_make_update_a_no_op()
+    test_no_trainable_and_no_deferred_data_still_raises()
     test_row_lags_are_zero_within_a_single_window()
     test_lag_aware_kl_ignores_stale_rows()
     test_instrumentation_pack_is_logged()

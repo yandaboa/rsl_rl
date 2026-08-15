@@ -303,6 +303,15 @@ class PPO:
             return "writer"
         return None
 
+    def _param_groups_present(self) -> list[str]:
+        """The tracked groups this policy actually has parameters in (no copies taken)."""
+        groups = {}
+        for name, _ in self.policy.named_parameters():
+            group = self._param_group(name)
+            if group is not None:
+                groups[group] = None
+        return list(groups)
+
     def _snapshot_param_groups(self) -> dict[str, dict[str, torch.Tensor]]:
         """A flat detached copy of every tracked parameter, grouped, taken before an update's first epoch."""
         snapshot: dict[str, dict[str, torch.Tensor]] = {}
@@ -889,6 +898,73 @@ class PPO:
         )
         return hidden, memory
 
+    @staticmethod
+    def _pool_metrics(pool: dict) -> dict[str, float]:
+        """Trial-pool accounting. Anything but zeros in the ``dropped``/``envs_without_data`` lines means
+        collected experience is being thrown away; ``deferred`` is data that is merely waiting."""
+        return {
+            "pool_pairs": float(pool["num_pairs"]),
+            "pool_pairs_lag0": float(pool["lag0_pairs"]),
+            "pool_trials": float(pool["num_trials"]),
+            "pool_deferred_trials": float(pool["deferred_trials"]),
+            "pool_dropped_episodes": float(pool["dropped_episodes"]),
+            "pool_dropped_lagged_trials": float(pool["dropped_lagged_trials"]),
+            "pool_dropped_truncated_trials": float(pool["dropped_truncated_trials"]),
+            "pool_envs_without_data": float(pool["envs_without_data"]),
+        }
+
+    def _skip_trial_memory_update(self, pool: dict) -> dict[str, float]:
+        """No-op update: no trial has completed yet, they are all still open. Warm-up, not a failure.
+
+        A trial is only trainable once it closes, so a rollout shorter than a trial cannot produce a single
+        pair: at ``num_steps_per_env=32`` with a 240-step trial the first ~7 updates necessarily see 512
+        deferred trials and 0 pairs. Raising there (as the minibatch generator does when there is genuinely
+        nothing to wait for) would make the production cadence uncrashable-into rather than merely slow to
+        start.
+
+        Two invariants, both load-bearing:
+
+        * the storage is still :meth:`~rsl_rl.storage.RolloutStorage.clear`\\ ed, exactly as in a real update,
+          so the open trials are carried into the next rollout with their collection stamps intact (and the
+          write pointer is reset -- skipping this would overflow the buffer on the next transition),
+        * ``policy_version`` is **not** incremented. No parameter moved, so the carried rows are still
+          on-policy; ageing them here would add one update of lag per warm-up rollout and could push a long
+          trial past ``max_policy_lag`` -- silently dropping it -- before a single real update had happened.
+        """
+        self.storage.clear()
+        loss_dict = {
+            key: 0.0
+            for key in (
+                "value_function",
+                "surrogate",
+                "entropy",
+                "ratio_mean",
+                "ratio_std",
+                "ratio_min",
+                "ratio_max",
+                "ratio_clip_frac",
+                "ratio_mean_lag0",
+                "ratio_min_lag0",
+                "ratio_max_lag0",
+                "ratio_clip_frac_lag0",
+                "ratio_max_dev_lag0_first_mb",
+                "kl_early_stopped",
+                "kl_minibatches_run",
+                "kl_fresh",
+                "kl_all",
+                "ratio_max_lag_0_1",
+                "ratio_max_lag_2_4",
+                "ratio_max_lag_5plus",
+            )
+        }
+        loss_dict["adaptive_lr"] = float(self.learning_rate)
+        loss_dict["update_skipped"] = 1.0
+        # Zeros rather than absent keys, so that a warm-up iteration does not punch a hole in the curves.
+        loss_dict.update({f"update_norm/{group}": 0.0 for group in self._param_groups_present()})
+        loss_dict.update(self._pool_metrics(pool))
+        loss_dict.update(self.policy.memory_gate_values())
+        return loss_dict
+
     def _update_trial_memory(self) -> dict[str, float]:
         """PPO over adjacent episode pairs: the clipped loss is taken on the target episode only."""
         mean_value_loss = 0.0
@@ -927,6 +1003,11 @@ class PPO:
         bucket_ratio_max = {"lag_0_1": 0.0, "lag_2_4": 0.0, "lag_5plus": 0.0}
         # Snapshot the pool accounting before update() consumes and clears the storage
         pool = dict(self.storage.build_trial_pairs())
+        # Warm-up: no trial has closed yet, but they are all still running, so the data is coming. Skip the
+        # update instead of raising. When nothing is deferred either, there is nothing to wait for and the
+        # minibatch generator below raises the (unchanged) configuration error.
+        if pool["num_pairs"] == 0 and pool["deferred_trials"] > 0:
+            return self._skip_trial_memory_update(pool)
         # -- once-per-update instrumentation (all of it cheap: one param copy, one segmentation pass) --
         group_snapshot = self._snapshot_param_groups()
         advantage_audit = self.storage.advantage_outcome_audit() if self.log_advantage_audit else {}
@@ -1192,14 +1273,10 @@ class PPO:
             "ratio_max_lag_0_1": bucket_ratio_max["lag_0_1"],
             "ratio_max_lag_2_4": bucket_ratio_max["lag_2_4"],
             "ratio_max_lag_5plus": bucket_ratio_max["lag_5plus"],
-            "pool_pairs": float(pool["num_pairs"]),
-            "pool_pairs_lag0": float(pool["lag0_pairs"]),
-            "pool_trials": float(pool["num_trials"]),
-            "pool_deferred_trials": float(pool["deferred_trials"]),
-            "pool_dropped_episodes": float(pool["dropped_episodes"]),
-            "pool_dropped_lagged_trials": float(pool["dropped_lagged_trials"]),
-            "pool_dropped_truncated_trials": float(pool["dropped_truncated_trials"]),
-            "pool_envs_without_data": float(pool["envs_without_data"]),
+            # 1.0 when this update trained on nothing because every trial was still open (see
+            # :meth:`_skip_trial_memory_update`); 0.0 for a real update.
+            "update_skipped": 0.0,
+            **self._pool_metrics(pool),
         }
         # Instrumentation pack: per-group relative parameter movement over this update, drift against the
         # loaded policy, the advantage/outcome audit and the memory gates.

@@ -57,6 +57,12 @@ class OnPolicyRunner:
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+        # Iterations whose update() actually trained. With the trial-memory policy an update is a no-op while
+        # every trial is still open (a 240-step trial against 32-step rollouts needs ~7 warm-up iterations
+        # before the first pair exists), so "iterations run" and "updates performed" are not the same number.
+        # A caller that wants N *real* updates -- e.g. train.py's critic warm-start -- must read this rather
+        # than count calls to learn().
+        self.num_trained_updates = 0
         self.git_status_repos = [rsl_rl.__file__]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
@@ -144,8 +150,12 @@ class OnPolicyRunner:
                 # Compute returns
                 self.alg.compute_returns(obs)
 
-            # Update policy
+            # Update policy. A trial-memory update is a no-op while every trial is still open; it returns a
+            # well-formed (all-zero) loss dict flagged with ``update_skipped`` instead of raising, and does
+            # not count as a performed update.
             loss_dict = self.alg.update()
+            if not loss_dict.get("update_skipped", 0.0):
+                self.num_trained_updates += 1
 
             # Commit the deferred observation-normalizer update.
             # Note: This has to happen *after* update(), so that the rollout is acted and reconstructed under
@@ -232,6 +242,8 @@ class OnPolicyRunner:
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+        # Flat against the iteration axis == the updates are no-ops (every trial still open).
+        self.writer.add_scalar("Perf/trained_updates", self.num_trained_updates, locs["it"])
 
         # Log training
         if len(locs["rewbuffer"]) > 0:
