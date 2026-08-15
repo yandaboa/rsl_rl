@@ -60,6 +60,8 @@ def _make_policy(
     context_length: int = T_EPISODE,
     obs_normalization: bool = False,
     noise_std_type: str = "scalar",
+    critic_design: str = "privileged",
+    detach_critic_trunk: bool = False,
 ) -> ActorCriticEpisodeContext:
     torch.manual_seed(seed)
     policy = ActorCriticEpisodeContext(
@@ -78,6 +80,8 @@ def _make_policy(
         critic_hidden_dims=[16],
         noise_std_type=noise_std_type,
         init_noise_std=0.5,
+        critic_design=critic_design,
+        detach_critic_trunk=detach_critic_trunk,
     )
     with torch.no_grad():
         for name, parameter in policy.named_parameters():
@@ -242,6 +246,123 @@ def test_every_row_is_trained_exactly_once() -> None:
     print(f"[ok] every one of {STEPS_PER_ENV * NUM_ENVS} rows is trained exactly once per epoch")
 
 
+def test_shared_trunk_epoch_zero_value_canary() -> None:
+    """With a shared trunk, epoch-0 values re-inferred INSIDE the real PPO update must equal the stored ones.
+
+    Same statement as the ratio canary, on the value side: the acting path reads ``h_t`` off the KV cache while
+    the update reads it off one batched ``[prefix | window]`` pass, so if the two disagreed every advantage would
+    be measured against a value the behavior policy never produced. The values are captured by wrapping
+    ``policy.evaluate`` -- ``ppo.py`` itself is untouched and is what calls it.
+    """
+    dones = _episode_schedule(2 * STEPS_PER_ENV)
+    policy = _make_policy(critic_design="shared_trunk", noise_std_type="gsde")
+    assert policy.critic[0].in_features == policy.d_model
+    ppo = _make_ppo(policy)
+    generator = torch.Generator(device=DEVICE).manual_seed(13)
+
+    for rollout in range(2):
+        _collect(ppo, dones, rollout * STEPS_PER_ENV, generator)
+        stored_values = ppo.storage.values.clone()
+
+        # Record what the REAL update path feeds into the value loss, in minibatch order.
+        recorded: list[torch.Tensor] = []
+        stock_evaluate = policy.evaluate
+
+        def recording_evaluate(*args, _stock=stock_evaluate, _sink=recorded, **kwargs) -> torch.Tensor:
+            value = _stock(*args, **kwargs)
+            _sink.append(value.detach().clone())
+            return value
+
+        policy.evaluate = recording_evaluate
+        try:
+            loss_dict = ppo.update()
+        finally:
+            del policy.evaluate
+
+        assert len(recorded) == 2, f"expected one evaluate() per minibatch, got {len(recorded)}"
+        re_inferred = torch.cat(recorded, dim=1)  # the generator hands out contiguous environment chunks
+        assert re_inferred.shape == stored_values.shape
+        value_error = (re_inferred - stored_values).abs().max().item()
+        assert value_error < 1e-5, f"epoch-0 values drifted by {value_error:.3e} (rollout {rollout})"
+        assert stored_values.abs().max().item() > 1e-4, "the stored values are ~0; the canary would be vacuous"
+        # The ratio canary must still hold with the actor and critic sharing one trunk pass.
+        assert abs(loss_dict["ratio_mean"] - 1.0) < 1e-5, f"ratio_mean = {loss_dict['ratio_mean']}"
+        for key, value in loss_dict.items():
+            assert value == value and abs(value) < float("inf"), f"{key} is not finite: {value}"
+        ppo.commit_obs_normalization(ppo.storage.collected_observations)
+        print(f"[ok] shared-trunk epoch-0 value canary, rollout {rollout}: max |dV| = {value_error:.3e}")
+
+
+def test_shared_trunk_bootstrap_value_is_not_committed() -> None:
+    """``compute_returns`` evaluates a frame that never went through ``act()``; it must peek, not commit.
+
+    If the bootstrap frame entered the KV cache, the next rollout's first token would attend to a duplicate of
+    itself and the epoch-0 reconstruction would break -- which is exactly what the canary above would then fail
+    on, so this test pins the mechanism directly.
+    """
+    dones = _episode_schedule(STEPS_PER_ENV)
+    policy = _make_policy(seed=6, critic_design="shared_trunk")
+    ppo = _make_ppo(policy)
+    generator = torch.Generator(device=DEVICE).manual_seed(21)
+
+    obs = _sample_obs(NUM_ENVS, generator)
+    with torch.no_grad():
+        for step in range(STEPS_PER_ENV):
+            ppo.act(obs)
+            next_obs = _sample_obs(NUM_ENVS, generator)
+            ppo.process_env_step(next_obs, torch.randn(NUM_ENVS, generator=generator, device=DEVICE), dones[step], {})
+            obs = next_obs
+        positions_before = policy.positions.clone()
+        cache_before = [cache.clone() for cache in policy._key_cache]
+        cache_positions_before = policy._cache_positions.clone()
+        ppo.compute_returns(obs)
+
+    assert torch.equal(policy.positions, positions_before), "the bootstrap advanced the acting path's episode step"
+    assert torch.equal(policy._cache_positions, cache_positions_before)
+    for before, after in zip(cache_before, policy._key_cache):
+        assert torch.equal(before, after), "the bootstrap frame was committed to the KV cache"
+    assert ppo.storage.returns.abs().sum().item() > 0.0
+    print("[ok] the shared-trunk bootstrap value peeks the last frame without committing it")
+
+
+def test_shared_trunk_value_loss_trains_the_trunk_through_ppo() -> None:
+    """Through the real ``update()``: the trunk moves under the value loss iff ``detach_critic_trunk=False``.
+
+    The actor's own losses are switched off (zero advantages -> zero surrogate gradient, zero entropy
+    coefficient) so that any trunk movement can only have come through the value head.
+    """
+    dones = _episode_schedule(STEPS_PER_ENV)
+    for detach in (False, True):
+        policy = _make_policy(seed=8, critic_design="shared_trunk", detach_critic_trunk=detach)
+        ppo = _make_ppo(policy, learning_rate=1e-2, value_loss_coef=1.0, entropy_coef=0.0)
+        generator = torch.Generator(device=DEVICE).manual_seed(2)
+        _collect(ppo, dones, 0, generator)
+        ppo.storage.advantages.zero_()  # d surrogate / d ratio = -advantage = 0
+        trunk_before = {
+            name: parameter.detach().clone()
+            for name, parameter in policy.named_parameters()
+            if name.startswith(("token_embed", "blocks", "final_norm", "pos_embed", "start_embed"))
+        }
+        ppo.update()
+
+        moved = max(
+            (parameter - trunk_before[name]).abs().max().item()
+            for name, parameter in policy.named_parameters()
+            if name in trunk_before
+        )
+        head_moved = max(
+            parameter.grad.abs().max().item()
+            for name, parameter in policy.named_parameters()
+            if name.startswith("critic.") and parameter.grad is not None
+        )
+        assert head_moved > 0.0, "the value loss never reached the value head"
+        if detach:
+            assert moved == 0.0, f"detach_critic_trunk=True moved the trunk by {moved:.3e}"
+        else:
+            assert moved > 0.0, "detach_critic_trunk=False left the trunk untouched by the value loss"
+        print(f"[ok] real PPO update, detach_critic_trunk={detach}: max |d trunk| = {moved:.3e}")
+
+
 def test_ppo_stays_byte_identical() -> None:
     """The known-good PPO, storage and runner must be untouched: all new behavior lives in new files."""
     protected = [
@@ -264,5 +385,8 @@ if __name__ == "__main__":
     test_epoch_zero_canary()
     test_prefix_actually_carries_history()
     test_every_row_is_trained_exactly_once()
+    test_shared_trunk_epoch_zero_value_canary()
+    test_shared_trunk_bootstrap_value_is_not_committed()
+    test_shared_trunk_value_loss_trains_the_trunk_through_ppo()
     test_ppo_stays_byte_identical()
     print("all episode-context PPO tests passed")

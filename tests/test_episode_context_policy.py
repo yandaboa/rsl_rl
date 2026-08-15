@@ -363,6 +363,215 @@ def test_ring_buffer_sufficiency() -> None:
     print(f"[ok] ring buffer: {num_rollouts} rollouts x {window} rows x {num_envs} envs reconstructed exactly")
 
 
+# --------------------------------------------------------------------------------------------------
+# Shared-trunk critic (critic_design="shared_trunk")
+# --------------------------------------------------------------------------------------------------
+
+
+def _make_shared_policy(
+    detach_critic_trunk: bool = False,
+    privileged_group: bool = False,
+    seed: int = 0,
+    context_length: int = T_EPISODE,
+) -> ActorCriticEpisodeContext:
+    """A shared-trunk-critic policy. ``privileged_group`` adds a critic group that must be IGNORED."""
+    torch.manual_seed(seed)
+    tensors = {"policy": torch.zeros(NUM_ENVS, OBS_DIM)}
+    obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+    if privileged_group:
+        tensors["critic"] = torch.zeros(NUM_ENVS, OBS_DIM + 2)
+        obs_groups["critic"] = ["critic"]
+    policy = ActorCriticEpisodeContext(
+        obs=TensorDict(tensors, batch_size=[NUM_ENVS], device=DEVICE),
+        obs_groups=obs_groups,
+        num_actions=ACTION_DIM,
+        context_length=context_length,
+        d_model=32,
+        num_layers=2,
+        num_heads=4,
+        max_episode_length=T_EPISODE,
+        ff_mult=2,
+        actor_hidden_dims=[16],
+        critic_hidden_dims=[16],
+        critic_design="shared_trunk",
+        detach_critic_trunk=detach_critic_trunk,
+        init_noise_std=0.5,
+    )
+    with torch.no_grad():
+        for name, parameter in policy.named_parameters():
+            if name in ("std", "log_std"):
+                continue
+            parameter.add_(0.1 * torch.randn_like(parameter))
+    return policy.double().eval()
+
+
+def _obs_dict(frames: torch.Tensor, privileged: torch.Tensor | None = None) -> TensorDict:
+    tensors = {"policy": frames}
+    if privileged is not None:
+        tensors["critic"] = privileged
+    return TensorDict(tensors, batch_size=list(frames.shape[:-1]), device=DEVICE)
+
+
+def test_critic_design_routing() -> None:
+    """The value head's input is the critic observation when privileged and ``d_model`` when shared."""
+    privileged = _make_policy()  # default design
+    assert privileged.critic_design == "privileged"
+    assert privileged.critic[0].in_features == privileged.num_critic_obs == OBS_DIM
+
+    shared = _make_shared_policy(privileged_group=True)
+    assert shared.critic_design == "shared_trunk"
+    assert shared.critic[0].in_features == shared.d_model
+    assert shared.critic[-1].out_features == 1
+    # The head must still be reachable as ``critic.*`` (uwlab's critic-warmup / strict-load filters key on it).
+    assert any(name.startswith("critic.") for name, _ in shared.named_parameters())
+    # A critic group that this environment does not publish is tolerated (it is never read).
+    absent = ActorCriticEpisodeContext(
+        obs=TensorDict({"policy": torch.zeros(NUM_ENVS, OBS_DIM)}, batch_size=[NUM_ENVS], device=DEVICE),
+        obs_groups={"policy": ["policy"], "critic": ["does_not_exist"]},
+        num_actions=ACTION_DIM,
+        d_model=16,
+        num_layers=1,
+        num_heads=2,
+        max_episode_length=T_EPISODE,
+        ff_mult=2,
+        actor_hidden_dims=[8],
+        critic_hidden_dims=[8],
+        critic_design="shared_trunk",
+        critic_obs_normalization=True,
+    )
+    assert absent.critic[0].in_features == absent.d_model
+    assert not absent.critic_obs_normalization, "a shared-trunk critic must not normalize an unused observation"
+    absent.update_normalization(TensorDict({"policy": torch.zeros(2, OBS_DIM)}, batch_size=[2], device=DEVICE))
+    print("[ok] critic_design routes the value head's input (privileged obs vs d_model trunk readout)")
+
+
+def test_shared_trunk_value_uses_the_actor_context() -> None:
+    """Values must come off the actor's ``h`` -- context-dependent, privileged-observation-independent."""
+    policy = _make_shared_policy(privileged_group=True, seed=3)
+    num_steps = 2 * T_EPISODE
+    generator = torch.Generator(device=DEVICE).manual_seed(17)
+    frames = torch.randn(num_steps, NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    dones = torch.zeros(num_steps, NUM_ENVS, dtype=torch.bool, device=DEVICE)
+    dones[T_EPISODE - 1] = True
+    positions = _positions_from_dones(dones)
+
+    with torch.no_grad():
+        # -- collection: act() then evaluate() on the same frame, exactly as ppo.act does --
+        policy.initialize_state(NUM_ENVS, DEVICE, dtype=frames.dtype)
+        step_values, step_hidden = [], []
+        for step in range(num_steps):
+            obs = _obs_dict(frames[step], torch.randn(NUM_ENVS, OBS_DIM + 2, generator=generator, dtype=torch.float64))
+            policy.act(obs)
+            hidden = policy._last_hidden.clone()
+            value = policy.evaluate(obs)
+            assert torch.allclose(value, policy.critic(hidden)), "evaluate() did not read the acting path's h_t"
+            # The privileged group is pure noise and must not move the value. Compared with the cache bypassed,
+            # so that the equality is a statement about the forward and not about the cache.
+            other = _obs_dict(
+                frames[step], torch.randn(NUM_ENVS, OBS_DIM + 2, generator=generator, dtype=torch.float64)
+            )
+            assert torch.equal(
+                policy.evaluate(obs, use_cached_hidden=False), policy.evaluate(other, use_cached_hidden=False)
+            ), "the shared-trunk critic read the privileged obs"
+            step_values.append(value)
+            step_hidden.append(hidden)
+            policy.reset(dones[step])
+        step_values = torch.stack(step_values)
+
+        # -- update: one batched [prefix | window] pass; PPO calls act() first, then evaluate() --
+        window_start = T_EPISODE - 2
+        prefix_start = max(0, window_start - policy.context_prefix_length)
+        prefix = EpisodeContextPrefix(
+            obs=frames[prefix_start:window_start],
+            positions=positions[prefix_start:window_start],
+            window_positions=positions[window_start:],
+        )
+        window_obs = _obs_dict(frames[window_start:])
+        policy.act(window_obs, hidden_state=prefix)
+        window_values = policy.evaluate(window_obs)
+        assert window_values.shape == (num_steps - window_start, NUM_ENVS, 1)
+        error = (window_values - step_values[window_start:]).abs().max().item()
+        assert error < 1e-10, f"batched values disagree with the acting path's: {error:.3e}"
+
+        # Context-dependence: corrupting the prefix must move the values of the rows that reach into it.
+        wrecked = EpisodeContextPrefix(
+            obs=prefix.obs + 5.0, positions=prefix.positions, window_positions=prefix.window_positions
+        )
+        policy.act(window_obs, hidden_state=wrecked)
+        assert not torch.allclose(window_values, policy.evaluate(window_obs)), (
+            "corrupting the prefix left the values unchanged; the critic is not conditioned on the context"
+        )
+
+        # -- bootstrap: an observation that never went through act() is peeked, not committed --
+        policy.reset(dones[-1])
+        cache_before = [cache.clone() for cache in policy._key_cache]
+        positions_before = policy._positions.clone()
+        boot_obs = _obs_dict(torch.randn(NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64))
+        boot_value = policy.evaluate(boot_obs)
+        assert boot_value.shape == (NUM_ENVS, 1)
+        assert torch.equal(policy._positions, positions_before), "the bootstrap value advanced the episode step"
+        for before, after in zip(cache_before, policy._key_cache):
+            assert torch.equal(before, after), "the bootstrap value was committed to the KV cache"
+        assert torch.allclose(boot_value, policy.critic(policy.forward_step(boot_obs, commit=False)))
+    print("[ok] shared-trunk values: acting h_t on collection, batched h on update, peeked h on the bootstrap")
+
+
+def test_shared_trunk_value_gradients_reach_the_trunk() -> None:
+    """``detach_critic_trunk`` is the switch: the value loss shapes the trunk only when it is ``False``."""
+    generator = torch.Generator(device=DEVICE).manual_seed(23)
+    frames = torch.randn(T_EPISODE, NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    positions = torch.arange(T_EPISODE, device=DEVICE).unsqueeze(1).expand(T_EPISODE, NUM_ENVS)
+    trunk_names = ("token_embed", "blocks", "final_norm", "pos_embed", "start_embed")
+
+    for detach in (False, True):
+        policy = _make_shared_policy(detach_critic_trunk=detach, seed=7)
+        policy.train()
+        prefix = EpisodeContextPrefix(obs=frames[:0], positions=positions[:0], window_positions=positions)
+        obs = _obs_dict(frames)
+        policy.zero_grad(set_to_none=True)
+        policy.act(obs, hidden_state=prefix)  # what ppo.py does right before evaluate()
+        value_loss = policy.evaluate(obs).pow(2).mean()
+        value_loss.backward()
+
+        trunk_grad = 0.0
+        for name, parameter in policy.named_parameters():
+            if name.startswith(trunk_names):
+                trunk_grad += 0.0 if parameter.grad is None else parameter.grad.abs().sum().item()
+        head_grad = sum(
+            parameter.grad.abs().sum().item()
+            for name, parameter in policy.named_parameters()
+            if name.startswith("critic.") and parameter.grad is not None
+        )
+        assert head_grad > 0.0, "the value loss did not even reach the value head"
+        if detach:
+            assert trunk_grad == 0.0, f"detach_critic_trunk=True still leaked {trunk_grad:.3e} into the trunk"
+        else:
+            assert trunk_grad > 0.0, "detach_critic_trunk=False did not train the trunk on the value loss"
+        print(f"[ok] detach_critic_trunk={detach}: trunk grad = {trunk_grad:.3e}, head grad = {head_grad:.3e}")
+
+
+def test_privileged_evaluate_is_unchanged() -> None:
+    """The default design is untouched: a context-free MLP on the critic observation, no trunk involvement."""
+    policy = _make_policy(seed=4)
+    generator = torch.Generator(device=DEVICE).manual_seed(31)
+    frames = torch.randn(NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    obs = _obs_dict(frames)
+    with torch.no_grad():
+        policy.initialize_state(NUM_ENVS, DEVICE, dtype=frames.dtype)
+        reference = policy.evaluate(obs)
+        assert torch.equal(reference, policy.critic(frames)), "the privileged critic stopped being a plain MLP"
+        # It is context-free: acting (which moves h_t) must not move the value of the same observation.
+        policy.act(obs)
+        assert torch.equal(reference, policy.evaluate(obs))
+    try:
+        policy.value_from_hidden(torch.zeros(NUM_ENVS, policy.d_model, dtype=torch.float64))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("value_from_hidden() must refuse to fabricate a value for a privileged critic")
+    print("[ok] critic_design='privileged' is byte-unchanged behavior")
+
+
 if __name__ == "__main__":
     test_step_matches_window()
     test_window_is_episode_local_and_span_limited()
@@ -370,4 +579,8 @@ if __name__ == "__main__":
     test_forward_window_batch_first_segments()
     test_cache_reset_isolates_environments()
     test_ring_buffer_sufficiency()
+    test_critic_design_routing()
+    test_shared_trunk_value_uses_the_actor_context()
+    test_shared_trunk_value_gradients_reach_the_trunk()
+    test_privileged_evaluate_is_unchanged()
     print("all episode-context policy tests passed")

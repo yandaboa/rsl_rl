@@ -17,8 +17,18 @@ carries the previous action, and the context never crosses an episode boundary. 
 function of ``(frames since the episode started, capped at L)`` -- which is exactly what the storage can
 reconstruct from a ring buffer of raw frames, with no ``x L`` duplication of observations.
 
-The **critic** is a plain single-step MLP on the (privileged) critic observation group. It sees no context and no
-transformer, so values are produced step-wise by :meth:`evaluate` on both the collection and the update path.
+The **critic** has two designs, selected by ``critic_design``:
+
+* ``"privileged"`` (default, the original behavior) -- a plain single-step MLP on the (privileged) critic
+  observation group. It sees no context and no transformer, so values are produced step-wise by :meth:`evaluate`
+  on both the collection and the update path.
+* ``"shared_trunk"`` -- the design validated by run 225077 on the 16-frame line: the critic conditions on the
+  SAME episode context as the actor. The value head is an MLP on the trunk readout ``h_t`` (``d_model`` in, 1
+  out), sharing the actor's trunk, and the critic observation group is unused. Values therefore come from the
+  acting path's ``h_t`` during collection and from the batched path's ``h`` during the update -- see
+  :meth:`evaluate` for how each of the three call sites (collection, terminal bootstrap, minibatch) is served.
+  By default the value loss backpropagates into the trunk (faithful to 225077); ``detach_critic_trunk=True``
+  cuts that gradient.
 
 Two forward paths, required to agree numerically:
 
@@ -100,15 +110,18 @@ class ActorCriticEpisodeContext(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         normalizer_until: int | None = None,
+        critic_design: str = "privileged",
+        detach_critic_trunk: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the episode-context actor-critic.
 
         Args:
             obs: A sample observation ``TensorDict``, used only to read the observation dimensions.
-            obs_groups: Mapping from ``"policy"``/``"critic"`` to the observation groups they consume. Unlike the
-                trial-memory policy, the critic groups are genuinely used: the critic is a separate MLP and may
-                be privileged.
+            obs_groups: Mapping from ``"policy"``/``"critic"`` to the observation groups they consume. With
+                ``critic_design="privileged"`` the critic groups are genuinely used (the critic is a separate MLP
+                and may be privileged); with ``critic_design="shared_trunk"`` they are ignored, so
+                ``{"critic": ["policy"]}`` (or a missing/absent group) is tolerated.
             num_actions: Action dimension.
             actor_obs_normalization: Empirically normalize the single-step observation feeding the tokens.
             critic_obs_normalization: Empirically normalize the critic observation.
@@ -123,7 +136,8 @@ class ActorCriticEpisodeContext(nn.Module):
             ff_mult: Feed-forward expansion factor.
             embed_hidden_dims: Hidden dims of the token embedding. Empty means a single linear layer.
             actor_hidden_dims: Hidden dims of the policy head (consumes the trunk readout ``h_t``).
-            critic_hidden_dims: Hidden dims of the value MLP (consumes the critic observation directly).
+            critic_hidden_dims: Hidden dims of the value MLP. It consumes the critic observation directly under
+                ``critic_design="privileged"`` and the trunk readout ``h_t`` under ``"shared_trunk"``.
             activation: Activation used in the trunk and the heads.
             init_noise_std: Initial action noise standard deviation. Under ``"gsde"`` this is not the realized
                 action std: the realized std is ``init_noise_std * ||h_t||``.
@@ -131,6 +145,12 @@ class ActorCriticEpisodeContext(nn.Module):
                 ``log_std`` keyed on the trunk readout, exactly as in the trial-memory policy).
             normalizer_until: ``until`` of the observation normalizers (number of samples after which the
                 statistics freeze). ``None`` keeps updating forever.
+            critic_design: ``"privileged"`` (a separate single-step MLP on the critic observation group) or
+                ``"shared_trunk"`` (a value head on the actor trunk's ``h_t``, i.e. the critic conditions on the
+                same episode context as the actor and is NOT privileged).
+            detach_critic_trunk: Only meaningful with ``critic_design="shared_trunk"``. When ``True``, ``h_t`` is
+                detached before the value head, so the value loss trains the head alone. Defaults to ``False``
+                (the value loss shapes the trunk too, as in run 225077).
         """
         if kwargs:
             print(
@@ -139,6 +159,11 @@ class ActorCriticEpisodeContext(nn.Module):
             )
         super().__init__()
 
+        if critic_design not in ("privileged", "shared_trunk"):
+            raise ValueError(f"Unknown critic_design: {critic_design!r}. Should be 'privileged' or 'shared_trunk'.")
+        self.critic_design = critic_design
+        self.detach_critic_trunk = bool(detach_critic_trunk)
+
         self.obs_groups = obs_groups
         num_actor_obs = 0
         for obs_group in obs_groups["policy"]:
@@ -146,6 +171,10 @@ class ActorCriticEpisodeContext(nn.Module):
             num_actor_obs += obs[obs_group].shape[-1]
         num_critic_obs = 0
         for obs_group in obs_groups.get("critic", obs_groups["policy"]):
+            # With a shared trunk the critic groups are never read, so a configuration that points the critic at
+            # the policy group (or at a group this environment does not even publish) is tolerated.
+            if critic_design == "shared_trunk" and obs_group not in obs:
+                continue
             assert len(obs[obs_group].shape) == 2, "The ActorCriticEpisodeContext module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
@@ -177,9 +206,13 @@ class ActorCriticEpisodeContext(nn.Module):
         self.blocks = nn.ModuleList([TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)])
         self.final_norm = nn.LayerNorm(d_model)
 
-        # Heads. The actor reads the trunk; the critic is a plain single-step MLP on the (privileged) critic obs.
+        # Heads. The actor reads the trunk; the critic reads either the trunk (shared) or the privileged critic
+        # observation. The value head keeps the name ``critic`` in BOTH designs: downstream tooling keys on it
+        # (uwlab's critic-warmup freezes every parameter NOT named ``critic*``/``_crit*``, and the BC strict-load
+        # tolerance drops mismatched ``critic.*`` keys).
         self.actor = MLP(d_model, num_actions, list(actor_hidden_dims), activation)
-        self.critic = MLP(num_critic_obs, 1, list(critic_hidden_dims), activation)
+        critic_input_dim = d_model if self.critic_design == "shared_trunk" else num_critic_obs
+        self.critic = MLP(critic_input_dim, 1, list(critic_hidden_dims), activation)
 
         # Observation normalization. Attribute names match ActorCritic so that train.py's --freeze_obs_norm
         # handling (which pokes ``actor_obs_normalizer`` / ``critic_obs_normalizer``) works unchanged.
@@ -188,8 +221,10 @@ class ActorCriticEpisodeContext(nn.Module):
             self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs, until=normalizer_until)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
-        self.critic_obs_normalization = critic_obs_normalization
-        if critic_obs_normalization:
+        # A shared-trunk critic never touches the critic observation, so its normalizer would only accumulate
+        # statistics nothing reads (and would crash ``update_normalization`` when the group does not exist).
+        self.critic_obs_normalization = critic_obs_normalization and self.critic_design == "privileged"
+        if self.critic_obs_normalization:
             self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs, until=normalizer_until)
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
@@ -217,7 +252,13 @@ class ActorCriticEpisodeContext(nn.Module):
             f" context={self.context_length} (span {self.context_span}) T={self.max_episode_length}"
         )
         print(f"Actor head: {self.actor}")
-        print(f"Critic MLP: {self.critic}")
+        if self.critic_design == "shared_trunk":
+            print(
+                f"Critic head (shared trunk, detach={self.detach_critic_trunk}, conditions on the same episode"
+                f" context as the actor): {self.critic}"
+            )
+        else:
+            print(f"Critic MLP (privileged, {num_critic_obs}-d observation): {self.critic}")
 
     # --------------------------------------------------------------------------------------------------------
     # Initialization / runtime state
@@ -244,6 +285,8 @@ class ActorCriticEpisodeContext(nn.Module):
         "_cache_positions",
         "_positions",
         "_last_hidden",
+        "_window_hidden",
+        "_window_hidden_obs",
     )
 
     def _reset_runtime_state(self) -> None:
@@ -256,6 +299,11 @@ class ActorCriticEpisodeContext(nn.Module):
         self._cache_positions: torch.Tensor | None = None
         self._positions: torch.Tensor | None = None
         self._last_hidden: torch.Tensor | None = None
+        # Update path (shared-trunk critic only): the ``h`` the last :meth:`act` computed for a minibatch, kept
+        # together with the observation object it came from so that :meth:`evaluate` can prove it is looking at
+        # the same minibatch before reusing it (``ppo.py`` calls ``act`` then ``evaluate`` on the same object).
+        self._window_hidden: torch.Tensor | None = None
+        self._window_hidden_obs: Any = None
 
     def initialize_state(self, num_envs: int, device: torch.device | str, dtype: torch.dtype | None = None) -> None:
         """Allocate the acting-time KV cache for ``num_envs`` environments (all episodes start at step 0)."""
@@ -271,6 +319,8 @@ class ActorCriticEpisodeContext(nn.Module):
         self._cache_positions = torch.full((num_envs, span), -1, device=device, dtype=torch.long)
         self._positions = torch.zeros(num_envs, device=device, dtype=torch.long)
         self._last_hidden = None
+        self._window_hidden = None
+        self._window_hidden_obs = None
 
     def _ensure_state(self, num_envs: int, device: torch.device, dtype: torch.dtype) -> None:
         if self._num_envs != num_envs or self._key_cache is None or self._key_cache[0].device != device:
@@ -598,9 +648,13 @@ class ActorCriticEpisodeContext(nn.Module):
         """
         if hidden_state is None:
             hidden = self.forward_step(obs, commit=True)
+            self._window_hidden, self._window_hidden_obs = None, None
             self._update_distribution(hidden)
             return self.distribution.sample()
         hidden = self.forward_window(obs, prefix=hidden_state)
+        # Hand this ``h`` to the value head instead of re-running the trunk: with a shared trunk, ``ppo.py``'s
+        # ``evaluate(obs_batch, ...)`` two lines below MUST see exactly the states the surrogate loss saw.
+        self._window_hidden, self._window_hidden_obs = hidden, obs
         self._update_distribution(hidden)
         return self.distribution.mean
 
@@ -608,11 +662,70 @@ class ActorCriticEpisodeContext(nn.Module):
         hidden = self.forward_step(obs, commit=True)
         return self.actor(hidden)
 
-    def evaluate(self, obs: TensorDict | torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        """Value of the given (privileged) observation. Context-free, so the shape is whatever comes in:
-        ``[N, ...] -> [N, 1]`` on the collection path, ``[W, B, ...] -> [W, B, 1]`` on the update path."""
-        critic_obs = self.get_critic_obs(obs)
-        return self.critic(self.critic_obs_normalizer(critic_obs))
+    def value_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Value from a trunk readout produced by either forward path (``critic_design="shared_trunk"`` only)."""
+        if self.critic_design != "shared_trunk":
+            raise RuntimeError(
+                "value_from_hidden() is meaningless with critic_design='privileged': the value head consumes the"
+                " critic observation, not the trunk readout. Call evaluate(obs) instead."
+            )
+        return self.critic(hidden.detach() if self.detach_critic_trunk else hidden)
+
+    def _hidden_for_value(
+        self,
+        obs: TensorDict | torch.Tensor,
+        hidden_state: EpisodeContextPrefix | None,
+        use_cached_hidden: bool,
+    ) -> torch.Tensor:
+        """The ``h`` a shared-trunk value must be read off, for each of the three call sites of :meth:`evaluate`.
+
+        1. **Update minibatch.** ``ppo.py`` calls ``act(obs_batch, hidden_state=prefix)`` and then
+           ``evaluate(obs_batch, hidden_state=None)`` on the *same* observation object, so the ``h`` :meth:`act`
+           just computed is reused (identity-checked). That keeps the value and the surrogate on one trunk pass:
+           one forward instead of two, and one shared autograd graph.
+        2. **Collection step.** ``ppo.act`` likewise calls ``policy.act(obs)`` and then ``policy.evaluate(obs)``,
+           so the committed ``h_t`` sits in :attr:`_last_hidden` -- which :meth:`reset` clears on every
+           environment step, i.e. it is non-``None`` only inside that act -> evaluate window.
+        3. **Terminal bootstrap.** ``ppo.compute_returns(obs)`` evaluates an observation that never went through
+           :meth:`act` (and runs after :meth:`reset`, so nothing is cached): the frame is pushed through the
+           trunk with ``commit=False``, i.e. it is *peeked* -- it must not enter the KV cache, since the next
+           rollout's first token is the same frame and would otherwise see a duplicate of itself.
+        """
+        if use_cached_hidden and self._window_hidden is not None and obs is self._window_hidden_obs:
+            return self._window_hidden
+        if hidden_state is not None:
+            return self.forward_window(obs, prefix=hidden_state)
+        actor_obs = self.get_actor_obs(obs)
+        if actor_obs.dim() != 2:
+            # Refuse rather than fall through to the step path: a ``[W, B, obs]`` window has no incremental
+            # meaning, and reusing ``_last_hidden`` here could silently return a ``[N, 1]`` value for it.
+            raise RuntimeError(
+                "A shared-trunk value for a batched window needs the window's context: call act() on the"
+                " minibatch first (what ppo.py does), or pass the EpisodeContextPrefix as hidden_state."
+            )
+        if use_cached_hidden and self._last_hidden is not None and self._last_hidden.shape[0] == actor_obs.shape[0]:
+            return self._last_hidden
+        return self.forward_step(actor_obs, commit=False)
+
+    def evaluate(
+        self,
+        obs: TensorDict | torch.Tensor,
+        hidden_state: EpisodeContextPrefix | None = None,
+        use_cached_hidden: bool = True,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Value of the given observation, ``[N, ...] -> [N, 1]`` (collection) or ``[W, B, ...] -> [W, B, 1]``
+        (update).
+
+        With ``critic_design="privileged"`` this is a context-free MLP on the (privileged) critic observation.
+        With ``"shared_trunk"`` the value is read off the SAME episode-context readout ``h`` the actor uses; see
+        :meth:`_hidden_for_value` for where that ``h`` comes from on each call site. ``use_cached_hidden=False``
+        forces a fresh trunk pass instead of reusing the one :meth:`act` left behind.
+        """
+        if self.critic_design == "privileged":
+            critic_obs = self.get_critic_obs(obs)
+            return self.critic(self.critic_obs_normalizer(critic_obs))
+        return self.value_from_hidden(self._hidden_for_value(obs, hidden_state, use_cached_hidden))
 
     # --------------------------------------------------------------------------------------------------------
     # Reset / PPO plumbing
@@ -620,6 +733,7 @@ class ActorCriticEpisodeContext(nn.Module):
 
     def reset(self, dones: torch.Tensor | None = None, **kwargs: Any) -> None:
         """Clear the KV cache of the environments that just ended an episode (the context never crosses a done)."""
+        self._window_hidden, self._window_hidden_obs = None, None
         if self._key_cache is None:
             return
         if dones is None:
