@@ -150,57 +150,41 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
-        # Ceiling for the adaptive-KL LR controller. Upstream hardcodes 1e-2, which is ~100x the
-        # base LR: with gSDE the first minibatches on fresh data read KL ~ 0, so the controller
-        # multiplies LR x1.5 per minibatch (epochs x minibatches chances per update) and can blast
-        # a transformer trunk apart mid-update before KL catches up (run-225872 postmortem:
-        # sustained surrogate ~0.25 / clip_frac 0.7 / ratio_max 28 at nominal lr 1e-4).
+        # Ceiling for the adaptive-KL LR controller; upstream's hardcoded 1e-2 blew up a trunk mid-update
+        # by ramping x1.5 per minibatch while KL still read ~0 (run 225872).
         self.adaptive_lr_max = float(adaptive_lr_max)
-        # Abort an update's remaining minibatches once the measured KL exceeds
-        # ``kl_early_stop_factor * desired_kl`` (None = off). Batch-size-invariant overshoot guard;
-        # only wired into the trial-pair update path.
+        # Abort the rest of an update once KL exceeds ``factor * desired_kl`` (None = off, trial-pair only).
         self.kl_early_stop_factor = None if kl_early_stop_factor is None else float(kl_early_stop_factor)
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
-        # If set, the observation normalizers are not updated during collection. The runner is then
-        # responsible for calling :meth:`commit_obs_normalization` once the rollout has been consumed,
-        # so that a rollout is acted and reconstructed under identical normalizer statistics.
+        # Normalizers frozen during collection; the runner commits them after update(), so that a rollout is
+        # acted and reconstructed under identical statistics.
         self.defer_obs_normalization = defer_obs_normalization
 
-        # Trial-memory (hierarchical multi-episode) training.
-        # Note: the routing is on the policy *class*, not on ``is_recurrent`` -- the recurrent minibatch
-        #   generator splits on episode dones and would be wrong here (it knows nothing about trials or pairs).
+        # Routed on the policy class, not on ``is_recurrent``: the recurrent generator splits on episode
+        # dones and knows nothing about trials or pairs.
         self.is_trial_memory = isinstance(policy, ActorCriticTrialMemory)
-        # With a separate critic trunk the value function has NO incremental path: nothing can be evaluated
-        # per collection step, so the values (and with them the timeout bootstrap and the GAE bootstrap) are
-        # produced by a batched sweep in :meth:`compute_returns`. See ActorCriticTrialMemory's ``critic_trunk``.
+        # A separate critic trunk has no incremental path, so its values come from a batched sweep in
+        # :meth:`compute_returns` rather than from a per-step evaluate().
         self.separate_critic_trunk = self.is_trial_memory and getattr(policy, "critic_trunk", "shared") == "separate"
-        # Per-step ``time_outs`` of the current rollout, needed to re-apply the timeout bootstrap after the
-        # sweep (at collection time the values are still zero, so the bootstrap there is a no-op).
+        # Per-step ``time_outs``, needed to re-apply the timeout bootstrap after that sweep.
         self._time_out_flags: torch.Tensor | None = None
         self.trial_memory_sweep_chunk_size = trial_memory_sweep_chunk_size
-        # Rows reserved for a trial that is still open when a rollout ends, so that it is carried into the
-        # next rollout instead of being thrown away (see RolloutStorage's ``carry_steps``). ``None`` (or any
-        # negative value, which is how a config that cannot express None spells it) means one full rollout,
-        # covering any trial no longer than the rollout itself. Only used for trial memory: with one episode
-        # per trial there is nothing to carry that PPO could still use.
+        # Rows reserved for a trial still open at the rollout boundary (RolloutStorage's ``carry_steps``).
+        # ``None``/negative means one full rollout.
         self.trial_carry_steps = None if trial_carry_steps is None or trial_carry_steps < 0 else trial_carry_steps
         self.max_policy_lag = int(max_policy_lag)
         self.trial_memory_cache_dtype = (
             None if trial_memory_cache_dtype is None else getattr(torch, trial_memory_cache_dtype)
         )
-        # Key under which the environment publishes the *true* terminal observation in ``extras``. In IsaacLab
-        # the observation returned by ``step()`` is already the post-reset one, so without such a key the
-        # terminal token's observation slot is zeros (see :meth:`process_env_step`).
+        # Where the env publishes the true terminal observation; without it that token's obs slot is zeros
+        # (IsaacLab's step() already returns the post-reset observation).
         self.terminal_obs_key = terminal_obs_key
-        # Diagnostics (trial-memory update only; both are once-per-update, not per minibatch).
-        # ``log_policy_drift`` measures how far the policy has moved from the one that was loaded (the BC
-        # initialization), ``log_advantage_audit`` whether the advantages still agree with episode outcomes.
+        # Diagnostics, trial-memory update only; both run once per update, not per minibatch.
         self.log_policy_drift = bool(log_policy_drift)
         self.log_advantage_audit = bool(log_advantage_audit)
-        # Frozen copy of the policy as it was loaded. Captured by the runner's load(), or lazily on the first
-        # update for a from-scratch run.
+        # Frozen copy of the loaded policy; captured by the runner's load(), or lazily at the first update.
         self.reference_policy: ActorCriticTrialMemory | None = None
         if self.is_trial_memory:
             if self.rnd is not None:
@@ -211,12 +195,9 @@ class PPO:
                 raise ValueError("Symmetry augmentation is not supported for the trial-memory policy.")
 
         # Mixed precision (opt-in, trial-memory update only). ``None`` keeps the fp32 path bit-for-bit.
-        # The activation memory of the pair update is what forces this: at 16k envs the trunk activations are
-        # ~80 GB in fp32 at 8 minibatches (design doc section 7); fp16 halves that and is what makes 4 viable.
         self.amp_dtype = self._resolve_amp_dtype(amp_dtype)
         self._amp_device_type = torch.device(self.device).type
-        # fp16 needs loss scaling (its gradients underflow); bf16 has fp32's exponent range and does not.
-        # The scaler is CUDA-only here -- CPU fp16 autocast exists but is a debug path, not a training one.
+        # fp16 gradients underflow without loss scaling; bf16 has fp32's exponent range and needs none.
         scaler_enabled = self.amp_dtype == torch.float16 and self._amp_device_type == "cuda"
         self.grad_scaler = torch.amp.GradScaler(self._amp_device_type) if scaler_enabled else None
         if self.amp_dtype is not None and not self.is_trial_memory:
@@ -257,9 +238,8 @@ class PPO:
     def _autocast_generator(self, generator: Iterator[dict]) -> Iterator[dict]:
         """Advance ``generator`` under autocast, yield outside of it.
 
-        The per-epoch ``no_grad`` memory sweep runs *inside* the pair generator (it is what the first ``next()``
-        of every epoch does), so this is the only way to put the sweep under autocast without reaching into
-        ``RolloutStorage``. Yielding outside the context keeps the caller's own autocast scoping explicit.
+        The per-epoch memory sweep runs inside the pair generator, so this is the only way to cover it without
+        reaching into ``RolloutStorage``.
         """
         iterator = iter(generator)
         while True:
@@ -275,7 +255,7 @@ class PPO:
     # ----------------------------------------------------------------------------------------------------------
 
     def capture_reference_policy(self) -> None:
-        """Freeze the current policy as the drift reference (the runner calls this right after a load)."""
+        """Freeze the current policy as the drift reference (the runner calls this after a load)."""
         if not self.is_trial_memory or not self.log_policy_drift:
             return
         self.reference_policy = self.policy.frozen_copy()
@@ -284,8 +264,7 @@ class PPO:
     def _param_group(name: str) -> str | None:
         """Which diagnostic bucket a parameter belongs to (``None`` == not tracked).
 
-        ``critic`` is matched first so that the whole ``critic_*`` pathway lands there rather than being split
-        across ``embed`` / ``blocks`` -- the same partition ``train.py``'s critic-warmup freeze filter uses.
+        ``critic`` is matched first so the whole ``critic_*`` pathway lands there, as in train.py's freeze filter.
         """
         if name.startswith("critic"):
             return "critic"
@@ -347,10 +326,8 @@ class PPO:
     ) -> dict[str, float]:
         """How far the policy has moved from :attr:`reference_policy`, on this minibatch's freshest rows.
 
-        Called once per update, on the first minibatch, *before* any optimizer step of that update. Both
-        policies are run on the SAME tokens and the same memory checkpoints, so the memory drift cancels and
-        this measures the trunk and the heads only (not the writer). ``row_lags`` selects rows at lag <= 1,
-        falling back to the freshest rows present so that the metric never silently disappears.
+        Runs on the first minibatch, before any optimizer step of the update. Both policies see the same
+        tokens and memory checkpoints, so this measures the trunk and the heads, not the writer.
         """
         if self.reference_policy is None or row_lags.numel() == 0:
             return {}
@@ -387,9 +364,7 @@ class PPO:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
     ) -> None:
-        # A trial is the training-data unit but a rollout is the collection unit, and the two do not divide
-        # each other once an environment terminates early. The carry region decouples them: an unfinished
-        # trial survives the rollout boundary instead of being discarded.
+        # The carry region decouples the training unit (a trial) from the collection unit (a rollout).
         carry_steps = 0
         if self.is_trial_memory:
             carry_steps = num_transitions_per_env if self.trial_carry_steps is None else int(self.trial_carry_steps)
@@ -410,16 +385,14 @@ class PPO:
             )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        # Note: the trial-memory policy's "hidden state" is the whole memory Z [N, M, d]; storing it per step
-        #   would cost tens of GB and it is recomputed from the raw data anyway, so it is not saved.
+        # Z is not stored per step: it costs tens of GB and is recomputed from the raw data anyway.
         if self.policy.is_recurrent and not self.is_trial_memory:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
         if self.separate_critic_trunk:
-            # No per-step critic: placeholder zeros, overwritten by the sweep in compute_returns(). They also
-            # make the collection-time timeout bootstrap below an exact no-op, which is why it is re-applied
-            # (from ``raw_rewards``) once the real values exist.
+            # Placeholder zeros, overwritten by the sweep in compute_returns(); they also make the
+            # collection-time timeout bootstrap a no-op, so it is re-applied there.
             self.transition.values = torch.zeros(
                 self.transition.actions.shape[0], 1, device=self.device, dtype=self.transition.actions.dtype
             )
@@ -457,9 +430,8 @@ class PPO:
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
-        # Bootstrapping on time outs
-        # Note: Only at a trial end. Inside a trial, GAE keeps bootstrapping through the episode
-        #   boundary itself (next_is_not_terminal stays 1), so adding the value here would count it twice.
+        # Bootstrapping on time outs, at a TRIAL end only: inside a trial GAE already bootstraps through the
+        # episode boundary, so adding the value here would count it twice.
         if "time_outs" in extras:
             time_outs = extras["time_outs"].unsqueeze(1).to(self.device).float()
             trial_ends = self.transition.trial_dones.view(-1, 1).to(self.device).float()
@@ -467,8 +439,7 @@ class PPO:
         else:
             time_outs = None
 
-        # Remember the timeout flags of this rollout so that the bootstrap can be re-applied once the batched
-        # critic sweep has produced the values (with the placeholder zeros the line above changed nothing).
+        # Kept so the bootstrap can be re-applied once the batched critic sweep has produced the values.
         if self._time_out_flags is not None:
             if self.storage.step == 0:
                 self._time_out_flags.zero_()
@@ -486,8 +457,7 @@ class PPO:
         trial_dones = self.transition.trial_dones
         self.storage.add_transitions(self.transition)
         self.transition.clear()
-        # Two distinct reset signals: an episode boundary clears the short-term tokens and the KV cache, a trial
-        # boundary additionally resets the persistent memory Z back to Z_init.
+        # An episode boundary clears the tokens and the KV cache; a trial boundary also resets Z to Z_init.
         if self.is_trial_memory:
             self.policy.reset(dones, trial_dones=trial_dones)
         else:
@@ -498,15 +468,9 @@ class PPO:
     ) -> None:
         """Run the acting-boundary protocol of :class:`ActorCriticTrialMemory` for one environment step.
 
-        Order (documented by the policy): ``record_transition`` -> ``append_terminal_token`` -> ``update_memory``,
-        with the episode/trial resets happening afterwards in :meth:`process_env_step`.
-
-        The terminal token exists so that the memory writer can see the outcome of the attempt; its content is
-        ``(o_{T+1}, a_T, r_T, d_T)``. In IsaacLab the observation handed to this method is already the
-        **post-reset** observation of a terminated environment, so it must not be used: it would leak the next
-        episode's state into ``H_e``. If the environment publishes the true terminal observation under
-        :attr:`terminal_obs_key` we use (and store) that, otherwise the observation slot is zeros on both the
-        acting and the reconstruction path -- the load-bearing content is the final reward and done flag.
+        Order: ``record_transition`` -> ``append_terminal_token`` -> ``update_memory``, resets afterwards in
+        :meth:`process_env_step`. ``obs`` is already the post-reset observation of a terminated environment, so
+        the terminal token uses :attr:`terminal_obs_key` when the env publishes it and zeros otherwise.
         """
         terminal_obs = None
         if self.terminal_obs_key is not None and extras is not None and self.terminal_obs_key in extras:
@@ -525,15 +489,13 @@ class PPO:
     def commit_obs_normalization(self, obs_batch: TensorDict) -> None:
         """Update the observation normalizers from a batch of observations.
 
-        Called on every collection step unless :attr:`defer_obs_normalization` is set, in which case the
-        runner calls it once after :meth:`update`, so that acting and reconstruction of a rollout share
-        the same normalizer statistics.
+        Called per collection step, or once after :meth:`update` under :attr:`defer_obs_normalization`.
 
         Args:
             obs_batch: Observations, either a single step ``[num_envs, ...]`` or a stored rollout
                 ``[num_transitions, num_envs, ...]``. Extra leading dimensions are flattened.
         """
-        # The normalizers reduce over dim 0 only, so collapse any extra leading (time) dimensions
+        # The normalizers reduce over dim 0 only, so collapse any leading time dimension.
         batch_dims = getattr(obs_batch, "batch_dims", 1)
         if batch_dims > 1:
             obs_batch = obs_batch.flatten(0, batch_dims - 1)
@@ -543,9 +505,8 @@ class PPO:
 
     def compute_returns(self, obs: TensorDict) -> None:
         if self.separate_critic_trunk:
-            # Batched critic sweep instead of the per-step values: fills storage.values for every live row and
-            # returns the GAE bootstrap. Deliberately NOT under autocast -- it is a once-per-rollout no_grad
-            # pass whose output becomes the regression target of the whole update, so it stays in fp32.
+            # Fills storage.values for every live row and returns the GAE bootstrap. Kept out of autocast:
+            # its output is the regression target of the whole update.
             last_values = self.storage.compute_critic_values(
                 self.policy, chunk_size=self.trial_memory_sweep_chunk_size, last_obs=obs
             )
@@ -560,19 +521,15 @@ class PPO:
     def _reapply_timeout_bootstrap(self) -> None:
         """Re-apply the trial-gated timeout bootstrap now that the swept values exist.
 
-        Identical arithmetic to the collection-time line in :meth:`process_env_step`
-        (``rewards += gamma * values * time_outs * trial_ends``), just recomputed from ``raw_rewards`` -- which
-        is exactly what that buffer is for. Recomputing from the raw rewards (rather than adding to the stored
-        ones) also makes this idempotent, so a carried row that is swept again in a later rollout never
-        accumulates two bootstraps.
+        Same arithmetic as :meth:`process_env_step`, recomputed from ``raw_rewards`` so that a carried row
+        swept again in a later rollout cannot accumulate two bootstraps.
         """
         storage = self.storage
         time_outs = self._time_out_flags
         if time_outs is None:
             return
         trial_ends = storage.trial_dones.float()
-        # Same association as the collection-time expression, so the result is bit-identical to what a
-        # per-step critic would have produced: raw + gamma * ((values * time_outs) * trial_ends).
+        # Same association as the collection-time expression, so the result is bit-identical to it.
         storage.rewards.copy_(storage.raw_rewards + self.gamma * (storage.values * time_outs * trial_ends))
 
     def update(self) -> dict[str, float]:
@@ -587,9 +544,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
-        # Probability-ratio diagnostics (per-minibatch reductions of
-        # ratio = exp(new_logp - old_logp)). Mean/std/clip_frac are averaged
-        # over minibatches; min/max are taken over all minibatches.
+        # Probability-ratio diagnostics: mean/std/clip_frac averaged over minibatches, min/max over all.
         mean_ratio = 0.0
         mean_ratio_std = 0.0
         mean_ratio_clip_frac = 0.0
@@ -843,14 +798,10 @@ class PPO:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct one minibatch of pairs and return the target hidden states and the memory fed to them.
 
-        Implements the pair recipe:
-
-        1. ``Zbar_e`` comes from the per-epoch sweep and is already **stopgrad**,
-        2. with a source: ``H_e^theta = forward_sequence(tau_e, Zbar_e)`` *with grad*, then
-           ``Z_{e+1}^theta = write_memory(Zbar_e, H_e^theta)``,
-        3. without a source (the degenerate ``(None, tau_1)`` pair): ``Z_{e+1}^theta = Z_init``,
-        4. ``H_{e+1}^theta = forward_sequence(tau_{e+1}, Z_{e+1}^theta)`` -- ``Z_{e+1}^theta`` is **not**
-           detached; detaching it would delete the entire memory-learning signal.
+        ``Zbar_e`` (stopgrad, from the per-epoch sweep) -> ``H_e = forward_sequence(tau_e, Zbar_e)`` with grad
+        -> ``Z_{e+1} = write_memory(Zbar_e, H_e)`` -> ``H_{e+1} = forward_sequence(tau_{e+1}, Z_{e+1})``, with
+        ``Z_{e+1}`` NOT detached (that would delete the memory-learning signal). A degenerate pair uses
+        ``Z_init``.
 
         Args:
             batch: One minibatch of the trial-pair generator.
@@ -863,13 +814,12 @@ class PPO:
         policy = self.policy if policy is None else policy
         target = batch["target"]
         param_dtype = policy.z_init.dtype
-        # Zbar_e, detached by the generator (the cache may be kept in a smaller dtype than the parameters)
+        # Zbar_e, detached by the generator (its cache may be in a smaller dtype than the parameters).
         incoming = batch["memory"].to(dtype=param_dtype)
         batch_size = incoming.shape[0]
 
-        # Note: the degenerate pair uses the *differentiable* Z_init rather than its detached copy from the
-        #   sweep, so that a first-episode loss still trains the learned NO_MEMORY tokens (the values are
-        #   identical, only the gradient path differs).
+        # The differentiable Z_init, not the sweep's detached copy: same values, but a first-episode loss
+        # still trains the NO_MEMORY tokens.
         memory = policy.initial_memory(batch_size, device=incoming.device).clone()
         source_slots = batch["source_slots"]
         if batch["source"] is not None and source_slots.numel() > 0:
@@ -914,23 +864,12 @@ class PPO:
         }
 
     def _skip_trial_memory_update(self, pool: dict) -> dict[str, float]:
-        """No-op update: no trial has completed yet, they are all still open. Warm-up, not a failure.
+        """No-op update: every trial is still open, so there is nothing to train on yet. Warm-up, not a failure.
 
-        A trial is only trainable once it closes, so a rollout shorter than a trial cannot produce a single
-        pair: at ``num_steps_per_env=32`` with a 240-step trial the first ~7 updates necessarily see 512
-        deferred trials and 0 pairs. Raising there (as the minibatch generator does when there is genuinely
-        nothing to wait for) would make the production cadence uncrashable-into rather than merely slow to
-        start.
-
-        Two invariants, both load-bearing:
-
-        * the storage is still :meth:`~rsl_rl.storage.RolloutStorage.clear`\\ ed, exactly as in a real update,
-          so the open trials are carried into the next rollout with their collection stamps intact (and the
-          write pointer is reset -- skipping this would overflow the buffer on the next transition),
-        * ``policy_version`` is **not** incremented. No parameter moved, so the carried rows are still
-          on-policy; ageing them here would add one update of lag per warm-up rollout and could push a long
-          trial past ``max_policy_lag`` -- silently dropping it -- before a single real update had happened.
+        A rollout shorter than a trial cannot produce a pair at all (32-step windows against a 240-step trial
+        need ~7 of them), which is why this is not the generator's hard error.
         """
+        # clear() must still run: it carries the open trials forward and resets the write pointer.
         self.storage.clear()
         loss_dict = {
             key: 0.0
@@ -959,7 +898,7 @@ class PPO:
         }
         loss_dict["adaptive_lr"] = float(self.learning_rate)
         loss_dict["update_skipped"] = 1.0
-        # Zeros rather than absent keys, so that a warm-up iteration does not punch a hole in the curves.
+        # Zeros rather than absent keys, so a warm-up iteration does not punch a hole in the curves.
         loss_dict.update({f"update_norm/{group}": 0.0 for group in self._param_groups_present()})
         loss_dict.update(self._pool_metrics(pool))
         loss_dict.update(self.policy.memory_gate_values())
@@ -970,12 +909,8 @@ class PPO:
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
-        # Probability-ratio diagnostics -- the reconstruction canary of the design doc lives here.
-        # Note: the canary statement ("with unchanged parameters the ratio is 1") only holds for trials whose
-        #   behavior policy IS the current one. A trial carried across a rollout boundary was partly collected
-        #   under the previous policy, so its ratio is legitimately != 1 at epoch 0. Reporting one number over
-        #   both would make a healthy run look broken, so the lag-0 subset is measured separately and the
-        #   *_lag0 keys are the ones to read as the canary.
+        # Probability-ratio diagnostics. "Ratio 1 at epoch 0" only holds for trials collected under the
+        # current policy, so the lag-0 subset is tracked separately and the *_lag0 keys are the canary.
         mean_ratio = 0.0
         mean_ratio_std = 0.0
         mean_ratio_clip_frac = 0.0
@@ -986,34 +921,29 @@ class PPO:
         lag0_ratio_min = float("inf")
         lag0_ratio_max = float("-inf")
         lag0_batches = 0
-        # The canary proper: the very FIRST minibatch, on lag-0 pairs. It is the only point in the update at
-        # which the parameters are still exactly the ones that acted -- the optimizer steps after every
-        # minibatch, so even the rest of epoch 0 is already off-policy and its ratio is *supposed* to move.
+        # The canary proper: first minibatch, lag-0 pairs -- the only point where the parameters are still
+        # exactly the ones that acted.
         first_batch_lag0_dev = 0.0
         num_updates = 0
         kl_early_stopped = False
-        # Lag-aware KL. Most rows of a minibatch are legitimately off-policy (a trial spans several rollouts),
-        # and their ratios drift for that reason alone -- feeding them to the adaptive-LR rule or to the early
-        # stop makes stale data look like policy divergence. Only rows at lag <= 1 drive the control loop.
+        # Only rows at lag <= 1 drive the LR controller and the early stop: a trial spans several rollouts, so
+        # stale rows drift for reasons that are not policy divergence.
         kl_fresh_sum = 0.0
         kl_all_sum = 0.0
         kl_batches = 0
-        # Worst ratio per lag bucket. 0.0 means "no row of this bucket was seen" (the buckets are disjoint and
-        # a real ratio is positive), which is also what keeps every logged value finite.
+        # Worst ratio per lag bucket; 0.0 means the bucket was empty (a real ratio is positive).
         bucket_ratio_max = {"lag_0_1": 0.0, "lag_2_4": 0.0, "lag_5plus": 0.0}
         # Snapshot the pool accounting before update() consumes and clears the storage
         pool = dict(self.storage.build_trial_pairs())
-        # Warm-up: no trial has closed yet, but they are all still running, so the data is coming. Skip the
-        # update instead of raising. When nothing is deferred either, there is nothing to wait for and the
-        # minibatch generator below raises the (unchanged) configuration error.
+        # Warm-up: nothing closed yet but everything is still running. With nothing deferred either, the
+        # generator below raises instead -- there would be nothing to wait for.
         if pool["num_pairs"] == 0 and pool["deferred_trials"] > 0:
             return self._skip_trial_memory_update(pool)
-        # -- once-per-update instrumentation (all of it cheap: one param copy, one segmentation pass) --
+        # -- once-per-update instrumentation: one param copy, one segmentation pass --
         group_snapshot = self._snapshot_param_groups()
         advantage_audit = self.storage.advantage_outcome_audit() if self.log_advantage_audit else {}
         if self.log_policy_drift and self.reference_policy is None:
-            # From-scratch run (or a load that predates the reference): the policy about to take its first
-            # step IS the initialization, so freezing it here is the same reference the runner would capture.
+            # From-scratch run: the policy about to take its first step IS the initialization.
             self.capture_reference_policy()
         drift: dict[str, float] = {}
 
@@ -1027,14 +957,12 @@ class PPO:
 
         for batch in self._autocast_generator(generator):
             target = batch["target"]
-            # Autocast covers the memory-hungry part: the source recompute, the writer, the target recompute and
-            # the heads. Everything downstream of it is per-step scalars, so it is upcast to fp32 below -- that is
-            # both the AMP convention (losses in fp32, scaled) and what keeps the ratio diagnostics meaningful.
+            # Autocast covers the memory-hungry part (source recompute, writer, target recompute, heads);
+            # everything below it is per-step scalars and runs in fp32.
             with self._autocast():
                 hidden, memory = self.trial_pair_forward(batch)
 
-                # Every quantity below lives on the target episode's acting steps only (no terminal token,
-                # no padding)
+                # Target episode's acting steps only: no terminal token, no padding.
                 loss_mask = target["loss_mask"]
                 distribution = self.policy.update_distribution_from_hidden(hidden)
                 actions_log_prob = distribution.log_prob(target["actions"]).sum(dim=-1)[loss_mask]
@@ -1042,10 +970,8 @@ class PPO:
                 mu_batch = distribution.mean[loss_mask]
                 sigma_batch = distribution.stddev[loss_mask]
                 if self.separate_critic_trunk:
-                    # Second trunk, same tokens: the value head consumes the critic pathway's readout, never
-                    # the actor's. ``memory`` is Z_{e+1}, the memory the TARGET episode was acted with (not the
-                    # source's Zbar_e); forward_sequence_critic detaches it, so no value gradient reaches the
-                    # writer, z_init or the actor trunk.
+                    # ``memory`` is Z_{e+1}, what the TARGET episode was acted with; forward_sequence_critic
+                    # detaches it, so no value gradient reaches the writer, z_init or the actor trunk.
                     value_batch = self.policy.forward_sequence_critic(
                         target["obs"],
                         target["prev_actions"],
@@ -1057,8 +983,7 @@ class PPO:
                 else:
                     value_batch = self.policy.value_from_hidden(hidden)[loss_mask]
 
-            # Out of autocast: the loss arithmetic runs in fp32. The upcast is a no-op for anything that is not
-            # half precision, so the fp32 path (and the fp64 exactness tests) are unchanged.
+            # Out of autocast: the upcast is a no-op outside half precision, so the fp32 path is unchanged.
             actions_log_prob = upcast_from_half(actions_log_prob)
             entropy_batch = upcast_from_half(entropy_batch)
             mu_batch = upcast_from_half(mu_batch)
@@ -1072,11 +997,8 @@ class PPO:
             target_values_batch = target["values"][loss_mask]
             old_mu_batch = target["old_mu"][loss_mask]
             old_sigma_batch = target["old_sigma"][loss_mask]
-            # Per-ROW policy lag, NOT the pair's trial lag. A trial that spans several rollouts is only
-            # trained on once it closes, which at the production cadence (32 collected steps against a
-            # 240-step carry region) is seven or eight updates after its first step -- so its trial lag is
-            # never <= 1 and a trial-level fresh mask would be empty on every single update, silently
-            # degrading the KL control back to "all rows". Its last rollout's rows, however, are at lag 0.
+            # Per-ROW lag, not the pair's trial lag: a long trial closes many updates after it started, so a
+            # trial-level fresh mask would be empty on every update while its last rows are at lag 0.
             row_lags = target["row_lags"][loss_mask]
             fresh_rows = row_lags <= 1
 
@@ -1084,10 +1006,8 @@ class PPO:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
-            # Compute KL divergence and adapt the learning rate.
-            # Note: fp32 by construction -- ``mu_batch``/``sigma_batch`` were upcast above. The KL drives the
-            #   learning rate, so it must not inherit fp16's ~1e-3 relative error (nor its exponent range: the
-            #   ratio sigma_new / sigma_old and the squares below can underflow in half precision).
+            # KL divergence and the adaptive learning rate. fp32 by construction (the inputs were upcast
+            # above): the squares and the sigma ratio below underflow in half precision.
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -1098,9 +1018,7 @@ class PPO:
                         axis=-1,
                     )
                     kl_all = torch.mean(kl)
-                    # ``kl_fresh`` is the control signal: rows whose behavior policy is at most one update old.
-                    # An empty fresh set (every trial in this minibatch is stale) falls back to all rows rather
-                    # than silently freezing the controller.
+                    # Control signal: rows at most one update old, falling back to all rows when there are none.
                     kl_mean = torch.mean(kl[fresh_rows]) if bool(fresh_rows.any()) else kl_all.clone()
 
                     if self.is_multi_gpu:
@@ -1126,12 +1044,8 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-                # KL early stop: once this update has moved the policy past ``factor x desired_kl``,
-                # abort the remaining minibatches (this batch's step included -- the KL above is
-                # measured BEFORE stepping on it). The per-minibatch LR throttle reacts too slowly at
-                # scale: large coherent batches give Adam full-size normalized steps, so epochs x
-                # minibatches steps overshoot before KL feedback catches up (the 226401 collapse:
-                # success 0.65 -> 0.14 in two updates while the LR sat at its floor). ``kl_mean`` is
+                # Abort the rest of the update, this batch's step included (the KL is measured before it).
+                # The per-minibatch LR throttle alone reacts too slowly at scale (run 226401). ``kl_mean`` is
                 # already all-reduced, so every rank breaks in the same place.
                 if (
                     self.kl_early_stop_factor is not None
@@ -1141,8 +1055,7 @@ class PPO:
                     kl_early_stopped = True
                     break
 
-            # Reference-policy drift, measured on the first minibatch's lag-0 rows -- the only point in the
-            # update where the parameters are still exactly the ones that acted.
+            # Drift vs the loaded policy, on the first minibatch: the parameters are still the ones that acted.
             if num_updates == 0 and self.log_policy_drift:
                 drift = self._policy_drift(batch, mu_batch, sigma_batch, loss_mask, row_lags)
 
@@ -1168,9 +1081,8 @@ class PPO:
                 ):
                     if bool(bucket.any()):
                         bucket_ratio_max[label] = max(bucket_ratio_max[label], flat_ratio[bucket].max().item())
-                # ... and the same, restricted to the fully on-policy TRIALS (the actual canary). Trial lag,
-                # not row lag: a fresh row inside an old trial is rebuilt from a memory checkpoint that the
-                # current writer produced, not the one that acted, so its ratio is legitimately != 1.
+                # The canary: fully on-policy TRIALS, not rows. A fresh row inside an old trial is rebuilt from
+                # a memory checkpoint the current writer produced, so its ratio is legitimately != 1.
                 lag0 = (batch["lags"] == 0).unsqueeze(0).expand_as(loss_mask)[loss_mask]
                 if bool(lag0.any()):
                     lag0_ratio = flat_ratio[lag0]
@@ -1195,24 +1107,17 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # Gradient step.
-            # Order under fp16: backward on the SCALED loss -> (multi-GPU all-reduce, still scaled) ->
-            #   ``scaler.unscale_(optimizer)`` -> clip -> ``scaler.step``. The unscale MUST come before the clip:
-            #   clipping scaled gradients would compare a ~65536x inflated norm against ``max_grad_norm`` and clip
-            #   every step to a ~1/65536 effective threshold, which looks like "training just got slower" rather
-            #   than like a bug. Reducing while still scaled is fine and deliberate: the scale is one scalar shared
-            #   by all ranks, so averaging commutes with it, and a rank whose backward overflowed propagates the
-            #   inf to everyone, keeping the skip decision (and hence the scale) identical across ranks.
+            # Gradient step. Under fp16 the order is fixed: scaled backward -> all-reduce (still scaled) ->
+            # unscale_ -> clip -> step. Clipping before the unscale would compare a ~65536x inflated norm
+            # against max_grad_norm; reducing while scaled is safe (one scalar shared by all ranks).
             self.optimizer.zero_grad()
             if self.grad_scaler is not None:
                 self.grad_scaler.scale(loss).backward()
             else:
                 loss.backward()
             if self.is_multi_gpu:
-                # Not every parameter is reached by every minibatch (Z_init is only trained by the degenerate
-                # pairs), and reduce_parameters() flattens exactly the parameters that have a gradient -- so
-                # ranks would disagree on the buffer layout. Materialize the missing gradients as zeros.
-                # (Zeros are scale-invariant, so doing this on scaled gradients is safe.)
+                # Not every parameter is reached by every minibatch, and reduce_parameters() flattens only
+                # those that have a gradient, so ranks would disagree on the buffer layout without this.
                 for param in self.policy.parameters():
                     if param.grad is None:
                         param.grad = torch.zeros_like(param)
@@ -1248,38 +1153,31 @@ class PPO:
             "ratio_min": ratio_min,
             "ratio_max": ratio_max,
             "ratio_clip_frac": mean_ratio_clip_frac / num_updates,
-            # The reconstruction canary: on-policy trials only (see the note above)
+            # The reconstruction canary: on-policy trials only.
             "ratio_mean_lag0": lag0_ratio_sum / lag0_batches,
             "ratio_min_lag0": lag0_ratio_min,
             "ratio_max_lag0": lag0_ratio_max,
             "ratio_clip_frac_lag0": lag0_clip_frac_sum / lag0_batches,
-            # max |ratio - 1| over the first minibatch, lag-0 pairs only: ~0 iff the reconstruction reproduces
-            # the behavior policy. This is the design doc's section 13 canary. 0.0 also means "no lag-0 pair
-            # landed in the first minibatch", so read it together with pool_pairs_lag0.
+            # max |ratio - 1|, first minibatch, lag-0 pairs: ~0 iff the reconstruction reproduces the behavior
+            # policy. 0.0 also means "no lag-0 pair landed there", so read it with pool_pairs_lag0.
             "ratio_max_dev_lag0_first_mb": first_batch_lag0_dev,
-            # Trial-pool accounting. Anything but zeros in the ``dropped``/``envs_without_data`` lines means
-            # collected experience is being thrown away.
-            # The LIVE adaptive LR after this update -- the run-225872 collapse (LR silently ramping
-            # x1.5/minibatch to the ceiling) was invisible without it.
+            # The LIVE adaptive LR after this update; a silent x1.5/minibatch ramp to the ceiling is
+            # invisible without it (run 225872).
             "adaptive_lr": float(self.learning_rate),
-            # 1.0 when the KL early stop aborted this update; ``num_updates`` (via pool metrics and
-            # the per-update means) shows how many minibatches actually ran.
+            # 1.0 when the KL early stop aborted this update; kl_minibatches_run says how many actually ran.
             "kl_early_stopped": 1.0 if kl_early_stopped else 0.0,
             "kl_minibatches_run": float(num_updates),
-            # The KL the adaptive LR and the early stop actually see (lag <= 1 rows) next to the KL over the
-            # whole minibatch: a large gap between the two is stale data, not policy divergence.
+            # The KL the controller sees (lag <= 1) next to the KL over all rows; a large gap is stale data.
             "kl_fresh": kl_fresh_sum / kl_batches,
             "kl_all": kl_all_sum / kl_batches,
             "ratio_max_lag_0_1": bucket_ratio_max["lag_0_1"],
             "ratio_max_lag_2_4": bucket_ratio_max["lag_2_4"],
             "ratio_max_lag_5plus": bucket_ratio_max["lag_5plus"],
-            # 1.0 when this update trained on nothing because every trial was still open (see
-            # :meth:`_skip_trial_memory_update`); 0.0 for a real update.
+            # 1.0 when the update trained on nothing (see :meth:`_skip_trial_memory_update`).
             "update_skipped": 0.0,
             **self._pool_metrics(pool),
         }
-        # Instrumentation pack: per-group relative parameter movement over this update, drift against the
-        # loaded policy, the advantage/outcome audit and the memory gates.
+        # Instrumentation pack: parameter movement, drift vs the loaded policy, advantage audit, gates.
         loss_dict.update(self._param_group_update_norms(group_snapshot))
         loss_dict.update(drift)
         loss_dict.update(advantage_audit)
