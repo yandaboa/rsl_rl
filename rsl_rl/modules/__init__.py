@@ -6,7 +6,7 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
-from .actor_critic_episode_context import ActorCriticEpisodeContext, EpisodeContextPrefix
+from .actor_critic_episode_context import ActorCriticEpisodeContext, EpisodeContextPrefix, MemoryTokenWriter
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_trial_memory import ActorCriticTrialMemory, MemoryWriter, MultiHeadAttention, TrunkBlock
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
@@ -20,6 +20,7 @@ __all__ = [
     "ActorCriticRecurrent",
     "ActorCriticTrialMemory",
     "EpisodeContextPrefix",
+    "MemoryTokenWriter",
     "MemoryWriter",
     "MultiHeadAttention",
     "RandomNetworkDistillation",

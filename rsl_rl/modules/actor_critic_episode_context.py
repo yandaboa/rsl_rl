@@ -12,10 +12,30 @@ attends over ``x_{t-L+1} .. x_t`` (clipped at the episode start), where ``L`` is
 
     x_t = Embed(o_t) + pos_embed[episode_step_t] + [episode_step_t == 0] * start_embed
 
-There is no memory, no writer, no trials and no reward/done channel: the single-step policy observation already
-carries the previous action, and the context never crosses an episode boundary. That makes the whole model a
-function of ``(frames since the episode started, capped at L)`` -- which is exactly what the storage can
-reconstruct from a ring buffer of raw frames, with no ``x L`` duplication of observations.
+There is no reward/done channel: the single-step policy observation already carries the previous action, and the
+context never crosses an episode boundary. That makes the whole model a function of ``(frames since the episode
+started, capped at L)`` -- which is exactly what the storage can reconstruct from a ring buffer of raw frames,
+with no ``x L`` duplication of observations.
+
+``memory_tokens > 0`` adds an OPTIONAL cross-episode memory on top of that, and nothing else about the model
+changes (with the default ``memory_tokens=0`` not even a submodule is built):
+
+* ``M`` persistent rows ``Z`` per environment, initialized from a learned ``z_init`` at every **trial** start,
+* the memory enters the model as ``M`` **prefix tokens of the trunk's own sequence**: the pass a step runs is
+  ``[Z_0 + memory_pos_embed[0], ..., Z_{M-1} + memory_pos_embed[M-1], x_0, ..., x_t]``, memory row ``i``
+  attending causally to memory rows ``<= i`` and every environment token attending to all ``M`` memory rows on
+  top of its usual (episode-clipped, span-clipped) reach. There is no separate read layer and no gate: the
+  memory is read by every block, exactly like any other token,
+* a :class:`MemoryTokenWriter` ``G`` run at every **episode** end, ``Z <- G(H)``, where ``H`` is the (detached)
+  snapshot of the trunk readouts of the pass that just finished -- the ``M`` memory rows FIRST, then the
+  episode's ``h_t``. The writer queries the memory rows and attends them over the whole of ``H`` (itself
+  included), i.e. one combined self+cross attention, so the recurrence ``Z_{e+1} = G(trunk(Z_e), episode_e)``
+  is carried entirely by that snapshot.
+
+The episode context itself still never crosses a done; the memory is the only thing that does. Note that the
+memory is NOT an identity at init: prepending ``M`` rows to the sequence perturbs a BC'd trunk from the very
+first step (``z_init`` and ``memory_pos_embed`` are initialized small, ``std = 0.02``, so the perturbation is
+small -- how small is measured by the closed-loop gate, not asserted here).
 
 The **critic** has two designs, selected by ``critic_design``:
 
@@ -53,12 +73,89 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.modules.actor_critic import GSDENoiseDistribution, upcast_from_half
-from rsl_rl.modules.actor_critic_trial_memory import TrunkBlock
+from rsl_rl.modules.actor_critic_trial_memory import MultiHeadAttention, TrunkBlock
 from rsl_rl.networks import MLP, EmpiricalNormalization
+from rsl_rl.utils import resolve_nn_activation
 
 # Which parameter holds the action noise, per ``noise_std_type``. A checkpoint written under one noise type
 # cannot be loaded into another (the shapes differ: ``[A]`` vs ``[d_model, A]``).
 _NOISE_PARAM_NAME = {"scalar": "std", "log": "log_std", "gsde": "log_std"}
+
+
+class MemoryTokenWriter(nn.Module):
+    """The writer ``G``: ``Z_new = G(H)``, one combined self+cross attention over the trunk's own output.
+
+    ``H`` ``[B, M + T, d]`` is the snapshot of one finished pass: the ``M`` memory rows the pass was prefixed
+    with, followed by the episode's per-step readouts. The queries are the memory rows of ``H`` -- so the writer
+    attends the memory *to itself and to the episode that just ran*, in one attention::
+
+        q     = LN_q(H[:, :M])                 # the memory rows' trunk outputs
+        k, v  = proj(LN_kv(H))                 # ALL of H, masked by validity
+        Z     = H[:, :M] + MHA(q, k, v)
+        Z     = Z + FF(LN_ff(Z))
+        Z     = LN_out(Z)                      # gain init 0.02: written Z lands at z_init's scale
+
+    That single ``M x (M + T)`` attention is the whole recurrence: ``Z_{e+1}`` depends on ``Z_e`` through the
+    trunk outputs of ``Z_e``'s rows, which is exactly what the (detached, cached) ``H`` carries at update time.
+
+    ``LN_out`` exists because ``Z`` is consumed as an INPUT token of the next pass. The residual base
+    ``H[:, :M]`` is a post-``final_norm`` trunk output, whose per-row norm is ~``sqrt(d)`` -- ~58x the scale of
+    ``z_init`` (std 0.02) and of every input token a BC'd trunk has ever seen. Without the output norm, episode
+    2 of every trial runs on wildly out-of-distribution prefix rows (measured: BC closed-loop success 84% -> 55%
+    at init). With the gain initialized to 0.02, a written ``Z`` starts at exactly ``z_init``'s scale and the
+    optimizer grows the gain as the memory earns its influence.
+    """
+
+    def __init__(self, d_model: int, num_heads: int, ff_dim: int, activation: str) -> None:
+        super().__init__()
+        self.norm_query = nn.LayerNorm(d_model)
+        self.norm_key = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, num_heads)
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_dim), resolve_nn_activation(activation), nn.Linear(ff_dim, d_model)
+        )
+        # Output norm with a SMALL initial gain -- see the class docstring for why this is load-bearing.
+        self.norm_out = nn.LayerNorm(d_model)
+        nn.init.constant_(self.norm_out.weight, 0.02)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        num_memory: int,
+        mask: torch.Tensor | None = None,
+        need_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Write one finished pass into the memory.
+
+        Args:
+            hidden: ``H`` ``[B, M + S, d]``: the memory rows first, then the episode's readouts.
+            num_memory: ``M``, how many leading rows of ``hidden`` are the memory.
+            mask: Validity of every row of ``H``, ``[B, M + S]``. Rows that are ``False`` cannot influence ``Z``.
+                The memory rows themselves are always valid (they are written by the prefill).
+            need_weights: Whether to also return the ``[B, num_heads, M, M + S]`` attention weights.
+
+        Returns:
+            ``Z_new`` ``[B, M, d]`` and, if requested, the attention weights.
+        """
+        queries = hidden[:, :num_memory]
+        keys, values = self.attn.project_kv(self.norm_key(hidden))
+
+        if mask is not None:
+            key_mask = mask.bool().clone()
+            # The memory rows are always readable: it is what keeps the softmax rows non-empty (a fully masked
+            # row is NaN) and it is what the acting path does anyway.
+            key_mask[:, :num_memory] = True
+            attn_mask = key_mask.unsqueeze(1).expand(-1, num_memory, -1)
+        else:
+            attn_mask = None
+
+        attended, weights = self.attn(
+            self.norm_query(queries), keys, values, attn_mask=attn_mask, need_weights=need_weights
+        )
+        memory = queries + attended
+        memory = memory + self.ff(self.norm_ff(memory))
+        return self.norm_out(memory), weights
 
 
 @dataclass(frozen=True)
@@ -78,11 +175,31 @@ class EpisodeContextPrefix:
             :class:`~rsl_rl.storage.EpisodeContextRolloutStorage` stores the frames in that form.
         positions: Episode-step index of every prefix frame, ``[P, B]``.
         window_positions: Episode-step index of every window row, ``[W, B]``.
+        memory: Optional per-segment memory ``[B, n_seg, M, d]`` (``memory_tokens > 0`` only), READY TO USE. It
+            is what a caller that already holds a ``Z`` passes; the storage does not use it (it ships the source
+            episodes instead, below, so that the writer runs in-graph). ``None`` means ``z_init`` for every row,
+            which is what the first episode of a trial gets anyway.
+        memory_segments: Optional index into the segment axis of ``memory`` / :attr:`source_hidden` for every row
+            of ``[prefix | window]``, ``[P + W, B]``. ``None`` derives it from the episode steps (a row with step
+            0 opens a segment) -- which the storage never relies on: it computes the segments explicitly from the
+            episode boundaries it recorded and passes them here.
+        source_hidden: The cached, DETACHED ``H`` of the episode that precedes every segment,
+            ``[B, n_seg, M + T, d]`` (memory rows first, then the episode's readouts), zero-padded for segments
+            that have none. The update path turns this into ``memory`` in-graph (``Z = G(H)``) -- see
+            :meth:`ActorCriticEpisodeContext.memory_from_prefix`. Ignored when :attr:`memory` is given.
+        source_valid: Validity of every row of :attr:`source_hidden`, ``[B, n_seg, M + T]``.
+        segment_has_source: Whether a segment has a source episode at all, ``[B, n_seg]``. ``False`` means the
+            segment is episode 0 of its trial and reads ``z_init``.
     """
 
     obs: torch.Tensor
     positions: torch.Tensor
     window_positions: torch.Tensor
+    memory: torch.Tensor | None = None
+    memory_segments: torch.Tensor | None = None
+    source_hidden: torch.Tensor | None = None
+    source_valid: torch.Tensor | None = None
+    segment_has_source: torch.Tensor | None = None
 
 
 class ActorCriticEpisodeContext(nn.Module):
@@ -112,6 +229,8 @@ class ActorCriticEpisodeContext(nn.Module):
         normalizer_until: int | None = None,
         critic_design: str = "privileged",
         detach_critic_trunk: bool = False,
+        memory_tokens: int = 0,
+        episodes_per_trial: int = 2,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the episode-context actor-critic.
@@ -151,6 +270,12 @@ class ActorCriticEpisodeContext(nn.Module):
             detach_critic_trunk: Only meaningful with ``critic_design="shared_trunk"``. When ``True``, ``h_t`` is
                 detached before the value head, so the value loss trains the head alone. Defaults to ``False``
                 (the value loss shapes the trunk too, as in run 225077).
+            memory_tokens: ``M``, the number of cross-episode memory rows PREPENDED to the trunk's sequence.
+                ``0`` (the default) builds no memory submodule at all and leaves every code path exactly as it
+                is without this feature.
+            episodes_per_trial: ``K``, bookkeeping only: it is what :attr:`episode_index_in_trial` counts up to,
+                and what a caller that does not track trials itself can use to decide when to pass
+                ``trial_dones``. The writer recurrence itself is general in ``K``.
         """
         if kwargs:
             print(
@@ -206,6 +331,18 @@ class ActorCriticEpisodeContext(nn.Module):
         self.blocks = nn.ModuleList([TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)])
         self.final_norm = nn.LayerNorm(d_model)
 
+        # Cross-episode memory (optional). Nothing below exists with ``memory_tokens=0``, so the module is then
+        # parameter-for-parameter and bit-for-bit the memory-free policy.
+        self.num_memory_tokens = int(memory_tokens)
+        self.episodes_per_trial = int(episodes_per_trial)
+        # One row per memory token plus one per step of a full episode: what the writer keys on, and exactly the
+        # sequence a step of that episode ran over.
+        self.hidden_history_span = self.num_memory_tokens + self.max_episode_length
+        if self.num_memory_tokens > 0:
+            self.z_init = nn.Parameter(torch.zeros(self.num_memory_tokens, d_model))
+            self.memory_pos_embed = nn.Parameter(torch.zeros(self.num_memory_tokens, d_model))
+            self.writer = MemoryTokenWriter(d_model, num_heads, ff_dim, activation)
+
         # Heads. The actor reads the trunk; the critic reads either the trunk (shared) or the privileged critic
         # observation. The value head keeps the name ``critic`` in BOTH designs: downstream tooling keys on it
         # (uwlab's critic-warmup freezes every parameter NOT named ``critic*``/``_crit*``, and the BC strict-load
@@ -250,6 +387,11 @@ class ActorCriticEpisodeContext(nn.Module):
         print(
             f"Episode-context trunk: L={num_layers} d={d_model} heads={num_heads}"
             f" context={self.context_length} (span {self.context_span}) T={self.max_episode_length}"
+            + (
+                f" M={self.num_memory_tokens} memory tokens prepended to the sequence (K={self.episodes_per_trial})"
+                if self.num_memory_tokens > 0
+                else " (no memory)"
+            )
         )
         print(f"Actor head: {self.actor}")
         if self.critic_design == "shared_trunk":
@@ -277,6 +419,14 @@ class ActorCriticEpisodeContext(nn.Module):
             block.ff[-1].weight.data.mul_(residual_scale)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.start_embed, mean=0.0, std=0.02)
+        if self.num_memory_tokens > 0:
+            self.writer.attn.out_proj.weight.data.mul_(residual_scale)
+            self.writer.ff[-1].weight.data.mul_(residual_scale)
+            # Small, like every other embedding: the memory rows are ordinary tokens of the trunk's sequence, so
+            # this is what keeps their step-0 perturbation of a BC'd trunk small (it is NOT zero -- there is no
+            # identity-at-init in this design).
+            nn.init.normal_(self.memory_pos_embed, mean=0.0, std=0.02)
+            nn.init.normal_(self.z_init, mean=0.0, std=0.02)
 
     _RUNTIME_STATE_ATTRS: tuple[str, ...] = (
         "_num_envs",
@@ -287,6 +437,12 @@ class ActorCriticEpisodeContext(nn.Module):
         "_last_hidden",
         "_window_hidden",
         "_window_hidden_obs",
+        "_memory",
+        "_memory_key_cache",
+        "_memory_value_cache",
+        "_hidden_history",
+        "_history_valid",
+        "_episode_index",
     )
 
     def _reset_runtime_state(self) -> None:
@@ -304,6 +460,16 @@ class ActorCriticEpisodeContext(nn.Module):
         # the same minibatch before reusing it (``ppo.py`` calls ``act`` then ``evaluate`` on the same object).
         self._window_hidden: torch.Tensor | None = None
         self._window_hidden_obs: Any = None
+        # Memory state (all ``None`` with ``memory_tokens=0``): the per-environment ``Z``, the per-layer K/V of
+        # its ``M`` prefix rows (refreshed by the prefill at every write, never evicted by the episode ring),
+        # the readouts of the pass in progress + their validity, and how many episodes of the current trial are
+        # already written into ``Z``.
+        self._memory: torch.Tensor | None = None
+        self._memory_key_cache: list[torch.Tensor] | None = None
+        self._memory_value_cache: list[torch.Tensor] | None = None
+        self._hidden_history: torch.Tensor | None = None
+        self._history_valid: torch.Tensor | None = None
+        self._episode_index: torch.Tensor | None = None
 
     def initialize_state(self, num_envs: int, device: torch.device | str, dtype: torch.dtype | None = None) -> None:
         """Allocate the acting-time KV cache for ``num_envs`` environments (all episodes start at step 0)."""
@@ -321,6 +487,24 @@ class ActorCriticEpisodeContext(nn.Module):
         self._last_hidden = None
         self._window_hidden = None
         self._window_hidden_obs = None
+        if self.num_memory_tokens > 0:
+            self._memory = self.z_init.detach().to(device=device, dtype=dtype).unsqueeze(0).repeat(num_envs, 1, 1)
+            self._memory_key_cache = [
+                torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
+                for _ in range(self.num_layers)
+            ]
+            self._memory_value_cache = [
+                torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
+                for _ in range(self.num_layers)
+            ]
+            self._hidden_history = torch.zeros(
+                num_envs, self.hidden_history_span, self.d_model, device=device, dtype=dtype
+            )
+            self._history_valid = torch.zeros(num_envs, self.hidden_history_span, device=device, dtype=torch.bool)
+            self._episode_index = torch.zeros(num_envs, device=device, dtype=torch.long)
+            # Every episode opens with the memory rows already in the sequence, so their K/V (and their rows of
+            # ``H``) have to exist before the first environment token is stepped.
+            self._prefill_memory(torch.arange(num_envs, device=device))
 
     def _ensure_state(self, num_envs: int, device: torch.device, dtype: torch.dtype) -> None:
         if self._num_envs != num_envs or self._key_cache is None or self._key_cache[0].device != device:
@@ -344,6 +528,206 @@ class ActorCriticEpisodeContext(nn.Module):
         the storage's ring buffer ``num_steps_per_env + min(L, T)`` slots.
         """
         return min(self.max_episode_length - 1, self.num_layers * (self.context_span - 1))
+
+    # --------------------------------------------------------------------------------------------------------
+    # Cross-episode memory
+    # --------------------------------------------------------------------------------------------------------
+
+    @property
+    def memory(self) -> torch.Tensor | None:
+        """The acting path's ``Z`` ``[num_envs, M, d]`` (``None`` before the first step, or with no memory)."""
+        return self._memory
+
+    @property
+    def episode_index_in_trial(self) -> torch.Tensor | None:
+        """How many episodes of the current trial are already written into ``Z``, per environment ``[num_envs]``."""
+        return self._episode_index
+
+    def initial_memory(self, batch_size: int, device: torch.device | str | None = None) -> torch.Tensor:
+        """The learned "no memory yet" rows ``[B, M, d]``. Differentiable, so an episode-0 loss reaches ``z_init``."""
+        self._assert_memory_enabled()
+        memory = self.z_init.unsqueeze(0).expand(batch_size, -1, -1)
+        return memory if device is None else memory.to(device)
+
+    def write_memory(
+        self,
+        hidden: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        need_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply the writer ``G``: ``Z_{e+1} = G(H_e)``. See :class:`MemoryTokenWriter` for the shapes.
+
+        ``H_e`` ``[B, M + S, d]`` is one finished pass -- the ``M`` memory rows first, then the episode's
+        readouts. This is what the update path calls **in graph** on the cached (detached) ``H`` of the source
+        episode, so that the writer gets a gradient while the source episode's trunk does not.
+        """
+        self._assert_memory_enabled()
+        return self.writer(hidden, self.num_memory_tokens, mask=mask, need_weights=need_weights)
+
+    def memory_from_prefix(self, prefix: EpisodeContextPrefix) -> torch.Tensor | None:
+        """Turn a minibatch's cached source episodes into the per-segment ``Z`` ``[B, n_seg, M, d]``, IN GRAPH.
+
+        This is the update-path counterpart of the acting path's :meth:`_write_memory`, and the only place the
+        writer runs with a gradient::
+
+            Z_seg = G(H_seg)   for a segment that has a source episode
+            Z_seg = z_init     for episode 0 of a trial
+
+        ``H_seg`` is the detached snapshot the storage took when that episode ended -- and because the memory
+        rows of that pass are its first ``M`` rows, the whole recurrence ``Z_{e+1} = G(trunk(Z_e), episode_e)``
+        rides in it. The gradient therefore trains the writer (and, through the source-free segments, ``z_init``)
+        but never the source episode's trunk. The writer is batched over the ``B x n_seg`` segments that actually
+        have a source and the result is scattered back, so the padded ones cost nothing.
+
+        Note: the chain is one write off ``z_init``, i.e. it reproduces the acting path exactly for
+        ``episodes_per_trial = 2`` (the validated configuration). With ``K > 2`` a segment of episode ``e > 1``
+        would need ``G`` applied ``e`` times down the trial, which the cached-``H`` design deliberately does not
+        keep; the memory is then an approximation of the acting one.
+
+        Returns:
+            ``[B, n_seg, M, d]``, or ``None`` when the prefix carries no source data.
+        """
+        if self.num_memory_tokens == 0 or prefix.source_hidden is None:
+            return None
+        has_source = prefix.segment_has_source
+        batch_size, num_segments = has_source.shape
+        source = prefix.source_hidden.reshape(batch_size * num_segments, -1, self.d_model)
+        valid = prefix.source_valid.reshape(batch_size * num_segments, -1)
+        # ``expand`` (not ``repeat``): differentiable and free, so an all-z_init minibatch still trains z_init.
+        memory = self.z_init.view(1, 1, self.num_memory_tokens, self.d_model).expand(batch_size, num_segments, -1, -1)
+        rows = has_source.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if rows.numel() == 0:
+            return memory
+        written, _ = self.write_memory(source[rows].detach(), mask=valid[rows])
+        flat = memory.reshape(batch_size * num_segments, self.num_memory_tokens, self.d_model)
+        return flat.index_copy(0, rows, written.to(flat.dtype)).view(batch_size, num_segments, -1, self.d_model)
+
+    def get_episode_hidden(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """``H`` of the pass in progress plus its validity mask, ``[n, M + T, d]`` and ``[n, M + T]``, detached.
+
+        Rows ``0 .. M - 1`` are the memory tokens the episode opened with (written by :meth:`_prefill_memory`),
+        rows ``M + t`` the readout of environment step ``t``. Snapshotting this at an episode boundary (before
+        :meth:`reset` clears it) is how the storage keeps the source episode of the next one without holding on
+        to its raw frames.
+        """
+        self._assert_memory_enabled()
+        if self._hidden_history is None:
+            raise RuntimeError("get_episode_hidden() called before the first forward_step(); no state allocated.")
+        if env_ids is None:
+            return self._hidden_history.detach(), self._history_valid.clone()
+        return self._hidden_history[env_ids].detach(), self._history_valid[env_ids].clone()
+
+    def _assert_memory_enabled(self) -> None:
+        if self.num_memory_tokens == 0:
+            raise RuntimeError("This policy was built with memory_tokens=0: there is no z_init and no writer.")
+
+    def _prepare_memory(self, memory: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Bring the caller's memory to ``[B, n_seg, M, d]``, defaulting to ``z_init`` for every row."""
+        if memory is None:
+            return self.z_init.view(1, 1, self.num_memory_tokens, self.d_model).expand(batch_size, 1, -1, -1)
+        if memory.dim() == 3:  # [B, M, d] -- one segment per row
+            memory = memory.unsqueeze(1)
+        assert memory.shape[0] == batch_size and memory.shape[2:] == (self.num_memory_tokens, self.d_model), (
+            f"memory must be [B, n_seg, {self.num_memory_tokens}, {self.d_model}] with B={batch_size},"
+            f" got {tuple(memory.shape)}"
+        )
+        return memory.to(device)
+
+    @staticmethod
+    def _segments_from_positions(positions: torch.Tensor) -> torch.Tensor:
+        """Segment index of every row of ``[S, B]`` episode steps: a row at step 0 opens the next segment."""
+        return ((positions == 0).long().cumsum(dim=0) - 1).clamp(min=0)
+
+    def _memory_token_input(self, memory: torch.Tensor) -> torch.Tensor:
+        """The trunk's INPUT rows for a memory ``[B, n_seg, M, d]``: ``Z_i + memory_pos_embed[i]``, flattened.
+
+        No ``start_embed`` and no episode positional embedding -- a memory row is not a frame of the episode, it
+        is its own kind of token and :attr:`memory_pos_embed` is the only thing that tells the rows apart.
+        """
+        batch_size, num_segments = memory.shape[0], memory.shape[1]
+        return (memory + self.memory_pos_embed).reshape(batch_size, num_segments * self.num_memory_tokens, -1)
+
+    def _memory_prefix_mask(self, token_mask: torch.Tensor, num_segments: int, segments: torch.Tensor) -> torch.Tensor:
+        """Grow a token-only mask ``[B, S, S]`` into the full ``[B, nM + S, nM + S]`` of ``[memory | tokens]``.
+
+        The ``n_seg`` memories of a pass are laid out FIRST, block by block, and
+
+        * memory row ``i`` of block ``k`` attends to rows ``<= i`` of block ``k`` and to nothing else (so a block
+          is exactly the prefill the acting path runs, and blocks cannot see each other),
+        * an environment token attends to the whole memory block of ITS segment, plus its usual token reach
+          (``segments`` ``[B, S]`` says which block that is; it is clamped so that a token can never end up with
+          an empty key set, which would make softmax produce NaN).
+
+        Environment tokens never feed back into the memory rows, which is what makes the ``M`` prefix rows of one
+        batched pass reproducible by a small ``M``-row prefill on the acting path.
+        """
+        batch_size, num_steps = segments.shape
+        device = token_mask.device
+        total = num_segments * self.num_memory_tokens
+        index = torch.arange(total, device=device)
+        block, row = index // self.num_memory_tokens, index % self.num_memory_tokens
+        memory_memory = (block.unsqueeze(1) == block.unsqueeze(0)) & (row.unsqueeze(1) >= row.unsqueeze(0))
+        token_memory = segments.clamp(max=num_segments - 1).unsqueeze(-1) == block.view(1, 1, -1)  # [B, S, nM]
+        top = torch.cat(
+            [
+                memory_memory.unsqueeze(0).expand(batch_size, -1, -1),
+                torch.zeros(batch_size, total, num_steps, dtype=torch.bool, device=device),
+            ],
+            dim=2,
+        )
+        return torch.cat([top, torch.cat([token_memory, token_mask], dim=2)], dim=1)
+
+    def _memory_trunk(self, rows: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        """Push the ``M`` memory INPUT rows ``[B, M, d]`` through the trunk on their own.
+
+        The memory rows attend causally to each other and to nothing else, so this is exactly what a full pass
+        would do to them -- which is what lets the acting path replace the memory prefix of the sequence by a
+        cached K/V per layer.
+
+        Returns:
+            Their readouts ``[B, M, d]`` (rows ``0 .. M - 1`` of ``H``) and the per-layer keys and values.
+        """
+        index = torch.arange(self.num_memory_tokens, device=rows.device)
+        attn_mask = (index.unsqueeze(1) >= index.unsqueeze(0)).unsqueeze(0)
+        all_keys: list[torch.Tensor] = []
+        all_values: list[torch.Tensor] = []
+        hidden = rows
+        for block in self.blocks:
+            normed, keys, values = block.token_kv(hidden)
+            all_keys.append(keys)
+            all_values.append(values)
+            hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
+        return self.final_norm(hidden), all_keys, all_values
+
+    def memory_readout(self, memory: torch.Tensor) -> torch.Tensor:
+        """Rows ``0 .. M - 1`` of the ``H`` a pass with this ``Z`` ``[B, M, d]`` produces -- what the writer queries.
+
+        Differentiable, and the exact counterpart of what :meth:`_prefill_memory` records on the acting path: a
+        caller that reconstructs a pass from scratch (a BC script, a test) builds its ``H`` as
+        ``cat([memory_readout(Z), h_0, ..., h_{T-1}])``.
+        """
+        self._assert_memory_enabled()
+        hidden, _, _ = self._memory_trunk(self._memory_token_input(memory.unsqueeze(1)))
+        return hidden
+
+    def _prefill_memory(self, env_ids: torch.Tensor) -> None:
+        """Run ``env_ids``' ``M`` memory rows through the trunk and cache their per-layer K/V + their ``H`` rows.
+
+        The acting path's counterpart of the memory block a batched pass carries in front of its window: because
+        the memory rows only ever attend to each other, one ``M``-row pass at the start of an episode produces
+        exactly the keys and values every later step of that episode has to attend over, and they are kept in
+        their own (never-evicted) cache instead of in the episode ring.
+        """
+        if env_ids.numel() == 0:
+            return
+        with torch.no_grad():
+            hidden, keys, values = self._memory_trunk(self._memory_token_input(self._memory[env_ids].unsqueeze(1)))
+            for layer in range(self.num_layers):
+                self._memory_key_cache[layer][env_ids] = keys[layer].detach()
+                self._memory_value_cache[layer][env_ids] = values[layer].detach()
+        # The memory rows are the first M rows of H, exactly as the writer (and the storage) expect them.
+        self._hidden_history[env_ids, : self.num_memory_tokens] = hidden.detach().to(self._hidden_history.dtype)
+        self._history_valid[env_ids, : self.num_memory_tokens] = True
 
     # --------------------------------------------------------------------------------------------------------
     # Distribution / observation helpers
@@ -476,18 +860,35 @@ class ActorCriticEpisodeContext(nn.Module):
         normalize_obs: bool = True,
         key_valid: torch.Tensor | None = None,
         segments: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
+        memory_segments: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """One causal pass over ``[S, B, obs_dim]`` with per-row episode steps ``[S, B]``. Returns ``h [S, B, d]``."""
+        """One causal pass over ``[S, B, obs_dim]`` with per-row episode steps ``[S, B]``. Returns ``h [S, B, d]``.
+
+        ``memory`` ``[B, n_seg, M, d]`` and ``memory_segments`` ``[S, B]`` (both optional, memory only) say which
+        ``M`` rows each token attends over. The memory rows are REAL rows of this pass: they are laid out in
+        front of the tokens (``[mem_seg_0 | ... | mem_seg_{n-1} | tokens]``), run through every block, and only
+        the token rows are returned. The trunk therefore processes -- and is trained through -- the memory.
+        """
         num_steps = obs.shape[0]
         tokens = self._embed_tokens(obs, positions, normalize_obs)
         hidden = tokens.transpose(0, 1)  # [B, S, d]
         attn_mask = self._window_attn_mask(positions, key_valid, segments)
+        num_memory_rows = 0
+        if self.num_memory_tokens > 0:
+            memory = self._prepare_memory(memory, hidden.shape[0], hidden.device)
+            if memory_segments is None:
+                memory_segments = self._segments_from_positions(positions)
+            memory_rows = self._memory_token_input(memory).to(hidden.dtype)
+            num_memory_rows = memory_rows.shape[1]
+            attn_mask = self._memory_prefix_mask(attn_mask, memory.shape[1], memory_segments.transpose(0, 1))
+            hidden = torch.cat([memory_rows, hidden], dim=1)
         for block in self.blocks:
             normed, keys, values = block.token_kv(hidden)
             hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
         hidden = self.final_norm(hidden)
-        assert hidden.shape[1] == num_steps
-        return hidden.transpose(0, 1)
+        assert hidden.shape[1] == num_memory_rows + num_steps
+        return hidden[:, num_memory_rows:].transpose(0, 1)
 
     @staticmethod
     def _positions_from_segments(segments: torch.Tensor) -> torch.Tensor:
@@ -506,6 +907,8 @@ class ActorCriticEpisodeContext(nn.Module):
         prefix: EpisodeContextPrefix | None = None,
         normalize_obs: bool = True,
         positions: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
+        memory_segments: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run a window of frames through the trunk in ONE causal pass. Two calling conventions:
 
@@ -526,9 +929,22 @@ class ActorCriticEpisodeContext(nn.Module):
         ``obs`` is the window (a ``TensorDict`` slice straight out of the storage is fine) and ``prefix`` an
         :class:`EpisodeContextPrefix` carrying the ``P`` preceding frames and the episode steps of both parts.
         Only the ``W`` window rows are returned; the prefix exists purely to make them exact.
+
+        **Memory** (``memory_tokens > 0`` only). ``memory`` ``[B, n_seg, M, d]`` holds one ``Z`` per episode
+        segment of the pass and ``memory_segments`` says which of them every token reads: ``[B, S]`` batch-first,
+        ``[P + W, B]`` (time-major, aligned with the concatenated positions) with a prefix. Every segment's ``M``
+        rows are prepended to the pass as real tokens and a token attends ONLY to its own segment's block, which
+        is what lets one minibatch mix rows from before and after an episode boundary.
+        ``memory=None`` means ``z_init`` everywhere; ``memory_segments=None``
+        derives the segments from the episode steps. With a prefix, ``memory=None`` first looks at the prefix: an
+        explicit ``prefix.memory``, else the cached source episodes it carries, which are written into a ``Z``
+        in-graph by :meth:`memory_from_prefix` -- the PPO update path.
         """
         if isinstance(seg_mask, EpisodeContextPrefix):  # tolerate a positional prefix
             prefix, seg_mask = seg_mask, None
+        assert self.num_memory_tokens > 0 or (memory is None and memory_segments is None), (
+            "forward_window(memory=...) needs a policy built with memory_tokens > 0."
+        )
         if prefix is None:
             # Batch-first: [B, S, ...] in and out; the trunk itself is time-major.
             sequence = self.get_actor_obs(obs)  # [B, S, obs_dim]
@@ -542,7 +958,12 @@ class ActorCriticEpisodeContext(nn.Module):
             if positions is None:
                 positions = self._positions_from_segments(segments)
             hidden = self._forward_tokens(
-                sequence.transpose(0, 1), positions.transpose(0, 1), normalize_obs, segments=segments.transpose(0, 1)
+                sequence.transpose(0, 1),
+                positions.transpose(0, 1),
+                normalize_obs,
+                segments=segments.transpose(0, 1),
+                memory=memory,
+                memory_segments=None if memory_segments is None else memory_segments.transpose(0, 1),
             )
             return hidden.transpose(0, 1)
 
@@ -558,7 +979,17 @@ class ActorCriticEpisodeContext(nn.Module):
             positions = torch.cat([prefix.positions, prefix.window_positions], dim=0)
         else:
             sequence, positions = window_obs, prefix.window_positions
-        hidden = self._forward_tokens(sequence, positions, normalize_obs=False)
+        if memory is None:
+            # A prefix straight out of the storage carries the SOURCE episodes, not a ready ``Z``: the writer runs
+            # here, in this minibatch's graph. ``prefix.memory`` (an explicit ``Z``) takes precedence.
+            memory = prefix.memory if prefix.memory is not None else self.memory_from_prefix(prefix)
+        hidden = self._forward_tokens(
+            sequence,
+            positions,
+            normalize_obs=False,
+            memory=memory,
+            memory_segments=prefix.memory_segments if memory_segments is None else memory_segments,
+        )
         return hidden[num_prefix:]
 
     def forward_sequence(
@@ -567,6 +998,7 @@ class ActorCriticEpisodeContext(nn.Module):
         mask: torch.Tensor | None = None,
         normalize_obs: bool = True,
         positions: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One whole episode (starting at step 0) in a single batched forward -- what a BC script wants.
 
@@ -576,16 +1008,21 @@ class ActorCriticEpisodeContext(nn.Module):
             mask: Validity of every row, ``[S, B]``. Invalid rows cannot influence any valid one.
             normalize_obs: Whether to apply the observation normalizer.
             positions: Optional explicit episode steps ``[S, B]``. Defaults to ``0, 1, ... S - 1``.
+            memory: Optional ``Z`` ``[B, M, d]`` for the episode (``memory_tokens > 0`` only). ``None`` means
+                ``z_init``, i.e. the first episode of a trial.
 
         Returns:
             ``h`` ``[S, B, d]``.
         """
+        assert self.num_memory_tokens > 0 or memory is None, (
+            "forward_sequence(memory=...) needs a policy built with memory_tokens > 0."
+        )
         sequence = self.get_actor_obs(obs)
         num_steps, batch_size = sequence.shape[0], sequence.shape[1]
         if positions is None:
             positions = torch.arange(num_steps, device=sequence.device).unsqueeze(1).expand(num_steps, batch_size)
         key_valid = None if mask is None else mask.bool()
-        return self._forward_tokens(sequence, positions, normalize_obs, key_valid)
+        return self._forward_tokens(sequence, positions, normalize_obs, key_valid, memory=memory)
 
     # --------------------------------------------------------------------------------------------------------
     # Incremental (collection) path
@@ -612,15 +1049,25 @@ class ActorCriticEpisodeContext(nn.Module):
         cache_positions = self._cache_positions
         fresh = (cache_positions >= 0) & (cache_positions + self.context_span > positions.unsqueeze(1))
         ones = torch.ones(num_envs, 1, device=obs.device, dtype=torch.bool)
-        attn_mask = torch.cat([fresh, ones], dim=-1).unsqueeze(1)  # [N, 1, span + 1]
+        if self.num_memory_tokens > 0:
+            # The ``M`` memory rows sit in front of the episode's own keys and are ALWAYS attendable -- they are
+            # the prefix of the very same sequence the batched path builds, prefilled once per write.
+            memory_ones = torch.ones(num_envs, self.num_memory_tokens, device=obs.device, dtype=torch.bool)
+            attn_mask = torch.cat([memory_ones, fresh, ones], dim=-1).unsqueeze(1)  # [N, 1, M + span + 1]
+        else:
+            attn_mask = torch.cat([fresh, ones], dim=-1).unsqueeze(1)  # [N, 1, span + 1]
 
         slots = torch.remainder(positions, self.context_span)
         scatter_index = slots.view(num_envs, 1, 1).expand(num_envs, 1, self.d_model)
         hidden = tokens
         for layer, block in enumerate(self.blocks):
             normed, keys, values = block.token_kv(hidden)
-            all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
-            all_values = torch.cat([self._value_cache[layer], values], dim=1)
+            if self.num_memory_tokens > 0:
+                all_keys = torch.cat([self._memory_key_cache[layer], self._key_cache[layer], keys], dim=1)
+                all_values = torch.cat([self._memory_value_cache[layer], self._value_cache[layer], values], dim=1)
+            else:
+                all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
+                all_values = torch.cat([self._value_cache[layer], values], dim=1)
             hidden = block.token_forward(hidden, normed, all_keys, all_values, attn_mask)
             if commit:
                 self._key_cache[layer].scatter_(1, scatter_index, keys.detach())
@@ -631,6 +1078,10 @@ class ActorCriticEpisodeContext(nn.Module):
             self._cache_positions.scatter_(1, slots.view(num_envs, 1), positions.view(num_envs, 1))
             self._positions = positions + 1
             self._last_hidden = hidden
+            if self.num_memory_tokens > 0:
+                # The writer's view of this episode. Detached: the source episode's trunk is not shaped by the
+                # write objective (it trains from its own PPO rows), which is what makes the cached-H design work.
+                self._append_hidden(hidden.detach(), positions)
         return hidden
 
     def act(
@@ -731,11 +1182,77 @@ class ActorCriticEpisodeContext(nn.Module):
     # Reset / PPO plumbing
     # --------------------------------------------------------------------------------------------------------
 
-    def reset(self, dones: torch.Tensor | None = None, **kwargs: Any) -> None:
-        """Clear the KV cache of the environments that just ended an episode (the context never crosses a done)."""
+    def _append_hidden(self, hidden: torch.Tensor, positions: torch.Tensor) -> None:
+        """Record ``h_t`` ``[N, d]`` as row ``M + step_t`` of the writer's view of the pass in progress.
+
+        Rows ``0 .. M - 1`` belong to the memory tokens and are written by :meth:`_prefill_memory`, so the
+        episode's own readouts start at ``M`` -- which is exactly the order of the batched pass.
+        """
+        slots = (positions + self.num_memory_tokens).clamp(max=self.hidden_history_span - 1).view(-1, 1)
+        self._hidden_history.scatter_(1, slots.unsqueeze(-1).expand(-1, 1, self.d_model), hidden.unsqueeze(1))
+        self._history_valid.scatter_(1, slots, torch.ones_like(slots, dtype=torch.bool))
+
+    def _write_memory(self, env_ids: torch.Tensor) -> None:
+        """Close the passes of ``env_ids``: ``Z <- G(H)``, detached. ``H`` is left for the caller to clear."""
+        if env_ids.numel() == 0:
+            return
+        with torch.no_grad():
+            new_memory, _ = self.write_memory(self._hidden_history[env_ids], mask=self._history_valid[env_ids])
+        self._memory = self._memory.clone()
+        self._memory[env_ids] = new_memory.detach().to(self._memory.dtype)
+        self._episode_index[env_ids] += 1
+
+    def _reset_trial(self, env_ids: torch.Tensor) -> None:
+        """Restore ``Z`` to the learned ``z_init`` for ``env_ids`` -- the only thing a trial boundary does."""
+        if env_ids.numel() == 0:
+            return
+        self._memory = self._memory.clone()
+        self._memory[env_ids] = self.z_init.detach().to(device=self._memory.device, dtype=self._memory.dtype)
+        self._episode_index[env_ids] = 0
+
+    def reset(self, dones: torch.Tensor | None = None, trial_dones: torch.Tensor | None = None, **kwargs: Any) -> None:
+        """Clear the KV cache of the environments that just ended an episode (the context never crosses a done).
+
+        With a memory (``memory_tokens > 0``) a done additionally closes that environment's ``H`` and writes it
+        into ``Z``, and a ``trial_dones`` entry restores ``Z`` to ``z_init``. Either way the affected
+        environments' ``H`` is cleared and the new ``Z`` is PREFILLED: its per-layer K/V (which the next episode
+        attends over from its very first step) and its rows ``0 .. M - 1`` of the fresh ``H``.
+        ``trial_dones=None`` means "every episode is its own trial", i.e. the memory never survives a done -- the
+        safe fallback for an environment that does not publish a trial signal. ``dones=None`` wipes everything,
+        memory included.
+
+        A trial boundary is expected to coincide with an episode boundary (a trial ends because its last episode
+        did). A ``trial_dones`` entry WITHOUT the matching ``dones`` entry is still handled -- the environment
+        gets ``z_init`` and a fresh prefill -- but it changes the memory in the middle of an episode, so that
+        episode's ``H`` no longer describes one consistent pass and the two forward paths disagree on its
+        earlier rows.
+        """
         self._window_hidden, self._window_hidden_obs = None, None
         if self._key_cache is None:
             return
+        if self.num_memory_tokens > 0:
+            # Unlike the rest of this method, resolving ``dones`` to indices syncs the host -- but it makes the
+            # writer run on the handful of environments that are actually done instead of on all of them.
+            done_ids = (
+                torch.arange(self._num_envs, device=self._positions.device)
+                if dones is None
+                else dones.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+            )
+            if dones is not None:
+                self._write_memory(done_ids)
+            trial_ids = done_ids if trial_dones is None else trial_dones.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+            self._reset_trial(trial_ids)
+            if dones is None:
+                self._memory = self.z_init.detach().to(self._memory).unsqueeze(0).expand_as(self._memory).clone()
+                self._episode_index.zero_()
+                refresh = torch.arange(self._num_envs, device=self._positions.device)
+            else:
+                refresh = torch.cat([done_ids, trial_ids]).unique()
+            # A new pass starts for these environments: drop the old readouts, then lay the (new) memory rows
+            # down again as rows 0 .. M - 1 of the next ``H``.
+            self._hidden_history[refresh] = 0.0
+            self._history_valid[refresh] = False
+            self._prefill_memory(refresh)
         if dones is None:
             self._cache_positions.fill_(-1)
             self._positions.zero_()

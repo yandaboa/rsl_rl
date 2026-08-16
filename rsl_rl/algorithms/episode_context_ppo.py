@@ -5,19 +5,25 @@
 
 """PPO for the single-episode context transformer.
 
-This is the **stock** :class:`~rsl_rl.algorithms.ppo.PPO` -- ``act``, ``process_env_step``, ``compute_returns``
-and the whole ``update()`` are inherited byte-for-byte from the known-good implementation. The only override is
-:meth:`init_storage`, which builds an :class:`EpisodeContextRolloutStorage` instead of a plain
-:class:`RolloutStorage`; that storage's ``recurrent_mini_batch_generator`` then feeds PPO's existing recurrent
-branch (``policy.is_recurrent`` is ``True``) with ``[W, B, ...]`` minibatches whose prefix rides in the
-hidden-state slot.
+This is the **stock** :class:`~rsl_rl.algorithms.ppo.PPO` -- ``act``, ``compute_returns`` and the whole
+``update()`` are inherited byte-for-byte from the known-good implementation. There are two overrides:
 
-The class exists only because ``PPO.init_storage`` names its storage class literally. Everything a reader might
-expect to be different here -- the loss, the ratio, the KL schedule, the clipping, the diagnostics -- is not.
+* :meth:`init_storage`, which builds an :class:`EpisodeContextRolloutStorage` instead of a plain
+  :class:`RolloutStorage`; that storage's ``recurrent_mini_batch_generator`` then feeds PPO's existing recurrent
+  branch (``policy.is_recurrent`` is ``True``) with ``[W, B, ...]`` minibatches whose prefix rides in the
+  hidden-state slot,
+* :meth:`process_env_step`, and ONLY when the policy carries a cross-episode memory (``memory_tokens > 0``): the
+  frozen ``ppo.py`` ends its step with ``policy.reset(dones)``, which -- with no trial signal -- would put ``Z``
+  back to ``z_init`` at every episode boundary, and it has nowhere to hand the storage the ``H`` of the episode
+  that just finished. With ``memory_tokens == 0`` the override is a plain ``super()`` call.
+
+Everything else a reader might expect to be different here -- the loss, the ratio, the KL schedule, the
+clipping, the diagnostics -- is not.
 """
 
 from __future__ import annotations
 
+import torch
 import warnings
 from tensordict import TensorDict
 
@@ -75,5 +81,61 @@ class EpisodeContextPPO(PPO):
             max_episode_length=self.policy.max_episode_length,
             num_layers=self.policy.num_layers,
             actor_obs_normalizer=self.policy.actor_obs_normalizer,
+            memory_tokens=self.policy.num_memory_tokens,
+            d_model=self.policy.d_model,
             max_policy_lag=self.max_policy_lag,
         )
+
+    def process_env_step(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+    ) -> None:
+        """One collection step. With a memory, also the whole cross-episode bookkeeping.
+
+        The body below the memory branch is the stock :meth:`PPO.process_env_step` (``ppo.py`` is byte-frozen, so
+        it is replicated rather than called: its last statement, ``policy.reset(dones)``, is exactly the one
+        thing that has to change). The order matters:
+
+        1. ``episode_index_in_trial`` is read BEFORE anything resets -- it labels the row about to be stored with
+           the episode of the trial that acted it,
+        2. the done environments get their ``H`` snapshotted into the storage (the ``M`` memory rows the episode
+           ran with, then its readouts), together with whether the episode that just ended was the last of its
+           trial. This MUST happen before ``policy.reset``, which consumes the very same ``H`` for its own write
+           and then clears it,
+        3. the transition is stored, and only then is the policy reset -- with the trial signal, so that ``Z``
+           survives an episode boundary inside a trial and is restored to ``z_init`` at a trial boundary.
+        """
+        if self.policy.num_memory_tokens == 0:
+            super().process_env_step(obs, rewards, dones, extras)
+            return
+
+        # Trial boundary. Defaults to the episode done, i.e. one episode per trial -- the safe fallback for an
+        # environment that does not publish the signal (the memory then never survives a done).
+        trial_dones = extras.get("trial_done", dones) if extras is not None else dones
+        trial_dones = trial_dones.reshape(-1).to(self.device)
+
+        # -- memory bookkeeping, before any reset --
+        self.storage.stage_episode_index(self.policy.episode_index_in_trial)
+        done_ids = dones.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if done_ids.numel() > 0:
+            hidden, valid = self.policy.get_episode_hidden(done_ids)
+            self.storage.push_episode_hidden(done_ids, hidden, valid, trial_dones[done_ids])
+
+        # -- stock PPO.process_env_step from here on --
+        if not self.defer_obs_normalization:
+            self.commit_obs_normalization(obs)
+        self.transition.rewards = rewards.clone()
+        self.transition.raw_rewards = rewards.clone()
+        self.transition.dones = dones
+        self.transition.trial_dones = trial_dones
+        if self.rnd:
+            self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
+            self.transition.rewards += self.intrinsic_rewards
+        # Bootstrapping on time outs, at a TRIAL end only: inside a trial GAE keeps bootstrapping through the
+        # episode boundary itself, so adding the value here would count it twice.
+        if extras is not None and "time_outs" in extras:
+            time_outs = extras["time_outs"].unsqueeze(1).to(self.device).float()
+            trial_ends = trial_dones.view(-1, 1).float()
+            self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * time_outs * trial_ends, 1)
+        self.storage.add_transitions(self.transition)
+        self.transition.clear()
+        self.policy.reset(dones, trial_dones=trial_dones)

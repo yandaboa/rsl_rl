@@ -21,6 +21,21 @@ whole thing:
   :class:`EpisodeContextPrefix`; ``ppo.py`` never looks inside it, it just hands it back to ``policy.act``,
 * every collected row is trained exactly once, in the update immediately after its rollout. Nothing is deferred,
   nothing is dropped, every lag is 0.
+
+With a memory policy (``memory_tokens > 0``) the storage additionally keeps, per environment, **which episode's
+readouts** feed the memory of the rows it is holding:
+
+* ``H`` snapshots, pushed by :class:`~rsl_rl.algorithms.EpisodeContextPPO` at every episode end (``[M + T, d]``:
+  the ``M`` memory rows the episode ran with, then its readouts; detached). Within a rollout they are kept
+  SPARSELY -- a handful of ``[n, M + T, d]`` chunks, one per step that had at least one done -- because a dense
+  ``[num_envs, k, M + T, d]`` slot would be gigabytes at 16k
+  environments. At :meth:`clear` the last snapshot of each environment is folded into the ONE dense per-
+  environment slot that survives the rollout boundary: the source of the episode that is currently running.
+* per-row ``episode_idx``, the acting policy's episode index inside its trial. ``0`` means "no source, read
+  ``z_init``".
+
+:meth:`recurrent_mini_batch_generator` turns that into per-segment source data and hands it to the policy inside
+the same ``hidden_states`` carrier as the prefix; the writer itself runs in the policy's update graph.
 """
 
 from __future__ import annotations
@@ -49,6 +64,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         max_episode_length: int = 80,
         num_layers: int = 1,
         actor_obs_normalizer: torch.nn.Module | None = None,
+        memory_tokens: int = 0,
+        d_model: int = 0,
         **kwargs,
     ) -> None:
         """
@@ -65,6 +82,11 @@ class EpisodeContextRolloutStorage(RolloutStorage):
             num_layers: Number of transformer blocks of the policy. It sizes the prefix: a row's receptive field
                 is ``num_layers * (span - 1)`` frames, not ``span - 1`` (see
                 :attr:`ActorCriticEpisodeContext.context_prefix_length`).
+            memory_tokens: ``M`` of the policy. ``0`` (the default) switches every memory buffer and every memory
+                code path off -- the storage is then exactly the memory-free one.
+            d_model: Trunk width of the policy. Only read when ``memory_tokens > 0`` (it sizes the ``H``
+                snapshots); one dense ``[num_envs, M + T, d]`` slot is allocated, which is the whole persistent
+                cost of the feature.
 
         The remaining arguments are :class:`RolloutStorage`'s. ``carry_steps`` is not accepted: there is no
         deferred training unit here (a row is trained in the very next update), and the carry region would only
@@ -97,6 +119,38 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         # Total frames ever written; the ring slot of global step ``g`` is ``g % ring_size``.
         self.total_steps = 0
 
+        # -- cross-episode memory (all of this is absent with memory_tokens = 0) --
+        self.num_memory_tokens = int(memory_tokens)
+        self.d_model = int(d_model)
+        self.has_memory = self.num_memory_tokens > 0
+        # One row per memory token plus one per step of an episode, mirroring the policy's
+        # ``hidden_history_span``: an ``H`` snapshot is the whole sequence the pass ran over.
+        self.hidden_span = self.num_memory_tokens + self.max_episode_length
+        if self.has_memory:
+            if self.d_model <= 0:
+                raise ValueError("memory_tokens > 0 needs the policy's d_model to size the H snapshots.")
+            # Persistent per-environment state: the source episode of the episode each environment is CURRENTLY
+            # in, as of the START of the rollout being held. Survives clear() -- that is the whole point: a
+            # window can begin in the middle of an episode whose source ended one or more rollouts ago.
+            self.source_hidden = torch.zeros(num_envs, self.hidden_span, self.d_model, device=device)
+            self.source_valid = torch.zeros(num_envs, self.hidden_span, dtype=torch.bool, device=device)
+            # False == "this environment's current episode is episode 0 of its trial" (read z_init).
+            self.has_source = torch.zeros(num_envs, dtype=torch.bool, device=device)
+            # Episode index inside the trial of every stored row; 0 means the row's episode has no source.
+            self.row_episode_index = torch.zeros(
+                self.num_transitions_per_env, num_envs, dtype=torch.long, device=device
+            )
+            self._pending_episode_index: torch.Tensor | None = None
+            self._clear_snapshots()
+
+    def _clear_snapshots(self) -> None:
+        """Drop the rollout-local ``H`` snapshots (kept as a list of ``[n, ...]`` chunks, in step order)."""
+        self._snapshot_hidden: list[torch.Tensor] = []
+        self._snapshot_valid: list[torch.Tensor] = []
+        self._snapshot_envs: list[torch.Tensor] = []
+        self._snapshot_steps: list[torch.Tensor] = []
+        self._snapshot_trial_end: list[torch.Tensor] = []
+
     # ------------------------------------------------------------------------------------------------------------
     # Collection
     # ------------------------------------------------------------------------------------------------------------
@@ -106,11 +160,55 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         actor_obs = torch.cat([obs[group] for group in self.actor_obs_groups], dim=-1)
         return actor_obs if self.actor_obs_normalizer is None else self.actor_obs_normalizer(actor_obs)
 
+    def stage_episode_index(self, episode_index: torch.Tensor) -> None:
+        """Label the row that :meth:`add_transitions` is about to write with the acting episode index.
+
+        Called by :class:`~rsl_rl.algorithms.EpisodeContextPPO` **before** the transition is stored and before
+        the policy is reset, i.e. while the counter still describes the episode the row was acted in.
+        """
+        if self.has_memory:
+            self._pending_episode_index = episode_index.reshape(-1).to(device=self.device, dtype=torch.long)
+
+    def push_episode_hidden(
+        self,
+        env_ids: torch.Tensor,
+        hidden: torch.Tensor,
+        valid: torch.Tensor,
+        trial_end: torch.Tensor,
+    ) -> None:
+        """Record the ``H`` of the episodes that end at the row currently being written.
+
+        Args:
+            env_ids: The environments that are done, ``[n]``.
+            hidden: Their ``H`` ``[n, M + T, d]``, detached (the snapshot the writer will be re-run on).
+            valid: Validity of every row of ``H``, ``[n, M + T]``.
+            trial_end: Whether the finished episode was the LAST of its trial, ``[n]``. If it was, the episode
+                that follows starts from ``z_init`` and this snapshot is not its source.
+
+        Chunks are appended in step order, which is what makes "the last snapshot wins" a plain sequence of
+        writes in :meth:`_commit_sources` (no duplicate-index scatter, no host sync).
+        """
+        if not self.has_memory or env_ids.numel() == 0:
+            return
+        self._snapshot_hidden.append(hidden.detach().to(self.device))
+        self._snapshot_valid.append(valid.to(device=self.device, dtype=torch.bool))
+        self._snapshot_envs.append(env_ids.to(device=self.device, dtype=torch.long))
+        self._snapshot_steps.append(torch.full((env_ids.numel(),), self.row, dtype=torch.long, device=self.device))
+        self._snapshot_trial_end.append(trial_end.reshape(-1).to(device=self.device, dtype=torch.bool))
+
     def add_transitions(self, transition: RolloutStorage.Transition) -> None:
         """Store the transition as usual, and push its frame (+ episode step) into the ring buffer."""
         slot = self.total_steps % self.ring_size
         self.frame_obs[slot].copy_(self.actor_obs(transition.observations))
         self.frame_positions[slot].copy_(self.episode_step)
+        if self.has_memory:
+            if self._pending_episode_index is None:
+                raise RuntimeError(
+                    "A memory storage needs stage_episode_index() before every add_transitions(): the row has to"
+                    " know which episode of its trial it was acted in. EpisodeContextPPO.process_env_step does it."
+                )
+            self.row_episode_index[self.row].copy_(self._pending_episode_index)
+            self._pending_episode_index = None
 
         super().add_transitions(transition)
 
@@ -123,6 +221,132 @@ class EpisodeContextRolloutStorage(RolloutStorage):
     # ------------------------------------------------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------------------------------------------------
+
+    def clear(self) -> None:
+        """Free the buffer for the next rollout, first folding this rollout's ``H`` snapshots into the sources.
+
+        The persistent slot must describe the rollout that is about to be COLLECTED, so it is advanced here --
+        after the update has consumed the generator, which needs the state as it was at the rollout's start.
+        """
+        if self.has_memory:
+            self._commit_sources()
+            self._clear_snapshots()
+        super().clear()
+
+    def _commit_sources(self) -> None:
+        """Make each environment's LAST finished episode of this rollout the source of the episode now running."""
+        for env_ids, hidden, valid, trial_end in zip(
+            self._snapshot_envs, self._snapshot_hidden, self._snapshot_valid, self._snapshot_trial_end
+        ):
+            # In step order, so a later done simply overwrites an earlier one. An environment appears at most
+            # once per chunk (one done per step), so no index inside a single write is duplicated.
+            self.source_hidden[env_ids] = hidden
+            self.source_valid[env_ids] = valid
+            # A trial end closes the chain: the next episode is episode 0 and reads z_init.
+            self.has_source[env_ids] = ~trial_end
+
+    def _snapshot_index(self) -> tuple[torch.Tensor, ...]:
+        """Flatten the rollout-local snapshots and index them by ``(row, environment)``.
+
+        Returns:
+            ``lookup`` ``[num_steps, num_envs]`` (the flat snapshot index of the done at that row, ``-1`` for no
+            done) plus the flattened ``hidden``, ``valid`` and ``trial_end``.
+        """
+        if not self._snapshot_envs:
+            empty = torch.zeros(0, self.hidden_span, self.d_model, device=self.device)
+            lookup = torch.full((self.num_transitions_per_env, self.num_envs), -1, dtype=torch.long, device=self.device)
+            return (
+                lookup,
+                empty,
+                torch.zeros(0, self.hidden_span, dtype=torch.bool, device=self.device),
+                torch.zeros(0, dtype=torch.bool, device=self.device),
+            )
+        envs = torch.cat(self._snapshot_envs)
+        steps = torch.cat(self._snapshot_steps)
+        hidden = torch.cat(self._snapshot_hidden)
+        valid = torch.cat(self._snapshot_valid)
+        trial_end = torch.cat(self._snapshot_trial_end)
+        lookup = torch.full((self.num_transitions_per_env, self.num_envs), -1, dtype=torch.long, device=self.device)
+        lookup[steps, envs] = torch.arange(envs.numel(), device=self.device)
+        return lookup, hidden, valid, trial_end
+
+    def _segment_sources(
+        self,
+        envs: slice,
+        window_positions: torch.Tensor,
+        lookup: torch.Tensor,
+        hidden: torch.Tensor,
+        valid: torch.Tensor,
+        trial_end: torch.Tensor,
+        num_prefix: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-segment memory sources of one environment chunk.
+
+        A segment is a maximal contiguous run of rows of ONE episode inside ``[prefix | window]``. Segment ``0``
+        holds the prefix (whose rows belong to the first window row's episode, and are inert for any other one)
+        plus every window row before the first episode start; every later segment opens at a window row whose
+        episode step is ``0``. The source of a segment is
+
+        * the environment's persistent source (the state at the START of this rollout) when the segment opens at
+          window row ``0`` or is segment ``0`` -- its episode began in an earlier rollout, or right at the
+          boundary,
+        * otherwise the ``H`` snapshotted at the row immediately before it, i.e. the episode that just ended.
+
+        A segment whose first window row carries ``episode_idx == 0`` has NO source: it is the first episode of a
+        trial, so its memory is ``z_init``.
+
+        Returns:
+            ``source_hidden`` ``[B, n_seg, M + T, d]``, ``source_valid`` ``[B, n_seg, M + T]``,
+            ``has_source`` ``[B, n_seg]`` and ``memory_segments`` ``[P + W, B]``.
+        """
+        num_steps, batch_size = window_positions.shape
+        device = self.device
+        starts = window_positions == 0  # [W, B]
+        window_segments = starts.long().cumsum(dim=0)  # prefix and everything before the first start are 0
+        num_segments = int(window_segments.max().item()) + 1
+
+        env_index = torch.arange(self.num_envs, device=device)[envs]  # [B]
+        rows = torch.arange(num_steps, device=device).unsqueeze(1)  # [W, 1]
+        # First window row of every segment; ``num_steps`` marks "this segment has no window row", which can only
+        # happen to segment 0 when the window opens exactly on an episode start.
+        first_row = torch.stack([
+            torch.where(window_segments == segment, rows, torch.full_like(rows, num_steps)).min(dim=0).values
+            for segment in range(num_segments)
+        ])  # [n_seg, B]
+        has_rows = first_row < num_steps
+        # Only a segment that opens strictly inside the window has its source among THIS rollout's snapshots.
+        from_snapshot = has_rows & (first_row > 0)
+        flat_index = lookup[(first_row - 1).clamp(min=0), env_index.unsqueeze(0).expand_as(first_row)]
+        from_snapshot = from_snapshot & (flat_index >= 0)
+        gather = flat_index.clamp(min=0)
+
+        persistent = self.source_hidden[env_index].unsqueeze(0).expand(num_segments, -1, -1, -1)
+        pick = from_snapshot.view(num_segments, batch_size, 1, 1)
+        source_hidden = torch.where(pick, hidden[gather] if hidden.numel() else persistent, persistent)
+        source_valid = torch.where(
+            pick.squeeze(-1),
+            valid[gather] if valid.numel() else self.source_valid[env_index].unsqueeze(0).expand(num_segments, -1, -1),
+            self.source_valid[env_index].unsqueeze(0).expand(num_segments, -1, -1),
+        )
+        has_source = torch.where(
+            from_snapshot,
+            ~trial_end[gather] if trial_end.numel() else self.has_source[env_index].unsqueeze(0).expand_as(has_rows),
+            self.has_source[env_index].unsqueeze(0).expand_as(has_rows),
+        )
+        # The authoritative statement of "this episode has a source" is the acting policy's own episode index,
+        # recorded per row. It agrees with the trial_end flag above; keeping both is what makes a mismatch a
+        # test failure rather than a silently wrong memory.
+        segment_episode_index = self.row_episode_index[first_row.clamp(max=num_steps - 1), env_index.unsqueeze(0)]
+        has_source = has_source & torch.where(has_rows, segment_episode_index > 0, has_source)
+
+        memory_segments = torch.zeros(num_prefix + num_steps, batch_size, dtype=torch.long, device=device)
+        memory_segments[num_prefix:] = window_segments
+        return (
+            source_hidden.transpose(0, 1),
+            source_valid.transpose(0, 1),
+            has_source.transpose(0, 1),
+            memory_segments,
+        )
 
     def context_slice(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The ``[prefix | window]`` frames of the rollout just collected, in temporal order.
@@ -150,7 +374,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         * the observation/action/target tensors as time-major ``[W, B, ...]`` slices of the rollout (no padding,
           no trajectory splitting: every row of every environment is live and is trained exactly once),
         * an :class:`EpisodeContextPrefix` in the actor's hidden-state slot and ``None`` in the critic's (the
-          critic is a context-free MLP),
+          critic is a context-free MLP). With a memory policy it additionally carries the per-segment source
+          episodes and the explicit segment ids (see :meth:`_segment_sources`),
         * ``masks_batch = None``: there is nothing to mask, which keeps the stock loss reductions exact.
         """
         if self.training_type != "rl":
@@ -173,6 +398,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
 
         # The slice is identical in every epoch (only the parameters move), so it is gathered once.
         prefix_obs, prefix_positions, window_positions = self.context_slice()
+        num_prefix = prefix_obs.shape[0]
+        snapshots = self._snapshot_index() if self.has_memory else None
 
         for _ in range(num_epochs):
             for i in range(num_mini_batches):
@@ -182,10 +409,23 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 stop = self.num_envs if i == num_mini_batches - 1 else (i + 1) * mini_batch_size
                 envs = slice(start, stop)
 
+                memory_fields: dict[str, torch.Tensor] = {}
+                if self.has_memory:
+                    source_hidden, source_valid, has_source, memory_segments = self._segment_sources(
+                        envs, window_positions[:, envs], *snapshots, num_prefix=num_prefix
+                    )
+                    memory_fields = dict(
+                        source_hidden=source_hidden,
+                        source_valid=source_valid,
+                        segment_has_source=has_source,
+                        memory_segments=memory_segments,
+                    )
+
                 hidden_state_a_batch = EpisodeContextPrefix(
                     obs=prefix_obs[:, envs],
                     positions=prefix_positions[:, envs],
                     window_positions=window_positions[:, envs],
+                    **memory_fields,
                 )
 
                 yield (
