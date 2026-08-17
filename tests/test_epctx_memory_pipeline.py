@@ -10,9 +10,9 @@ Self-contained: pure torch, no Isaac Sim / SimulationApp needed. Run with::
     source /home/yandabao/miniforge3/etc/profile.d/conda.sh && conda activate patlab
     python -m pytest tests/test_epctx_memory_pipeline.py -q
 
-``tests/test_epctx_trial_memory.py`` pins the model in isolation (identity at init, writer/read semantics, reset
-bookkeeping). This file pins the plumbing that carries a memory from the environment step where it is written to
-the minibatch where it is read:
+``tests/test_epctx_trial_memory.py`` pins the model in isolation (the ``z_init`` anchor of the write, writer/read
+semantics, reset bookkeeping). This file pins the plumbing that carries a memory from the environment step where
+it is written to the minibatch where it is read:
 
 * ``test_epoch_zero_canary_with_memory`` -- the load-bearing one. The acting path builds ``Z`` incrementally
   (``Z_1 = G(H_0)`` at the episode boundary, where ``H_0`` is the whole pass: the ``M`` memory rows plus the
@@ -332,12 +332,15 @@ def test_the_memory_is_load_bearing_in_the_update() -> None:
     assert bool(prefix.segment_has_source.any()), "no source in this minibatch; the test would be vacuous"
     with torch.no_grad():
         reference = policy.act(batch[0], hidden_state=prefix).clone()
+        # The corruption has to be non-affine: ``H`` reaches ``Z`` only through the writer's LayerNorms, so a
+        # constant shift (or a rescaling) of every feature is exactly invariant and would look like a leak.
+        noise = torch.randn(prefix.source_hidden.shape, generator=generator, device=DEVICE)
         wrecked = type(prefix)(
             obs=prefix.obs,
             positions=prefix.positions,
             window_positions=prefix.window_positions,
             memory_segments=prefix.memory_segments,
-            source_hidden=prefix.source_hidden + 3.0,
+            source_hidden=prefix.source_hidden + noise,
             source_valid=prefix.source_valid,
             segment_has_source=prefix.segment_has_source,
         )

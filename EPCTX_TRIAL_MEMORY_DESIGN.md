@@ -17,7 +17,8 @@ and the writer is one combined self+cross attention. Two consequences follow, bo
 * **Identity at init is gone.** Prepending M rows perturbs a loaded BC trunk from step 0. `z_init`
   and `memory_pos_embed` keep the small `std=0.02` init so the perturbation is small, but it is not
   zero and there is no test asserting it is. How much the BC policy actually moves is measured by
-  the closed-loop gate (roll the loaded ckpt, compare success), not by a unit test.
+  the closed-loop gate (roll the loaded ckpt, compare success), not by a unit test. What IS exact at
+  init is the WRITE: `Z_next == z_init`, so every episode of a trial opens the same way (below).
 * The trunk now receives gradient **through the memory rows** (they are real tokens), which is
   intended: the write objective can shape the trunk's representation of the memory.
 
@@ -64,20 +65,30 @@ memory-free policy (test-asserted).
 
 ## The writer
 
-`MemoryTokenWriter` (in actor_critic_episode_context.py), `Z_new = G(H)`:
+`MemoryTokenWriter` (in actor_critic_episode_context.py), `Z_new = z_init + delta(H)`:
 
 ```
-q     = LN_q(H[:, :M])          # the memory rows' trunk OUTPUTS of the pass that just ended
-k, v  = proj(LN_kv(H))          # ALL of H (memory rows + episode readouts), masked by validity
-Z     = H[:, :M] + MHA(q, k, v)
-Z     = Z + FF(LN_ff(Z))
+A      = MHA(LN_q(H[:, :M]), proj(LN_kv(H)))   # ALL of H as K/V, masked by validity — one softmax
+U      = H[:, :M] + A
+delta  = FF(LN_ff(U))                          # FF's FINAL linear: weight AND bias zero-initialized
+Z_next = z_init + delta                        # z_init = the policy's learned initial memory, [B, M, d]
 ```
 
 i.e. the self-attention (memory over memory) and the cross-attention (memory over the finished
-episode) are the SAME attention, as mandated. Output projections are residual-scaled like the trunk
-blocks. There is no artificial terminal token: the writer sees the readout of the final observation
-and, through `H[:, :M]`, the memory the episode ran with — which is what carries the recurrence
-`Z_{e+1} = G(trunk(Z_e), episode_e)` across a boundary.
+episode) are the SAME attention, as mandated. The attention output projection is residual-scaled like
+the trunk blocks. There is no artificial terminal token: the writer sees the readout of the final
+observation and, through `H[:, :M]`, the memory the episode ran with — which is what carries the
+recurrence `Z_{e+1} = G(trunk(Z_e), episode_e)` across a boundary.
+
+**z_init-anchored, delta zero at init (user-mandated, 2026-08-17).** The write is a residual on
+`z_init`, not on `H[:, :M]`, and the FF's output layer starts at exactly zero — so at initialization
+`delta == 0` and `Z_next == z_init` bit-for-bit, i.e. episode 2 of a trial is IDENTICAL to episode 1.
+The optimizer grows `delta` as the memory earns its influence. This replaces the earlier
+scale-anchored form (`Z = LN_out(H[:, :M] + attn + FF)` with the output-norm gain initialized to
+0.02), which is removed entirely — no flag, no fallback. The anchor is passed into the writer's
+`forward` as an argument (the module itself holds no `z_init`), and it is the DIFFERENTIABLE
+parameter: `z_init` therefore receives gradient through written segments as well as through
+episode-0 segments.
 
 On the acting path the write runs inside `reset()` under `no_grad` on the done environments'
 `H`, is detached into `Z`, and is followed by (trial reset →) history clear → prefill. Ordering
@@ -99,9 +110,10 @@ Kept: **cached frozen hidden states + in-graph writer.**
   `Z_seg = G(H_source)` computed **in-graph** with the CURRENT writer weights, where `H_source` is
   the cached, detached snapshot (the "stop grad on memory" is on H).
 - Gradient therefore trains: `MemoryTokenWriter`, `memory_pos_embed`, the trunk (both via its own
-  rows and via processing the M memory rows), and `z_init` — the last one through the SOURCE-FREE
-  segments only, since the writer queries the cached H rather than `z_init`. The source episode's
-  trunk gets no gradient through the memory path (it still trains from its own PPO rows).
+  rows and via processing the M memory rows), and `z_init` — the last one through BOTH the
+  source-free segments (which read it directly) and the written ones (through the writer's anchor).
+  The source episode's trunk gets no gradient through the memory path (it still trains from its own
+  PPO rows).
 - Costs accepted: H is stale by up to ~ceil((T+steps)/steps) ≈ 4 updates. Benefits: ring buffer
   stays `steps+min(L,T)` = 112 (no episode-1 raw obs needed at update), update compute grows only by
   the `n_seg * M` extra rows of the pass plus the tiny `M x (M+T)` writer attention, and the stock
@@ -149,9 +161,12 @@ Kept: **cached frozen hidden states + in-graph writer.**
    segment's rows equal a pass over that segment alone.
 4. Reset/trial bookkeeping: done → `Z = G(H)` (≠ z_init) + history cleared + prefill refreshed (the
    next step's output changes); trial done → `Z = z_init` + prefill.
-5. Grad flow: a segment-1 loss trains the writer, `memory_pos_embed` and the trunk block parameters;
-   `H_source` stays grad-free; `z_init` is trained by a source-free segment (see the note above).
-   A leaf `Z` receives gradient, i.e. the trunk really backpropagates into the memory rows.
+5. Grad flow: a segment-1 loss trains the writer, `memory_pos_embed`, the trunk block parameters AND
+   `z_init` (through the writer's anchor); `H_source` stays grad-free. A leaf `Z` receives gradient,
+   i.e. the trunk really backpropagates into the memory rows.
+5b. Anchor at init: a freshly built policy writes `Z_next == z_init` bit-for-bit, and its episode 2
+   reproduces episode 1 on identical observations; nudging the FF's output weight off zero moves both
+   `Z_next` and the downstream logits (non-degeneracy).
 6. End-to-end through `EpisodeContextPPO` + storage: epoch-0 canary (ratio == 1) across episode AND
    trial boundaries inside windows, plus a from-scratch replay of the whole history rebuilt by hand
    (`memory_readout(Z)` + episode readouts → `G`) with a memory-chain-cut vacuity guard.

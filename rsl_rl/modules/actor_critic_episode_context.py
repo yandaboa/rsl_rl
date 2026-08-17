@@ -26,16 +26,18 @@ changes (with the default ``memory_tokens=0`` not even a submodule is built):
   attending causally to memory rows ``<= i`` and every environment token attending to all ``M`` memory rows on
   top of its usual (episode-clipped, span-clipped) reach. There is no separate read layer and no gate: the
   memory is read by every block, exactly like any other token,
-* a :class:`MemoryTokenWriter` ``G`` run at every **episode** end, ``Z <- G(H)``, where ``H`` is the (detached)
-  snapshot of the trunk readouts of the pass that just finished -- the ``M`` memory rows FIRST, then the
-  episode's ``h_t``. The writer queries the memory rows and attends them over the whole of ``H`` (itself
+* a :class:`MemoryTokenWriter` ``G`` run at every **episode** end, ``Z <- z_init + delta(H)``, where ``H`` is the
+  (detached) snapshot of the trunk readouts of the pass that just finished -- the ``M`` memory rows FIRST, then
+  the episode's ``h_t``. The writer queries the memory rows and attends them over the whole of ``H`` (itself
   included), i.e. one combined self+cross attention, so the recurrence ``Z_{e+1} = G(trunk(Z_e), episode_e)``
-  is carried entirely by that snapshot.
+  is carried entirely by that snapshot. The write is anchored on ``z_init`` and ``delta`` is exactly zero at
+  init, so a freshly built policy runs episode 2 of a trial exactly as it runs episode 1.
 
 The episode context itself still never crosses a done; the memory is the only thing that does. Note that the
-memory is NOT an identity at init: prepending ``M`` rows to the sequence perturbs a BC'd trunk from the very
-first step (``z_init`` and ``memory_pos_embed`` are initialized small, ``std = 0.02``, so the perturbation is
-small -- how small is measured by the closed-loop gate, not asserted here).
+memory is NOT an identity at init *for the trunk*: prepending ``M`` rows to the sequence perturbs a BC'd trunk
+from the very first step (``z_init`` and ``memory_pos_embed`` are initialized small, ``std = 0.02``, so the
+perturbation is small -- how small is measured by the closed-loop gate, not asserted here). What IS exact at
+init is the write itself: episode 2 of a trial sees the same ``Z`` episode 1 did.
 
 The **critic** has two designs, selected by ``critic_design``:
 
@@ -83,27 +85,26 @@ _NOISE_PARAM_NAME = {"scalar": "std", "log": "log_std", "gsde": "log_std"}
 
 
 class MemoryTokenWriter(nn.Module):
-    """The writer ``G``: ``Z_new = G(H)``, one combined self+cross attention over the trunk's own output.
+    """The writer ``G``: ``Z_new = anchor + delta(H)``, one combined self+cross attention over the trunk's output.
 
     ``H`` ``[B, M + T, d]`` is the snapshot of one finished pass: the ``M`` memory rows the pass was prefixed
     with, followed by the episode's per-step readouts. The queries are the memory rows of ``H`` -- so the writer
     attends the memory *to itself and to the episode that just ran*, in one attention::
 
-        q     = LN_q(H[:, :M])                 # the memory rows' trunk outputs
-        k, v  = proj(LN_kv(H))                 # ALL of H, masked by validity
-        Z     = H[:, :M] + MHA(q, k, v)
-        Z     = Z + FF(LN_ff(Z))
-        Z     = LN_out(Z)                      # gain init 0.02: written Z lands at z_init's scale
+        A     = MHA(LN_q(H[:, :M]), proj(LN_kv(H)))   # ALL of H as keys/values, masked by validity
+        U     = H[:, :M] + A
+        delta = FF(LN_ff(U))                          # FF's final linear (weight AND bias) is zero-initialized
+        Z     = anchor + delta                        # anchor = the policy's learned z_init
 
     That single ``M x (M + T)`` attention is the whole recurrence: ``Z_{e+1}`` depends on ``Z_e`` through the
     trunk outputs of ``Z_e``'s rows, which is exactly what the (detached, cached) ``H`` carries at update time.
 
-    ``LN_out`` exists because ``Z`` is consumed as an INPUT token of the next pass. The residual base
-    ``H[:, :M]`` is a post-``final_norm`` trunk output, whose per-row norm is ~``sqrt(d)`` -- ~58x the scale of
-    ``z_init`` (std 0.02) and of every input token a BC'd trunk has ever seen. Without the output norm, episode
-    2 of every trial runs on wildly out-of-distribution prefix rows (measured: BC closed-loop success 84% -> 55%
-    at init). With the gain initialized to 0.02, a written ``Z`` starts at exactly ``z_init``'s scale and the
-    optimizer grows the gain as the memory earns its influence.
+    The write is anchored on ``z_init``, not on ``H[:, :M]``: ``Z`` is consumed as an INPUT token of the next
+    pass, and a post-``final_norm`` trunk row has norm ~``sqrt(d)`` -- ~58x the scale of ``z_init`` and of every
+    input token a BC'd trunk has ever seen. Because ``delta`` is exactly zero at initialization,
+    ``Z_new == anchor`` bit-for-bit and episode 2 of a trial starts out identical to episode 1; the optimizer
+    grows ``delta`` as the memory earns its influence. The anchor stays differentiable, so a written segment
+    trains ``z_init`` as well.
     """
 
     def __init__(self, d_model: int, num_heads: int, ff_dim: int, activation: str) -> None:
@@ -115,14 +116,22 @@ class MemoryTokenWriter(nn.Module):
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_dim), resolve_nn_activation(activation), nn.Linear(ff_dim, d_model)
         )
-        # Output norm with a SMALL initial gain -- see the class docstring for why this is load-bearing.
-        self.norm_out = nn.LayerNorm(d_model)
-        nn.init.constant_(self.norm_out.weight, 0.02)
+        self.zero_delta_init()
+
+    def zero_delta_init(self) -> None:
+        """Zero the FF's output layer, i.e. make the write an exact no-op relative to its anchor.
+
+        The owning policy re-applies this AFTER its own global initialization sweep, which would otherwise
+        overwrite these zeros with the GPT-style normal init.
+        """
+        nn.init.zeros_(self.ff[-1].weight)
+        nn.init.zeros_(self.ff[-1].bias)
 
     def forward(
         self,
         hidden: torch.Tensor,
         num_memory: int,
+        anchor: torch.Tensor,
         mask: torch.Tensor | None = None,
         need_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -131,6 +140,8 @@ class MemoryTokenWriter(nn.Module):
         Args:
             hidden: ``H`` ``[B, M + S, d]``: the memory rows first, then the episode's readouts.
             num_memory: ``M``, how many leading rows of ``hidden`` are the memory.
+            anchor: The learned "no memory yet" rows the write is relative to, ``[M, d]`` or ``[B, M, d]`` (the
+                policy's ``z_init``). Passed in rather than owned here: the writer stays stateless.
             mask: Validity of every row of ``H``, ``[B, M + S]``. Rows that are ``False`` cannot influence ``Z``.
                 The memory rows themselves are always valid (they are written by the prefill).
             need_weights: Whether to also return the ``[B, num_heads, M, M + S]`` attention weights.
@@ -153,9 +164,8 @@ class MemoryTokenWriter(nn.Module):
         attended, weights = self.attn(
             self.norm_query(queries), keys, values, attn_mask=attn_mask, need_weights=need_weights
         )
-        memory = queries + attended
-        memory = memory + self.ff(self.norm_ff(memory))
-        return self.norm_out(memory), weights
+        delta = self.ff(self.norm_ff(queries + attended))
+        return anchor.to(device=delta.device, dtype=delta.dtype) + delta, weights
 
 
 @dataclass(frozen=True)
@@ -421,7 +431,9 @@ class ActorCriticEpisodeContext(nn.Module):
         nn.init.normal_(self.start_embed, mean=0.0, std=0.02)
         if self.num_memory_tokens > 0:
             self.writer.attn.out_proj.weight.data.mul_(residual_scale)
-            self.writer.ff[-1].weight.data.mul_(residual_scale)
+            # ... but the writer's FF output goes back to exactly zero: ``Z_new = z_init + delta`` with
+            # ``delta == 0`` at init, so a written memory starts out indistinguishable from ``z_init``.
+            self.writer.zero_delta_init()
             # Small, like every other embedding: the memory rows are ordinary tokens of the trunk's sequence, so
             # this is what keeps their step-0 perturbation of a BC'd trunk small (it is NOT zero -- there is no
             # identity-at-init in this design).
@@ -555,14 +567,15 @@ class ActorCriticEpisodeContext(nn.Module):
         mask: torch.Tensor | None = None,
         need_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply the writer ``G``: ``Z_{e+1} = G(H_e)``. See :class:`MemoryTokenWriter` for the shapes.
+        """Apply the writer ``G``: ``Z_{e+1} = z_init + delta(H_e)``. See :class:`MemoryTokenWriter` for the shapes.
 
         ``H_e`` ``[B, M + S, d]`` is one finished pass -- the ``M`` memory rows first, then the episode's
         readouts. This is what the update path calls **in graph** on the cached (detached) ``H`` of the source
-        episode, so that the writer gets a gradient while the source episode's trunk does not.
+        episode, so that the writer gets a gradient while the source episode's trunk does not. The anchor is the
+        DIFFERENTIABLE ``z_init``, so a written segment trains it too.
         """
         self._assert_memory_enabled()
-        return self.writer(hidden, self.num_memory_tokens, mask=mask, need_weights=need_weights)
+        return self.writer(hidden, self.num_memory_tokens, self.z_init, mask=mask, need_weights=need_weights)
 
     def memory_from_prefix(self, prefix: EpisodeContextPrefix) -> torch.Tensor | None:
         """Turn a minibatch's cached source episodes into the per-segment ``Z`` ``[B, n_seg, M, d]``, IN GRAPH.
@@ -575,9 +588,10 @@ class ActorCriticEpisodeContext(nn.Module):
 
         ``H_seg`` is the detached snapshot the storage took when that episode ended -- and because the memory
         rows of that pass are its first ``M`` rows, the whole recurrence ``Z_{e+1} = G(trunk(Z_e), episode_e)``
-        rides in it. The gradient therefore trains the writer (and, through the source-free segments, ``z_init``)
-        but never the source episode's trunk. The writer is batched over the ``B x n_seg`` segments that actually
-        have a source and the result is scattered back, so the padded ones cost nothing.
+        rides in it. The gradient therefore trains the writer, and ``z_init`` through BOTH kinds of segment (the
+        source-free ones read it directly, the written ones through the writer's anchor), but never the source
+        episode's trunk. The writer is batched over the ``B x n_seg`` segments that actually have a source and
+        the result is scattered back, so the padded ones cost nothing.
 
         Note: the chain is one write off ``z_init``, i.e. it reproduces the acting path exactly for
         ``episodes_per_trial = 2`` (the validated configuration). With ``K > 2`` a segment of episode ``e > 1``

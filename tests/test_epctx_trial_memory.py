@@ -19,12 +19,15 @@ episode end by a writer that attends the memory rows over the whole finished pas
   path (memory rows really in the sequence) agree to floating-point noise. That is what makes the PPO
   reconstruction canary possible at all.
 * ``test_grad_flow_through_the_writer``: a loss on the rows of the *second* segment of a window trains the
-  writer, ``memory_pos_embed`` and the trunk THROUGH the memory rows, while the cached ``H`` of the source
-  episode stays out of the graph; ``z_init`` is trained by the source-free segments.
+  writer, ``memory_pos_embed``, the trunk THROUGH the memory rows and ``z_init`` (the writer's anchor), while
+  the cached ``H`` of the source episode stays out of the graph.
+* ``test_written_memory_is_z_init_at_init``: the write is ``Z_next = z_init + delta`` with ``delta`` exactly
+  zero at initialization, so a fresh policy's episode 2 is bit-for-bit its episode 1.
 
-There is deliberately NO identity-at-init test: prepending rows to the sequence perturbs a loaded BC trunk from
-the first step by construction (the user's decision). ``z_init``/``memory_pos_embed`` keep the small ``0.02``
-init so the perturbation is small; how small is a closed-loop question, not a unit test.
+There is deliberately NO identity-at-init test for the TRUNK: prepending rows to the sequence perturbs a loaded
+BC trunk from the first step by construction (the user's decision). ``z_init``/``memory_pos_embed`` keep the
+small ``0.02`` init so the perturbation is small; how small is a closed-loop question, not a unit test. What is
+exact at init is the write, above.
 """
 
 from __future__ import annotations
@@ -261,6 +264,61 @@ def test_segments_are_isolated() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# B2. The write is anchored on z_init
+# --------------------------------------------------------------------------------------------------
+
+
+def test_written_memory_is_z_init_at_init() -> None:
+    """A freshly built writer writes exactly ``z_init``: ``delta`` is zero, so episode 2 == episode 1."""
+    policy = _make_policy(memory_tokens=MEMORY_TOKENS, seed=5, perturb=False)
+    generator = torch.Generator(device=DEVICE).manual_seed(101)
+    obs = torch.randn(T_EPISODE, NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    z_init = policy.z_init.detach()
+    expanded = z_init.unsqueeze(0).expand(NUM_ENVS, -1, -1)
+
+    policy.initialize_state(NUM_ENVS, DEVICE, dtype=torch.float64)
+    with torch.no_grad():
+        first = torch.stack([policy.forward_step(obs[step], commit=True) for step in range(T_EPISODE)])
+        hidden, valid = policy.get_episode_hidden()
+        written, _ = policy.write_memory(hidden, mask=valid)
+    assert torch.equal(written, expanded), "the write is not bit-for-bit z_init at init"
+
+    # The acting write feeds the prefill of the next pass, so the whole second episode of the trial has to
+    # reproduce the first one frame for frame on identical observations.
+    with torch.no_grad():
+        dones = torch.ones(NUM_ENVS, dtype=torch.bool, device=DEVICE)
+        policy.reset(dones, torch.zeros(NUM_ENVS, dtype=torch.bool, device=DEVICE))
+        assert torch.equal(policy.memory, expanded), "the acting path's Z moved off z_init at init"
+        second = torch.stack([policy.forward_step(obs[step], commit=True) for step in range(T_EPISODE)])
+    error = (second - first).abs().max().item()
+    assert error < 1e-12, f"episode 2 differs from episode 1 at init by {error:.3e}"
+    print(f"[ok] at init the write is exactly z_init and episode 2 == episode 1: max |dh| = {error:.3e}")
+
+
+def test_a_nonzero_delta_moves_the_memory_and_the_policy() -> None:
+    """Nudge the FF's output layer off zero: ``Z_next`` leaves ``z_init`` and the logits it feeds move."""
+    policy = _make_policy(memory_tokens=MEMORY_TOKENS, seed=5, perturb=False)
+    generator = torch.Generator(device=DEVICE).manual_seed(103)
+    hidden = torch.randn(
+        NUM_ENVS, MEMORY_TOKENS + T_EPISODE, policy.d_model, generator=generator, dtype=torch.float64, device=DEVICE
+    )
+    window = torch.randn(NUM_ENVS, T_EPISODE, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    z_init = policy.z_init.detach()
+
+    with torch.no_grad():
+        anchored, _ = policy.write_memory(hidden)
+        assert torch.equal(anchored, z_init.unsqueeze(0).expand(NUM_ENVS, -1, -1))
+        before = policy.action_mean_from_hidden(policy.forward_window(window, memory=anchored.unsqueeze(1)))
+        weight = policy.writer.ff[-1].weight
+        weight.add_(0.5 * torch.randn(weight.shape, generator=generator, dtype=weight.dtype, device=DEVICE))
+        moved, _ = policy.write_memory(hidden)
+        after = policy.action_mean_from_hidden(policy.forward_window(window, memory=moved.unsqueeze(1)))
+    assert (moved - z_init).abs().max().item() > 1e-6, "delta stayed zero after the nudge"
+    assert (after - before).abs().max().item() > 1e-9, "the written memory never reached the actions"
+    print("[ok] a nonzero delta writes a memory that is not z_init and that changes the policy")
+
+
+# --------------------------------------------------------------------------------------------------
 # C. Reset / trial bookkeeping
 # --------------------------------------------------------------------------------------------------
 
@@ -350,7 +408,10 @@ def test_trial_dones_default_to_dones() -> None:
 
 
 def test_grad_flow_through_the_writer() -> None:
-    """A loss on the second segment trains the writer, the memory embedding and the trunk -- not the cached H."""
+    """A loss on the second segment trains the writer, the memory embedding, the trunk and ``z_init``.
+
+    Not the cached ``H``: the storage snapshots it detached and it must stay out of the graph.
+    """
     policy = _memory_twin(_make_policy(memory_tokens=0, seed=4), seed=5)
     policy.zero_grad(set_to_none=True)
     generator = torch.Generator(device=DEVICE).manual_seed(23)
@@ -381,6 +442,11 @@ def test_grad_flow_through_the_writer() -> None:
         "writer.attn.q_proj.weight": policy.writer.attn.q_proj.weight,
         "writer.attn.v_proj.weight": policy.writer.attn.v_proj.weight,
         "writer.ff.0.weight": policy.writer.ff[0].weight,
+        # The FF's output layer: its own weight is trained even from a zero start, because its INPUT is nonzero.
+        "writer.ff.2.weight": policy.writer.ff[-1].weight,
+        "writer.ff.2.bias": policy.writer.ff[-1].bias,
+        # ``z_init`` is the writer's anchor, so a WRITTEN segment trains it too (not just source-free ones).
+        "z_init": policy.z_init,
         # The trunk itself, which now processes the memory rows as ordinary tokens.
         "blocks.0.attn.k_proj.weight": policy.blocks[0].attn.k_proj.weight,
         "blocks.1.ff.0.weight": policy.blocks[1].ff[0].weight,
@@ -389,16 +455,14 @@ def test_grad_flow_through_the_writer() -> None:
         assert parameter.grad is not None, f"{name} got no gradient"
         assert parameter.grad.abs().max().item() > 0.0, f"{name}'s gradient is exactly zero"
     assert source_hidden.grad is None, "a gradient reached the cached source episode"
-    # ``z_init`` is NOT in segment 1's graph by construction: the writer queries the cached H, not z_init. It is
-    # trained by the segments that have no source -- here, segment 0.
-    assert policy.z_init.grad is None or policy.z_init.grad.abs().max().item() == 0.0
 
+    # ... and a source-free segment reaches z_init directly, the way it always did.
     policy.zero_grad(set_to_none=True)
     policy.action_mean_from_hidden(hidden[:, :T_EPISODE]).sum().backward()
     assert policy.z_init.grad is not None and policy.z_init.grad.abs().max().item() > 0.0, (
         "a source-free segment did not train z_init"
     )
-    print("[ok] the writer, memory_pos_embed and the trunk are trained through the memory rows; H stays out")
+    print("[ok] the writer, memory_pos_embed, the trunk and z_init are trained through the memory rows; H stays out")
 
 
 def test_gradient_reaches_the_memory_rows() -> None:
@@ -426,6 +490,8 @@ if __name__ == "__main__":
     test_memory_only_adds_memory_parameters()
     test_step_matches_window_with_memory()
     test_the_memory_changes_the_policy()
+    test_written_memory_is_z_init_at_init()
+    test_a_nonzero_delta_moves_the_memory_and_the_policy()
     test_segments_are_isolated()
     test_reset_writes_and_trial_reset_restores()
     test_trial_dones_default_to_dones()
