@@ -10,7 +10,11 @@ attends over ``x_{t-L+1} .. x_t`` (clipped at the episode start), where ``L`` is
 
 .. code::
 
-    x_t = Embed(o_t) + pos_embed[episode_step_t] + [episode_step_t == 0] * start_embed
+    x_t = Embed(o_t) + [episode_step_t == 0] * start_embed
+
+Position enters through RoPE inside the attention (queries and keys are rotated by their episode step), not
+through a learned table, so the trunk is shift-invariant and has no positional capacity to run out of.
+``start_embed`` stays: RoPE is relative, so it is the only absolute "this is step 0" signal.
 
 There is no reward/done channel: the single-step policy observation already carries the previous action, and the
 context never crosses an episode boundary. That makes the whole model a function of ``(frames since the episode
@@ -259,9 +263,9 @@ class ActorCriticEpisodeContext(nn.Module):
             d_model: Trunk width.
             num_layers: Number of trunk layers.
             num_heads: Number of attention heads.
-            max_episode_length: ``T``, the number of control steps in one episode. Sizes the positional
-                embedding table; episode steps beyond it are clamped (on BOTH forward paths, so they stay
-                consistent).
+            max_episode_length: ``T``, the number of control steps in one episode. Positions are RoPE'd, so
+                this bounds the buffers only (the KV cache / :attr:`context_span`, the writer's ``H``
+                history), NOT how far the positional encoding reaches: an episode may overrun ``T``.
             ff_mult: Feed-forward expansion factor.
             embed_hidden_dims: Hidden dims of the token embedding. Empty means a single linear layer.
             actor_hidden_dims: Hidden dims of the policy head (consumes the trunk readout ``h_t``).
@@ -333,7 +337,6 @@ class ActorCriticEpisodeContext(nn.Module):
             self.token_embed = nn.Linear(num_actor_obs, d_model)
         else:
             self.token_embed = MLP(num_actor_obs, d_model, list(embed_hidden_dims), activation)
-        self.pos_embed = nn.Parameter(torch.zeros(self.max_episode_length, d_model))
         self.start_embed = nn.Parameter(torch.zeros(d_model))
 
         # Trunk
@@ -427,7 +430,6 @@ class ActorCriticEpisodeContext(nn.Module):
         for block in self.blocks:
             block.attn.out_proj.weight.data.mul_(residual_scale)
             block.ff[-1].weight.data.mul_(residual_scale)
-        nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
         nn.init.normal_(self.start_embed, mean=0.0, std=0.02)
         if self.num_memory_tokens > 0:
             self.writer.attn.out_proj.weight.data.mul_(residual_scale)
@@ -485,7 +487,7 @@ class ActorCriticEpisodeContext(nn.Module):
 
     def initialize_state(self, num_envs: int, device: torch.device | str, dtype: torch.dtype | None = None) -> None:
         """Allocate the acting-time KV cache for ``num_envs`` environments (all episodes start at step 0)."""
-        dtype = self.pos_embed.dtype if dtype is None else dtype
+        dtype = self.start_embed.dtype if dtype is None else dtype
         span = self.context_span
         self._num_envs = num_envs
         self._key_cache = [
@@ -703,6 +705,8 @@ class ActorCriticEpisodeContext(nn.Module):
         """
         index = torch.arange(self.num_memory_tokens, device=rows.device)
         attn_mask = (index.unsqueeze(1) >= index.unsqueeze(0)).unsqueeze(0)
+        # Position 0 for every memory row, as in the batched pass -- an identity rotation, spelled out.
+        rope_pos = torch.zeros(rows.shape[0], self.num_memory_tokens, device=rows.device, dtype=torch.long)
         all_keys: list[torch.Tensor] = []
         all_values: list[torch.Tensor] = []
         hidden = rows
@@ -710,7 +714,7 @@ class ActorCriticEpisodeContext(nn.Module):
             normed, keys, values = block.token_kv(hidden)
             all_keys.append(keys)
             all_values.append(values)
-            hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
+            hidden = block.token_forward(hidden, normed, keys, values, attn_mask, q_pos=rope_pos, k_pos=rope_pos)
         return self.final_norm(hidden), all_keys, all_values
 
     def memory_readout(self, memory: torch.Tensor) -> torch.Tensor:
@@ -822,14 +826,14 @@ class ActorCriticEpisodeContext(nn.Module):
     # --------------------------------------------------------------------------------------------------------
 
     def _embed_tokens(self, obs: torch.Tensor, positions: torch.Tensor, normalize_obs: bool = True) -> torch.Tensor:
-        """``x = Embed(o) + pos_embed[step] + [step == 0] * start_embed``. All inputs share their leading dims."""
+        """``x = Embed(o) + [step == 0] * start_embed``. All inputs share their leading dims.
+
+        The step itself is not embedded here: it is applied as RoPE inside the attention, so ``positions`` only
+        supplies the episode-start flag on this path (and needs no clamping -- RoPE takes any integer).
+        """
         if normalize_obs:
             obs = self.actor_obs_normalizer(obs)
         tokens = self.token_embed(obs)
-        # Steps past the table are clamped rather than rejected, identically on both forward paths: an
-        # environment that overruns T must not make the two disagree (nor crash a 16k-env run).
-        clamped = positions.clamp(max=self.max_episode_length - 1)
-        tokens = tokens + self.pos_embed[clamped]
         is_start = (positions == 0).unsqueeze(-1).to(tokens.dtype)
         return tokens + is_start * self.start_embed
 
@@ -888,6 +892,7 @@ class ActorCriticEpisodeContext(nn.Module):
         tokens = self._embed_tokens(obs, positions, normalize_obs)
         hidden = tokens.transpose(0, 1)  # [B, S, d]
         attn_mask = self._window_attn_mask(positions, key_valid, segments)
+        rope_pos = positions.transpose(0, 1)  # [B, S]
         num_memory_rows = 0
         if self.num_memory_tokens > 0:
             memory = self._prepare_memory(memory, hidden.shape[0], hidden.device)
@@ -897,9 +902,13 @@ class ActorCriticEpisodeContext(nn.Module):
             num_memory_rows = memory_rows.shape[1]
             attn_mask = self._memory_prefix_mask(attn_mask, memory.shape[1], memory_segments.transpose(0, 1))
             hidden = torch.cat([memory_rows, hidden], dim=1)
+            # Every memory row sits at position 0 (identity rotation), on both sides of the attention:
+            # ``memory_pos_embed`` is what tells the rows apart, RoPE must not add a second ordering.
+            memory_pos = torch.zeros(hidden.shape[0], num_memory_rows, device=rope_pos.device, dtype=rope_pos.dtype)
+            rope_pos = torch.cat([memory_pos, rope_pos], dim=1)
         for block in self.blocks:
             normed, keys, values = block.token_kv(hidden)
-            hidden = block.token_forward(hidden, normed, keys, values, attn_mask)
+            hidden = block.token_forward(hidden, normed, keys, values, attn_mask, q_pos=rope_pos, k_pos=rope_pos)
         hidden = self.final_norm(hidden)
         assert hidden.shape[1] == num_memory_rows + num_steps
         return hidden[:, num_memory_rows:].transpose(0, 1)
@@ -1073,6 +1082,13 @@ class ActorCriticEpisodeContext(nn.Module):
 
         slots = torch.remainder(positions, self.context_span)
         scatter_index = slots.view(num_envs, 1, 1).expand(num_envs, 1, self.d_model)
+        # RoPE positions of the assembled keys. The cache stores UN-rotated K/V, so a slot is rotated by the
+        # position it holds; ``-1`` (empty) is clamped to 0 -- those slots are masked out as not fresh anyway.
+        step_pos = positions.view(num_envs, 1)
+        key_pos = torch.cat([cache_positions.clamp(min=0), step_pos], dim=1)
+        if self.num_memory_tokens > 0:
+            memory_pos = torch.zeros(num_envs, self.num_memory_tokens, device=obs.device, dtype=torch.long)
+            key_pos = torch.cat([memory_pos, key_pos], dim=1)
         hidden = tokens
         for layer, block in enumerate(self.blocks):
             normed, keys, values = block.token_kv(hidden)
@@ -1082,7 +1098,7 @@ class ActorCriticEpisodeContext(nn.Module):
             else:
                 all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
                 all_values = torch.cat([self._value_cache[layer], values], dim=1)
-            hidden = block.token_forward(hidden, normed, all_keys, all_values, attn_mask)
+            hidden = block.token_forward(hidden, normed, all_keys, all_values, attn_mask, step_pos, key_pos)
             if commit:
                 self._key_cache[layer].scatter_(1, scatter_index, keys.detach())
                 self._value_cache[layer].scatter_(1, scatter_index, values.detach())
@@ -1309,9 +1325,22 @@ class ActorCriticEpisodeContext(nn.Module):
                 " [d_model, num_actions] matrix and a 'scalar'/'log' one a [num_actions] vector."
             )
 
+    @staticmethod
+    def _drop_learned_position_table(state_dict: dict) -> dict:
+        """Strip a pre-RoPE checkpoint's learned ``pos_embed`` table, loudly. ``memory_pos_embed`` is kept."""
+        stale = [key for key in state_dict if key.endswith("pos_embed") and not key.endswith("memory_pos_embed")]
+        if not stale:
+            return state_dict
+        print(
+            "[ActorCriticEpisodeContext] WARNING: checkpoint was trained with a LEARNED position table"
+            f" ({', '.join(stale)}); this trunk uses RoPE and will NOT reproduce it. Dropping the table."
+        )
+        return {key: value for key, value in state_dict.items() if key not in stale}
+
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         """Load the parameters of the actor-critic model. Returns whether this resumes a previous training."""
         self._check_noise_std_compatible(state_dict)
+        state_dict = self._drop_learned_position_table(state_dict)
         super().load_state_dict(state_dict, strict=strict)
         self._reset_runtime_state()
         if self.noise_std_type == "gsde":

@@ -521,7 +521,7 @@ def test_shared_trunk_value_gradients_reach_the_trunk() -> None:
     generator = torch.Generator(device=DEVICE).manual_seed(23)
     frames = torch.randn(T_EPISODE, NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
     positions = torch.arange(T_EPISODE, device=DEVICE).unsqueeze(1).expand(T_EPISODE, NUM_ENVS)
-    trunk_names = ("token_embed", "blocks", "final_norm", "pos_embed", "start_embed")
+    trunk_names = ("token_embed", "blocks", "final_norm", "start_embed")
 
     for detach in (False, True):
         policy = _make_shared_policy(detach_critic_trunk=detach, seed=7)
@@ -572,6 +572,114 @@ def test_privileged_evaluate_is_unchanged() -> None:
     print("[ok] critic_design='privileged' is byte-unchanged behavior")
 
 
+# --------------------------------------------------------------------------------------------------
+# RoPE
+# --------------------------------------------------------------------------------------------------
+
+
+def _make_rope_policy(
+    context_length: int, memory_tokens: int = 0, num_envs: int = 2, seed: int = 3
+) -> ActorCriticEpisodeContext:
+    """Small float64 policy for the RoPE tests, optionally with cross-episode memory rows."""
+    torch.manual_seed(seed)
+    sample_obs = TensorDict({"policy": torch.zeros(num_envs, OBS_DIM)}, batch_size=[num_envs], device=DEVICE)
+    policy = ActorCriticEpisodeContext(
+        obs=sample_obs,
+        obs_groups={"policy": ["policy"], "critic": ["policy"]},
+        num_actions=ACTION_DIM,
+        actor_obs_normalization=False,
+        context_length=context_length,
+        d_model=32,
+        num_layers=2,
+        num_heads=4,
+        max_episode_length=T_EPISODE,
+        ff_mult=2,
+        actor_hidden_dims=[16],
+        critic_hidden_dims=[16],
+        init_noise_std=0.5,
+        memory_tokens=memory_tokens,
+        episodes_per_trial=2,
+    )
+    # Off the initialization, or the trunk is near-identity and the comparison below is vacuous.
+    with torch.no_grad():
+        for name, parameter in policy.named_parameters():
+            if name in ("std", "log_std"):
+                continue
+            parameter.add_(0.1 * torch.randn_like(parameter))
+    return policy.double().eval()
+
+
+def test_rope_kv_cache_matches_full_sequence() -> None:
+    """RoPE rotates cached keys at READ time, so the KV cache must still reproduce a cache-free full pass.
+
+    Two consecutive episodes (positions restart at 0 on the reset) through (1) the stateful per-step path and
+    (2) one batched pass over the whole sequence with the same explicit positions, compared on the ACTION MEAN.
+    """
+    num_envs = 2
+    num_steps = 2 * T_EPISODE
+    generator = torch.Generator(device=DEVICE).manual_seed(101)
+    obs = torch.randn(num_steps, num_envs, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    dones = torch.zeros(num_steps, num_envs, dtype=torch.bool, device=DEVICE)
+    dones[T_EPISODE - 1] = True  # both envs restart together, so the two segments line up
+    positions = _positions_from_dones(dones)
+
+    cases = (
+        ("L >= T, no memory", T_EPISODE, 0),
+        ("sliding L = 5 < T, no memory", 5, 0),
+        ("sliding L = 5 < T, M = 2", 5, 2),
+    )
+    for label, context_length, memory_tokens in cases:
+        policy = _make_rope_policy(context_length, memory_tokens=memory_tokens, num_envs=num_envs)
+        policy.initialize_state(num_envs, DEVICE, dtype=torch.float64)
+        segment_memory = []
+        stepwise = []
+        with torch.no_grad():
+            for step in range(num_steps):
+                if memory_tokens > 0 and (step == 0 or dones[step - 1].all()):
+                    segment_memory.append(policy._memory.clone())  # what this segment's prefix rows hold
+                stepwise.append(policy.actor(policy.forward_step(obs[step], commit=True)))
+                # Explicit (all-false) trial dones: the default is "every episode is its own trial", which
+                # would restore z_init and leave the second segment's memory indistinguishable from the first.
+                policy.reset(dones[step], torch.zeros_like(dones[step]))
+            memory = None if memory_tokens == 0 else torch.stack(segment_memory, dim=1)  # [B, n_seg, M, d]
+            if memory is not None:
+                assert memory.shape[1] == 2 and not torch.equal(memory[:, 0], memory[:, 1]), (
+                    "the writer left the second segment's memory untouched -- the memory case is vacuous"
+                )
+            batched = policy.actor(policy.forward_sequence(obs, positions=positions, memory=memory))
+        error = (torch.stack(stepwise) - batched).abs().max().item()
+        assert error < 1e-5, f"KV cache vs full sequence ({label}): {error:.3e}"
+        assert torch.stack(stepwise).abs().max().item() > 1e-3, "the comparison is vacuous"
+        print(f"[ok] RoPE KV cache == full sequence, {label}: max |d mean| = {error:.3e}")
+
+
+def test_rope_is_shift_invariant() -> None:
+    """The whole point of RoPE: only RELATIVE positions matter, so a constant offset changes nothing.
+
+    Neither sequence starts at episode step 0 (both are mid-episode), so ``start_embed`` -- the one absolute
+    signal left in the model -- is off on both sides and an exact shift is well defined. The old learned table
+    fails this by construction.
+    """
+    policy = _make_rope_policy(context_length=T_EPISODE, memory_tokens=0)
+    generator = torch.Generator(device=DEVICE).manual_seed(41)
+    obs = torch.randn(T_EPISODE, NUM_ENVS, OBS_DIM, generator=generator, dtype=torch.float64, device=DEVICE)
+    # Start past ``context_span - 1`` so every row's reach (and hence the mask) is the same on both sides.
+    base = T_EPISODE - 1 + torch.arange(T_EPISODE, device=DEVICE).unsqueeze(1).expand(T_EPISODE, NUM_ENVS)
+
+    with torch.no_grad():
+        here = policy.forward_sequence(obs, positions=base)
+        shifted = policy.forward_sequence(obs, positions=base + 7)
+    error = (here - shifted).abs().max().item()
+    assert error < 1e-5, f"a constant position shift moved the readout by {error:.3e}"
+    assert here.abs().max().item() > 1e-3, "the comparison is vacuous"
+
+    # ... and the trunk is not simply position-blind: reversing the frames must change the readout.
+    with torch.no_grad():
+        reversed_obs = policy.forward_sequence(obs.flip(0), positions=base)
+    assert (here[-1] - reversed_obs[-1]).abs().max().item() > 1e-6, "the trunk ignores order entirely"
+    print(f"[ok] RoPE shift invariance: max |dh| under a +7 offset = {error:.3e}")
+
+
 if __name__ == "__main__":
     test_step_matches_window()
     test_window_is_episode_local_and_span_limited()
@@ -583,4 +691,6 @@ if __name__ == "__main__":
     test_shared_trunk_value_uses_the_actor_context()
     test_shared_trunk_value_gradients_reach_the_trunk()
     test_privileged_evaluate_is_unchanged()
+    test_rope_kv_cache_matches_full_sequence()
+    test_rope_is_shift_invariant()
     print("all episode-context policy tests passed")

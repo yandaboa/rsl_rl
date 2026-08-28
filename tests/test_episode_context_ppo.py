@@ -341,7 +341,7 @@ def test_shared_trunk_value_loss_trains_the_trunk_through_ppo() -> None:
         trunk_before = {
             name: parameter.detach().clone()
             for name, parameter in policy.named_parameters()
-            if name.startswith(("token_embed", "blocks", "final_norm", "pos_embed", "start_embed"))
+            if name.startswith(("token_embed", "blocks", "final_norm", "start_embed"))
         }
         ppo.update()
 

@@ -46,6 +46,7 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.modules.actor_critic import GSDENoiseDistribution, upcast_from_half
+from rsl_rl.modules.rope import apply_rope, rope_cos_sin
 from rsl_rl.networks import MLP, EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
 
@@ -101,6 +102,8 @@ class MultiHeadAttention(nn.Module):
         values: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         need_weights: bool = False,
+        q_pos: torch.Tensor | None = None,
+        k_pos: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Attend ``query_input`` ``[B, Lq, d]`` (pre-projection) over projected ``keys``/``values`` ``[B, Lk, d]``.
 
@@ -110,6 +113,9 @@ class MultiHeadAttention(nn.Module):
             values: Already projected values.
             attn_mask: Boolean mask, ``True`` where the (query, key) pair may attend. ``[Lq, Lk]`` or ``[B, Lq, Lk]``.
             need_weights: Whether to also return the attention weights ``[B, num_heads, Lq, Lk]``.
+            q_pos: RoPE positions of the queries, ``[B, Lq]``. ``None`` (the default) means no rotation.
+            k_pos: RoPE positions of the keys, ``[B, Lk]``. Keys are rotated at READ time, so a KV cache can
+                keep storing un-rotated keys and hand their stored positions in here.
 
         Returns:
             The attention output ``[B, Lq, d]`` and, if requested, the attention weights.
@@ -117,6 +123,10 @@ class MultiHeadAttention(nn.Module):
         query = self._split_heads(self.q_proj(query_input))
         key = self._split_heads(keys)
         value = self._split_heads(values)
+        if q_pos is not None:
+            query = apply_rope(query, *rope_cos_sin(q_pos, self.head_dim, dtype=query.dtype))
+        if k_pos is not None:
+            key = apply_rope(key, *rope_cos_sin(k_pos, self.head_dim, dtype=key.dtype))
         mask = None if attn_mask is None else self._expand_mask(attn_mask)
 
         if need_weights:
@@ -170,9 +180,15 @@ class TrunkBlock(nn.Module):
         keys: torch.Tensor,
         values: torch.Tensor,
         attn_mask: torch.Tensor | None,
+        q_pos: torch.Tensor | None = None,
+        k_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Finish the block for the environment tokens, given the assembled ``[memory | tokens]`` keys/values."""
-        attended, _ = self.attn(normed, keys, values, attn_mask=attn_mask)
+        """Finish the block for the environment tokens, given the assembled ``[memory | tokens]`` keys/values.
+
+        ``q_pos``/``k_pos`` are the RoPE positions of the query rows and of the assembled key rows; ``None``
+        (the default, what :class:`ActorCriticTrialMemory` passes) means no rotation.
+        """
+        attended, _ = self.attn(normed, keys, values, attn_mask=attn_mask, q_pos=q_pos, k_pos=k_pos)
         hidden = hidden + attended
         return hidden + self.ff(self.norm_ff(hidden))
 
