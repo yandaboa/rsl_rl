@@ -55,6 +55,13 @@ The **critic** has two designs, selected by ``critic_design``:
   :meth:`evaluate` for how each of the three call sites (collection, terminal bootstrap, minibatch) is served.
   By default the value loss backpropagates into the trunk (faithful to 225077); ``detach_critic_trunk=True``
   cuts that gradient.
+* ``"separate_trunk"`` -- a second, independent transformer pathway over the SAME (non-privileged) observation,
+  ending in the same value head. Every module of it is named ``critic_*`` (``critic_token_embed``,
+  ``critic_start_embed``, ``critic_blocks``, ``critic_final_norm``, ``critic_memory_pos_embed``) so that a
+  critic-only warm-up (which freezes every parameter whose name does not start with ``critic``) trains the whole
+  value function end to end, and no actor parameter is reachable from the value loss. It mirrors the actor's KV
+  cache, so values still come off the acting path during collection; the cross-episode memory ``Z`` is not
+  duplicated and enters the critic pathway detached.
 
 Two forward paths, required to agree numerically:
 
@@ -278,9 +285,11 @@ class ActorCriticEpisodeContext(nn.Module):
                 ``log_std`` keyed on the trunk readout, exactly as in the trial-memory policy).
             normalizer_until: ``until`` of the observation normalizers (number of samples after which the
                 statistics freeze). ``None`` keeps updating forever.
-            critic_design: ``"privileged"`` (a separate single-step MLP on the critic observation group) or
+            critic_design: ``"privileged"`` (a separate single-step MLP on the critic observation group),
                 ``"shared_trunk"`` (a value head on the actor trunk's ``h_t``, i.e. the critic conditions on the
-                same episode context as the actor and is NOT privileged).
+                same episode context as the actor and is NOT privileged) or ``"separate_trunk"`` (its own
+                ``critic_*`` transformer over the same observation, so the value loss reaches no actor
+                parameter).
             detach_critic_trunk: Only meaningful with ``critic_design="shared_trunk"``. When ``True``, ``h_t`` is
                 detached before the value head, so the value loss trains the head alone. Defaults to ``False``
                 (the value loss shapes the trunk too, as in run 225077).
@@ -298,8 +307,11 @@ class ActorCriticEpisodeContext(nn.Module):
             )
         super().__init__()
 
-        if critic_design not in ("privileged", "shared_trunk"):
-            raise ValueError(f"Unknown critic_design: {critic_design!r}. Should be 'privileged' or 'shared_trunk'.")
+        if critic_design not in ("privileged", "shared_trunk", "separate_trunk"):
+            raise ValueError(
+                f"Unknown critic_design: {critic_design!r}. Should be 'privileged', 'shared_trunk' or"
+                " 'separate_trunk'."
+            )
         self.critic_design = critic_design
         self.detach_critic_trunk = bool(detach_critic_trunk)
 
@@ -310,9 +322,9 @@ class ActorCriticEpisodeContext(nn.Module):
             num_actor_obs += obs[obs_group].shape[-1]
         num_critic_obs = 0
         for obs_group in obs_groups.get("critic", obs_groups["policy"]):
-            # With a shared trunk the critic groups are never read, so a configuration that points the critic at
+            # Neither trunk-based critic reads the critic groups, so a configuration that points the critic at
             # the policy group (or at a group this environment does not even publish) is tolerated.
-            if critic_design == "shared_trunk" and obs_group not in obs:
+            if critic_design in ("shared_trunk", "separate_trunk") and obs_group not in obs:
                 continue
             assert len(obs[obs_group].shape) == 2, "The ActorCriticEpisodeContext module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
@@ -361,8 +373,24 @@ class ActorCriticEpisodeContext(nn.Module):
         # (uwlab's critic-warmup freezes every parameter NOT named ``critic*``/``_crit*``, and the BC strict-load
         # tolerance drops mismatched ``critic.*`` keys).
         self.actor = MLP(d_model, num_actions, list(actor_hidden_dims), activation)
-        critic_input_dim = d_model if self.critic_design == "shared_trunk" else num_critic_obs
+        critic_input_dim = num_critic_obs if self.critic_design == "privileged" else d_model
         self.critic = MLP(critic_input_dim, 1, list(critic_hidden_dims), activation)
+
+        # ``separate_trunk``: a second token pathway of the same shape, on the same observation. Every module is
+        # named ``critic_*`` so a critic-only warm-up trains all of it. ``z_init`` and the writer are NOT
+        # duplicated -- there is one memory, and it enters this pathway detached.
+        if self.critic_design == "separate_trunk":
+            if len(embed_hidden_dims) == 0:
+                self.critic_token_embed = nn.Linear(num_actor_obs, d_model)
+            else:
+                self.critic_token_embed = MLP(num_actor_obs, d_model, list(embed_hidden_dims), activation)
+            self.critic_start_embed = nn.Parameter(torch.zeros(d_model))
+            self.critic_blocks = nn.ModuleList([
+                TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)
+            ])
+            self.critic_final_norm = nn.LayerNorm(d_model)
+            if self.num_memory_tokens > 0:
+                self.critic_memory_pos_embed = nn.Parameter(torch.zeros(self.num_memory_tokens, d_model))
 
         # Observation normalization. Attribute names match ActorCritic so that train.py's --freeze_obs_norm
         # handling (which pokes ``actor_obs_normalizer`` / ``critic_obs_normalizer``) works unchanged.
@@ -412,6 +440,11 @@ class ActorCriticEpisodeContext(nn.Module):
                 f"Critic head (shared trunk, detach={self.detach_critic_trunk}, conditions on the same episode"
                 f" context as the actor): {self.critic}"
             )
+        elif self.critic_design == "separate_trunk":
+            print(
+                f"Critic head (SEPARATE critic_* trunk: L={num_layers} d={d_model} over the same observation,"
+                f" no actor parameter in the value graph): {self.critic}"
+            )
         else:
             print(f"Critic MLP (privileged, {num_critic_obs}-d observation): {self.critic}")
 
@@ -441,19 +474,33 @@ class ActorCriticEpisodeContext(nn.Module):
             # identity-at-init in this design).
             nn.init.normal_(self.memory_pos_embed, mean=0.0, std=0.02)
             nn.init.normal_(self.z_init, mean=0.0, std=0.02)
+        if self.critic_design == "separate_trunk":
+            for block in self.critic_blocks:
+                block.attn.out_proj.weight.data.mul_(residual_scale)
+                block.ff[-1].weight.data.mul_(residual_scale)
+            nn.init.normal_(self.critic_start_embed, mean=0.0, std=0.02)
+            if self.num_memory_tokens > 0:
+                nn.init.normal_(self.critic_memory_pos_embed, mean=0.0, std=0.02)
 
     _RUNTIME_STATE_ATTRS: tuple[str, ...] = (
         "_num_envs",
         "_key_cache",
         "_value_cache",
+        "_critic_key_cache",
+        "_critic_value_cache",
         "_cache_positions",
         "_positions",
         "_last_hidden",
+        "_last_critic_hidden",
         "_window_hidden",
         "_window_hidden_obs",
+        "_critic_window_hidden",
+        "_critic_window_hidden_obs",
         "_memory",
         "_memory_key_cache",
         "_memory_value_cache",
+        "_critic_memory_key_cache",
+        "_critic_memory_value_cache",
         "_hidden_history",
         "_history_valid",
         "_episode_index",
@@ -464,16 +511,24 @@ class ActorCriticEpisodeContext(nn.Module):
         self._num_envs: int | None = None
         self._key_cache: list[torch.Tensor] | None = None
         self._value_cache: list[torch.Tensor] | None = None
+        # ``separate_trunk`` only: the critic pathway's own mirror of the KV cache. The step schedule
+        # (``_cache_positions`` / ``_positions``) is SHARED -- both pathways consume the same frames.
+        self._critic_key_cache: list[torch.Tensor] | None = None
+        self._critic_value_cache: list[torch.Tensor] | None = None
         # Episode step stored in every cache slot, ``-1`` for an empty slot. Slot ``p % context_span`` holds
         # position ``p``, so a slot that has fallen out of the window is simply overwritten.
         self._cache_positions: torch.Tensor | None = None
         self._positions: torch.Tensor | None = None
         self._last_hidden: torch.Tensor | None = None
+        self._last_critic_hidden: torch.Tensor | None = None
         # Update path (shared-trunk critic only): the ``h`` the last :meth:`act` computed for a minibatch, kept
         # together with the observation object it came from so that :meth:`evaluate` can prove it is looking at
         # the same minibatch before reusing it (``ppo.py`` calls ``act`` then ``evaluate`` on the same object).
         self._window_hidden: torch.Tensor | None = None
         self._window_hidden_obs: Any = None
+        # Same, for the separate critic pathway -- filled by :meth:`evaluate` (the actor never computes it).
+        self._critic_window_hidden: torch.Tensor | None = None
+        self._critic_window_hidden_obs: Any = None
         # Memory state (all ``None`` with ``memory_tokens=0``): the per-environment ``Z``, the per-layer K/V of
         # its ``M`` prefix rows (refreshed by the prefill at every write, never evicted by the episode ring),
         # the readouts of the pass in progress + their validity, and how many episodes of the current trial are
@@ -481,6 +536,8 @@ class ActorCriticEpisodeContext(nn.Module):
         self._memory: torch.Tensor | None = None
         self._memory_key_cache: list[torch.Tensor] | None = None
         self._memory_value_cache: list[torch.Tensor] | None = None
+        self._critic_memory_key_cache: list[torch.Tensor] | None = None
+        self._critic_memory_value_cache: list[torch.Tensor] | None = None
         self._hidden_history: torch.Tensor | None = None
         self._history_valid: torch.Tensor | None = None
         self._episode_index: torch.Tensor | None = None
@@ -501,6 +558,16 @@ class ActorCriticEpisodeContext(nn.Module):
         self._last_hidden = None
         self._window_hidden = None
         self._window_hidden_obs = None
+        self._last_critic_hidden = None
+        self._critic_window_hidden = None
+        self._critic_window_hidden_obs = None
+        if self.critic_design == "separate_trunk":
+            self._critic_key_cache = [
+                torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.num_layers)
+            ]
+            self._critic_value_cache = [
+                torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.num_layers)
+            ]
         if self.num_memory_tokens > 0:
             self._memory = self.z_init.detach().to(device=device, dtype=dtype).unsqueeze(0).repeat(num_envs, 1, 1)
             self._memory_key_cache = [
@@ -516,6 +583,15 @@ class ActorCriticEpisodeContext(nn.Module):
             )
             self._history_valid = torch.zeros(num_envs, self.hidden_history_span, device=device, dtype=torch.bool)
             self._episode_index = torch.zeros(num_envs, device=device, dtype=torch.long)
+            if self.critic_design == "separate_trunk":
+                self._critic_memory_key_cache = [
+                    torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
+                    for _ in range(self.num_layers)
+                ]
+                self._critic_memory_value_cache = [
+                    torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
+                    for _ in range(self.num_layers)
+                ]
             # Every episode opens with the memory rows already in the sequence, so their K/V (and their rows of
             # ``H``) have to exist before the first environment token is stepped.
             self._prefill_memory(torch.arange(num_envs, device=device))
@@ -654,14 +730,15 @@ class ActorCriticEpisodeContext(nn.Module):
         """Segment index of every row of ``[S, B]`` episode steps: a row at step 0 opens the next segment."""
         return ((positions == 0).long().cumsum(dim=0) - 1).clamp(min=0)
 
-    def _memory_token_input(self, memory: torch.Tensor) -> torch.Tensor:
+    def _memory_token_input(self, memory: torch.Tensor, critic: bool = False) -> torch.Tensor:
         """The trunk's INPUT rows for a memory ``[B, n_seg, M, d]``: ``Z_i + memory_pos_embed[i]``, flattened.
 
         No ``start_embed`` and no episode positional embedding -- a memory row is not a frame of the episode, it
         is its own kind of token and :attr:`memory_pos_embed` is the only thing that tells the rows apart.
         """
+        memory_pos_embed = self._pathway(critic)[2]
         batch_size, num_segments = memory.shape[0], memory.shape[1]
-        return (memory + self.memory_pos_embed).reshape(batch_size, num_segments * self.num_memory_tokens, -1)
+        return (memory + memory_pos_embed).reshape(batch_size, num_segments * self.num_memory_tokens, -1)
 
     def _memory_prefix_mask(self, token_mask: torch.Tensor, num_segments: int, segments: torch.Tensor) -> torch.Tensor:
         """Grow a token-only mask ``[B, S, S]`` into the full ``[B, nM + S, nM + S]`` of ``[memory | tokens]``.
@@ -693,7 +770,9 @@ class ActorCriticEpisodeContext(nn.Module):
         )
         return torch.cat([top, torch.cat([token_memory, token_mask], dim=2)], dim=1)
 
-    def _memory_trunk(self, rows: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    def _memory_trunk(
+        self, rows: torch.Tensor, critic: bool = False
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         """Push the ``M`` memory INPUT rows ``[B, M, d]`` through the trunk on their own.
 
         The memory rows attend causally to each other and to nothing else, so this is exactly what a full pass
@@ -703,6 +782,7 @@ class ActorCriticEpisodeContext(nn.Module):
         Returns:
             Their readouts ``[B, M, d]`` (rows ``0 .. M - 1`` of ``H``) and the per-layer keys and values.
         """
+        _, _, _, blocks, final_norm = self._pathway(critic)
         index = torch.arange(self.num_memory_tokens, device=rows.device)
         attn_mask = (index.unsqueeze(1) >= index.unsqueeze(0)).unsqueeze(0)
         # Position 0 for every memory row, as in the batched pass -- an identity rotation, spelled out.
@@ -710,12 +790,12 @@ class ActorCriticEpisodeContext(nn.Module):
         all_keys: list[torch.Tensor] = []
         all_values: list[torch.Tensor] = []
         hidden = rows
-        for block in self.blocks:
+        for block in blocks:
             normed, keys, values = block.token_kv(hidden)
             all_keys.append(keys)
             all_values.append(values)
             hidden = block.token_forward(hidden, normed, keys, values, attn_mask, q_pos=rope_pos, k_pos=rope_pos)
-        return self.final_norm(hidden), all_keys, all_values
+        return final_norm(hidden), all_keys, all_values
 
     def memory_readout(self, memory: torch.Tensor) -> torch.Tensor:
         """Rows ``0 .. M - 1`` of the ``H`` a pass with this ``Z`` ``[B, M, d]`` produces -- what the writer queries.
@@ -746,6 +826,15 @@ class ActorCriticEpisodeContext(nn.Module):
         # The memory rows are the first M rows of H, exactly as the writer (and the storage) expect them.
         self._hidden_history[env_ids, : self.num_memory_tokens] = hidden.detach().to(self._hidden_history.dtype)
         self._history_valid[env_ids, : self.num_memory_tokens] = True
+        if self.critic_design == "separate_trunk":
+            # The critic pathway reads the same ``Z`` through its own weights, so it needs its own prefix K/V.
+            # Its readouts are NOT recorded in ``H``: the writer stays actor-only.
+            with torch.no_grad():
+                rows = self._memory_token_input(self._memory[env_ids].unsqueeze(1), critic=True)
+                _, keys, values = self._memory_trunk(rows, critic=True)
+                for layer in range(self.num_layers):
+                    self._critic_memory_key_cache[layer][env_ids] = keys[layer].detach()
+                    self._critic_memory_value_cache[layer][env_ids] = values[layer].detach()
 
     # --------------------------------------------------------------------------------------------------------
     # Distribution / observation helpers
@@ -825,17 +914,47 @@ class ActorCriticEpisodeContext(nn.Module):
     # Token embedding + batched (update) path
     # --------------------------------------------------------------------------------------------------------
 
-    def _embed_tokens(self, obs: torch.Tensor, positions: torch.Tensor, normalize_obs: bool = True) -> torch.Tensor:
+    def _pathway(self, critic: bool = False) -> tuple[Any, ...]:
+        """``(token_embed, start_embed, memory_pos_embed, blocks, final_norm)`` of the requested pathway.
+
+        ``critic=True`` selects the ``critic_*`` duplicate, which only exists with
+        ``critic_design="separate_trunk"``. ``memory_pos_embed`` is ``None`` when the policy has no memory.
+        """
+        if not critic:
+            return (
+                self.token_embed,
+                self.start_embed,
+                getattr(self, "memory_pos_embed", None),
+                self.blocks,
+                self.final_norm,
+            )
+        if self.critic_design != "separate_trunk":
+            raise RuntimeError("The critic token pathway only exists with critic_design='separate_trunk'.")
+        return (
+            self.critic_token_embed,
+            self.critic_start_embed,
+            getattr(self, "critic_memory_pos_embed", None),
+            self.critic_blocks,
+            self.critic_final_norm,
+        )
+
+    def _embed_tokens(
+        self, obs: torch.Tensor, positions: torch.Tensor, normalize_obs: bool = True, critic: bool = False
+    ) -> torch.Tensor:
         """``x = Embed(o) + [step == 0] * start_embed``. All inputs share their leading dims.
 
         The step itself is not embedded here: it is applied as RoPE inside the attention, so ``positions`` only
         supplies the episode-start flag on this path (and needs no clamping -- RoPE takes any integer).
+
+        Both pathways normalize with the SAME ``actor_obs_normalizer``: there is one observation stream, and the
+        normalizer holds buffers only, so nothing differentiable is shared by this.
         """
+        token_embed, start_embed, _, _, _ = self._pathway(critic)
         if normalize_obs:
             obs = self.actor_obs_normalizer(obs)
-        tokens = self.token_embed(obs)
+        tokens = token_embed(obs)
         is_start = (positions == 0).unsqueeze(-1).to(tokens.dtype)
-        return tokens + is_start * self.start_embed
+        return tokens + is_start * start_embed
 
     def _window_attn_mask(
         self,
@@ -880,6 +999,7 @@ class ActorCriticEpisodeContext(nn.Module):
         segments: torch.Tensor | None = None,
         memory: torch.Tensor | None = None,
         memory_segments: torch.Tensor | None = None,
+        critic: bool = False,
     ) -> torch.Tensor:
         """One causal pass over ``[S, B, obs_dim]`` with per-row episode steps ``[S, B]``. Returns ``h [S, B, d]``.
 
@@ -888,17 +1008,21 @@ class ActorCriticEpisodeContext(nn.Module):
         front of the tokens (``[mem_seg_0 | ... | mem_seg_{n-1} | tokens]``), run through every block, and only
         the token rows are returned. The trunk therefore processes -- and is trained through -- the memory.
         """
+        _, _, _, blocks, final_norm = self._pathway(critic)
         num_steps = obs.shape[0]
-        tokens = self._embed_tokens(obs, positions, normalize_obs)
+        tokens = self._embed_tokens(obs, positions, normalize_obs, critic)
         hidden = tokens.transpose(0, 1)  # [B, S, d]
         attn_mask = self._window_attn_mask(positions, key_valid, segments)
         rope_pos = positions.transpose(0, 1)  # [B, S]
         num_memory_rows = 0
         if self.num_memory_tokens > 0:
             memory = self._prepare_memory(memory, hidden.shape[0], hidden.device)
+            if critic:
+                # The writer, ``z_init`` and the actor trunk that produced ``Z`` must never see a value gradient.
+                memory = memory.detach()
             if memory_segments is None:
                 memory_segments = self._segments_from_positions(positions)
-            memory_rows = self._memory_token_input(memory).to(hidden.dtype)
+            memory_rows = self._memory_token_input(memory, critic).to(hidden.dtype)
             num_memory_rows = memory_rows.shape[1]
             attn_mask = self._memory_prefix_mask(attn_mask, memory.shape[1], memory_segments.transpose(0, 1))
             hidden = torch.cat([memory_rows, hidden], dim=1)
@@ -906,10 +1030,10 @@ class ActorCriticEpisodeContext(nn.Module):
             # ``memory_pos_embed`` is what tells the rows apart, RoPE must not add a second ordering.
             memory_pos = torch.zeros(hidden.shape[0], num_memory_rows, device=rope_pos.device, dtype=rope_pos.dtype)
             rope_pos = torch.cat([memory_pos, rope_pos], dim=1)
-        for block in self.blocks:
+        for block in blocks:
             normed, keys, values = block.token_kv(hidden)
             hidden = block.token_forward(hidden, normed, keys, values, attn_mask, q_pos=rope_pos, k_pos=rope_pos)
-        hidden = self.final_norm(hidden)
+        hidden = final_norm(hidden)
         assert hidden.shape[1] == num_memory_rows + num_steps
         return hidden[:, num_memory_rows:].transpose(0, 1)
 
@@ -932,6 +1056,7 @@ class ActorCriticEpisodeContext(nn.Module):
         positions: torch.Tensor | None = None,
         memory: torch.Tensor | None = None,
         memory_segments: torch.Tensor | None = None,
+        critic: bool = False,
     ) -> torch.Tensor:
         """Run a window of frames through the trunk in ONE causal pass. Two calling conventions:
 
@@ -962,6 +1087,9 @@ class ActorCriticEpisodeContext(nn.Module):
         derives the segments from the episode steps. With a prefix, ``memory=None`` first looks at the prefix: an
         explicit ``prefix.memory``, else the cached source episodes it carries, which are written into a ``Z``
         in-graph by :meth:`memory_from_prefix` -- the PPO update path.
+
+        ``critic=True`` runs the ``critic_*`` pathway instead (``critic_design="separate_trunk"`` only); the
+        memory it reads is the same ``Z``, detached.
         """
         if isinstance(seg_mask, EpisodeContextPrefix):  # tolerate a positional prefix
             prefix, seg_mask = seg_mask, None
@@ -987,6 +1115,7 @@ class ActorCriticEpisodeContext(nn.Module):
                 segments=segments.transpose(0, 1),
                 memory=memory,
                 memory_segments=None if memory_segments is None else memory_segments.transpose(0, 1),
+                critic=critic,
             )
             return hidden.transpose(0, 1)
 
@@ -1012,6 +1141,7 @@ class ActorCriticEpisodeContext(nn.Module):
             normalize_obs=False,
             memory=memory,
             memory_segments=prefix.memory_segments if memory_segments is None else memory_segments,
+            critic=critic,
         )
         return hidden[num_prefix:]
 
@@ -1022,6 +1152,7 @@ class ActorCriticEpisodeContext(nn.Module):
         normalize_obs: bool = True,
         positions: torch.Tensor | None = None,
         memory: torch.Tensor | None = None,
+        critic: bool = False,
     ) -> torch.Tensor:
         """One whole episode (starting at step 0) in a single batched forward -- what a BC script wants.
 
@@ -1033,6 +1164,7 @@ class ActorCriticEpisodeContext(nn.Module):
             positions: Optional explicit episode steps ``[S, B]``. Defaults to ``0, 1, ... S - 1``.
             memory: Optional ``Z`` ``[B, M, d]`` for the episode (``memory_tokens > 0`` only). ``None`` means
                 ``z_init``, i.e. the first episode of a trial.
+            critic: Run the ``critic_*`` pathway (``critic_design="separate_trunk"`` only).
 
         Returns:
             ``h`` ``[S, B, d]``.
@@ -1045,26 +1177,39 @@ class ActorCriticEpisodeContext(nn.Module):
         if positions is None:
             positions = torch.arange(num_steps, device=sequence.device).unsqueeze(1).expand(num_steps, batch_size)
         key_valid = None if mask is None else mask.bool()
-        return self._forward_tokens(sequence, positions, normalize_obs, key_valid, memory=memory)
+        return self._forward_tokens(sequence, positions, normalize_obs, key_valid, memory=memory, critic=critic)
 
     # --------------------------------------------------------------------------------------------------------
     # Incremental (collection) path
     # --------------------------------------------------------------------------------------------------------
 
     def forward_step(
-        self, obs: TensorDict | torch.Tensor, commit: bool = True, normalize_obs: bool = True
+        self,
+        obs: TensorDict | torch.Tensor,
+        commit: bool = True,
+        normalize_obs: bool = True,
+        critic: bool = False,
     ) -> torch.Tensor:
         """Advance the acting path by one frame and return ``h_t`` ``[num_envs, d]``.
 
         No Python branch on any tensor value (no ``.item()`` / ``.any()``), so the hot path never syncs the GPU.
         With ``commit=False`` the frame is not written to the KV cache.
+
+        ``critic=True`` (``critic_design="separate_trunk"`` only) runs the ``critic_*`` pathway against its own
+        KV-cache mirror. The episode-step schedule is SHARED, and only the actor's commit advances it, so a
+        frame's critic step has to run before its actor step -- see :meth:`act`.
         """
+        _, _, _, blocks, final_norm = self._pathway(critic)
         obs = self.get_actor_obs(obs)
         num_envs = obs.shape[0]
         self._ensure_state(num_envs, obs.device, obs.dtype)
+        key_cache = self._critic_key_cache if critic else self._key_cache
+        value_cache = self._critic_value_cache if critic else self._value_cache
+        memory_key_cache = self._critic_memory_key_cache if critic else self._memory_key_cache
+        memory_value_cache = self._critic_memory_value_cache if critic else self._memory_value_cache
 
         positions = self._positions
-        tokens = self._embed_tokens(obs.unsqueeze(1), positions.unsqueeze(1), normalize_obs)  # [N, 1, d]
+        tokens = self._embed_tokens(obs.unsqueeze(1), positions.unsqueeze(1), normalize_obs, critic)  # [N, 1, d]
 
         # Keys visible to this query: every cached frame of this episode still inside the context span, plus
         # itself. Slot p % span holds position p, so a slot that has fallen out of the span has already been
@@ -1090,20 +1235,24 @@ class ActorCriticEpisodeContext(nn.Module):
             memory_pos = torch.zeros(num_envs, self.num_memory_tokens, device=obs.device, dtype=torch.long)
             key_pos = torch.cat([memory_pos, key_pos], dim=1)
         hidden = tokens
-        for layer, block in enumerate(self.blocks):
+        for layer, block in enumerate(blocks):
             normed, keys, values = block.token_kv(hidden)
             if self.num_memory_tokens > 0:
-                all_keys = torch.cat([self._memory_key_cache[layer], self._key_cache[layer], keys], dim=1)
-                all_values = torch.cat([self._memory_value_cache[layer], self._value_cache[layer], values], dim=1)
+                all_keys = torch.cat([memory_key_cache[layer], key_cache[layer], keys], dim=1)
+                all_values = torch.cat([memory_value_cache[layer], value_cache[layer], values], dim=1)
             else:
-                all_keys = torch.cat([self._key_cache[layer], keys], dim=1)
-                all_values = torch.cat([self._value_cache[layer], values], dim=1)
+                all_keys = torch.cat([key_cache[layer], keys], dim=1)
+                all_values = torch.cat([value_cache[layer], values], dim=1)
             hidden = block.token_forward(hidden, normed, all_keys, all_values, attn_mask, step_pos, key_pos)
             if commit:
-                self._key_cache[layer].scatter_(1, scatter_index, keys.detach())
-                self._value_cache[layer].scatter_(1, scatter_index, values.detach())
-        hidden = self.final_norm(hidden).squeeze(1)
+                key_cache[layer].scatter_(1, scatter_index, keys.detach())
+                value_cache[layer].scatter_(1, scatter_index, values.detach())
+        hidden = final_norm(hidden).squeeze(1)
 
+        if commit and critic:
+            # Only the critic's own cache moves: the step counters, ``H`` and the writer belong to the actor.
+            self._last_critic_hidden = hidden
+            return hidden
         if commit:
             self._cache_positions.scatter_(1, slots.view(num_envs, 1), positions.view(num_envs, 1))
             self._positions = positions + 1
@@ -1128,14 +1277,21 @@ class ActorCriticEpisodeContext(nn.Module):
         returned instead of a fresh sample: sampling ``[W, B, A]`` would burn RNG and memory for nothing.
         """
         if hidden_state is None:
+            if self.critic_design == "separate_trunk":
+                # BEFORE the actor's commit: the two pathways share the episode-step counters, which the actor's
+                # commit advances, and the critic mirror has to consume this frame at the same position.
+                self.forward_step(obs, commit=True, critic=True)
             hidden = self.forward_step(obs, commit=True)
             self._window_hidden, self._window_hidden_obs = None, None
+            self._critic_window_hidden, self._critic_window_hidden_obs = None, None
             self._update_distribution(hidden)
             return self.distribution.sample()
         hidden = self.forward_window(obs, prefix=hidden_state)
         # Hand this ``h`` to the value head instead of re-running the trunk: with a shared trunk, ``ppo.py``'s
         # ``evaluate(obs_batch, ...)`` two lines below MUST see exactly the states the surrogate loss saw.
         self._window_hidden, self._window_hidden_obs = hidden, obs
+        # A separate critic runs its own pass; ``evaluate`` fills this in for the minibatch it is called on.
+        self._critic_window_hidden, self._critic_window_hidden_obs = None, None
         self._update_distribution(hidden)
         return self.distribution.mean
 
@@ -1147,8 +1303,9 @@ class ActorCriticEpisodeContext(nn.Module):
         """Value from a trunk readout produced by either forward path (``critic_design="shared_trunk"`` only)."""
         if self.critic_design != "shared_trunk":
             raise RuntimeError(
-                "value_from_hidden() is meaningless with critic_design='privileged': the value head consumes the"
-                " critic observation, not the trunk readout. Call evaluate(obs) instead."
+                f"value_from_hidden() is meaningless with critic_design={self.critic_design!r}: the value head"
+                " consumes the critic observation ('privileged') or the critic_* trunk's own readout"
+                " ('separate_trunk'), not the actor's. Call evaluate(obs) instead."
             )
         return self.critic(hidden.detach() if self.detach_critic_trunk else hidden)
 
@@ -1188,6 +1345,36 @@ class ActorCriticEpisodeContext(nn.Module):
             return self._last_hidden
         return self.forward_step(actor_obs, commit=False)
 
+    def _critic_hidden_for_value(
+        self,
+        obs: TensorDict | torch.Tensor,
+        hidden_state: EpisodeContextPrefix | None,
+        use_cached_hidden: bool,
+    ) -> torch.Tensor:
+        """The ``critic_*`` pathway's readout, for the same three call sites as :meth:`_hidden_for_value`.
+
+        The critic runs its own pass, so unlike the shared trunk it cannot reuse anything :meth:`act` left
+        behind: the update minibatch needs the prefix in the CRITIC hidden-state slot (which the episode-context
+        storage yields there), the collection step reads the mirror :meth:`act` committed one call earlier, and
+        the terminal bootstrap peeks the frame with ``commit=False``.
+        """
+        if use_cached_hidden and self._critic_window_hidden is not None and obs is self._critic_window_hidden_obs:
+            return self._critic_window_hidden
+        if hidden_state is not None:
+            hidden = self.forward_window(obs, prefix=hidden_state, critic=True)
+            self._critic_window_hidden, self._critic_window_hidden_obs = hidden, obs
+            return hidden
+        actor_obs = self.get_actor_obs(obs)
+        if actor_obs.dim() != 2:
+            raise RuntimeError(
+                "A separate-trunk value for a batched window needs the window's context: pass the"
+                " EpisodeContextPrefix as hidden_state (what the episode-context storage yields)."
+            )
+        cached = self._last_critic_hidden
+        if use_cached_hidden and cached is not None and cached.shape[0] == actor_obs.shape[0]:
+            return cached
+        return self.forward_step(actor_obs, commit=False, critic=True)
+
     def evaluate(
         self,
         obs: TensorDict | torch.Tensor,
@@ -1200,12 +1387,15 @@ class ActorCriticEpisodeContext(nn.Module):
 
         With ``critic_design="privileged"`` this is a context-free MLP on the (privileged) critic observation.
         With ``"shared_trunk"`` the value is read off the SAME episode-context readout ``h`` the actor uses; see
-        :meth:`_hidden_for_value` for where that ``h`` comes from on each call site. ``use_cached_hidden=False``
-        forces a fresh trunk pass instead of reusing the one :meth:`act` left behind.
+        :meth:`_hidden_for_value` for where that ``h`` comes from on each call site. With ``"separate_trunk"``
+        it is read off the ``critic_*`` pathway's own readout instead (:meth:`_critic_hidden_for_value`).
+        ``use_cached_hidden=False`` forces a fresh trunk pass instead of reusing the one :meth:`act` left behind.
         """
         if self.critic_design == "privileged":
             critic_obs = self.get_critic_obs(obs)
             return self.critic(self.critic_obs_normalizer(critic_obs))
+        if self.critic_design == "separate_trunk":
+            return self.critic(self._critic_hidden_for_value(obs, hidden_state, use_cached_hidden))
         return self.value_from_hidden(self._hidden_for_value(obs, hidden_state, use_cached_hidden))
 
     # --------------------------------------------------------------------------------------------------------
@@ -1258,6 +1448,7 @@ class ActorCriticEpisodeContext(nn.Module):
         earlier rows.
         """
         self._window_hidden, self._window_hidden_obs = None, None
+        self._critic_window_hidden, self._critic_window_hidden_obs = None, None
         if self._key_cache is None:
             return
         if self.num_memory_tokens > 0:
@@ -1287,6 +1478,7 @@ class ActorCriticEpisodeContext(nn.Module):
             self._cache_positions.fill_(-1)
             self._positions.zero_()
             self._last_hidden = None
+            self._last_critic_hidden = None
             return
         keep = (~dones.reshape(-1, 1).bool()).to(self._cache_positions.dtype)
         # Branch-free (no host sync): a done environment's slots go back to "empty" and its step counter to 0.
@@ -1295,6 +1487,7 @@ class ActorCriticEpisodeContext(nn.Module):
         self._cache_positions.mul_(keep).add_(keep - 1)
         self._positions.mul_(keep.reshape(-1))
         self._last_hidden = None
+        self._last_critic_hidden = None
 
     def get_hidden_states(self) -> tuple[None, None]:
         """The acting state is a KV cache, not a hidden state: it is never stored per step (it is re-derived

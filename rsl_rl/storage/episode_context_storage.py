@@ -373,9 +373,11 @@ class EpisodeContextRolloutStorage(RolloutStorage):
 
         * the observation/action/target tensors as time-major ``[W, B, ...]`` slices of the rollout (no padding,
           no trajectory splitting: every row of every environment is live and is trained exactly once),
-        * an :class:`EpisodeContextPrefix` in the actor's hidden-state slot and ``None`` in the critic's (the
-          critic is a context-free MLP). With a memory policy it additionally carries the per-segment source
-          episodes and the explicit segment ids (see :meth:`_segment_sources`),
+        * the SAME :class:`EpisodeContextPrefix` in both hidden-state slots. The actor consumes it in
+          ``policy.act``; the critic slot is what ``ppo.py`` hands to ``policy.evaluate``, which a
+          ``separate_trunk`` critic needs to run its own windowed pass (the ``privileged`` critic ignores it and
+          the ``shared_trunk`` one reuses the actor's ``h``). With a memory policy the prefix additionally
+          carries the per-segment source episodes and the explicit segment ids (see :meth:`_segment_sources`),
         * ``masks_batch = None``: there is nothing to mask, which keeps the stock loss reductions exact.
         """
         if self.training_type != "rl":
@@ -437,6 +439,6 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                     self.actions_log_prob[:, envs],
                     self.mu[:, envs],
                     self.sigma[:, envs],
-                    (hidden_state_a_batch, None),
+                    (hidden_state_a_batch, hidden_state_a_batch),
                     None,
                 )
