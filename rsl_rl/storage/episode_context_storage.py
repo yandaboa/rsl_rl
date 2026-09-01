@@ -395,7 +395,25 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         positions = self.frame_positions[slots]
         return self.frame_obs[slots[:prefix]], positions[:prefix], positions[prefix:]
 
-    def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
+    def mini_batch_env_chunks(self, num_mini_batches: int) -> list[tuple[int, int]]:
+        """``[start, stop)`` training-environment ranges of the LOGICAL minibatches, in the order handed out.
+
+        Shared with :meth:`recurrent_mini_batch_generator` so that a caller which needs a whole-minibatch
+        reduction (advantage normalization under gradient accumulation, where a yielded batch is only a slice
+        of the minibatch) cannot drift from the split the generator actually uses.
+        """
+        num_mini_batches = min(num_mini_batches, self.num_train_envs)
+        mini_batch_size = self.num_train_envs // num_mini_batches
+        # The last chunk absorbs the remainder, so that every environment is trained exactly once even when
+        # num_envs is not a multiple of num_mini_batches.
+        return [
+            (i * mini_batch_size, self.num_train_envs if i == num_mini_batches - 1 else (i + 1) * mini_batch_size)
+            for i in range(num_mini_batches)
+        ]
+
+    def recurrent_mini_batch_generator(
+        self, num_mini_batches: int, num_epochs: int = 8, grad_accumulation_steps: int = 1
+    ) -> Generator:
         """Environment-chunk minibatches shaped for PPO's recurrent branch.
 
         Yields the stock 10-tuple, with
@@ -411,6 +429,10 @@ class EpisodeContextRolloutStorage(RolloutStorage):
 
         With an eval pool (``num_eval_envs > 0``) the chunks cover ``[0, num_train_envs)`` only: those
         environments acted deterministically, so their rows are off-policy for this update and are dropped.
+
+        With ``grad_accumulation_steps > 1`` every logical minibatch is handed out as that many equally sized
+        micro-batches (contiguous sub-chunks of its environment range, in order); the caller is what turns them
+        back into one optimizer step. ``1`` yields the logical chunks themselves, unchanged.
         """
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
@@ -419,8 +441,9 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 f"The rollout is incomplete ({self.step} of {self.num_collect_steps} steps). The episode-context"
                 " generator reconstructs a contiguous window and cannot skip rows."
             )
-        num_mini_batches = min(num_mini_batches, self.num_train_envs)
-        mini_batch_size = self.num_train_envs // num_mini_batches
+        assert grad_accumulation_steps >= 1, f"grad_accumulation_steps must be >= 1, got {grad_accumulation_steps}."
+        chunks = self.mini_batch_env_chunks(num_mini_batches)
+        mini_batch_size = self.num_train_envs // len(chunks)
         if mini_batch_size < 2 or self.num_collect_steps < 2:
             # ppo.py reduces with ``torch.squeeze(advantages_batch)``, which drops EVERY size-one dimension --
             # a one-environment (or one-step) minibatch would silently broadcast the surrogate into a [W, W]
@@ -429,6 +452,23 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 f"An episode-context minibatch must hold at least 2 environments and 2 steps (got"
                 f" {mini_batch_size} envs x {self.num_collect_steps} steps). Lower num_mini_batches."
             )
+        if grad_accumulation_steps > 1:
+            num_micro_batches = len(chunks) * grad_accumulation_steps
+            # Equal micro-batches are what makes the average of their means the mean of the minibatch.
+            assert self.num_train_envs % num_micro_batches == 0, (
+                f"{self.num_train_envs} training environments do not split evenly into {len(chunks)} minibatches"
+                f" x {grad_accumulation_steps} accumulation steps."
+            )
+            micro_batch_size = self.num_train_envs // num_micro_batches
+            assert micro_batch_size >= 2, (
+                f"A micro-batch must hold at least 2 environments (got {micro_batch_size}); see the"
+                " torch.squeeze hazard above. Lower grad_accumulation_steps."
+            )
+            chunks = [
+                (start + step * micro_batch_size, start + (step + 1) * micro_batch_size)
+                for start, _ in chunks
+                for step in range(grad_accumulation_steps)
+            ]
 
         # The slice is identical in every epoch (only the parameters move), so it is gathered once.
         prefix_obs, prefix_positions, window_positions = self.context_slice()
@@ -436,11 +476,7 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         snapshots = self._snapshot_index() if self.has_memory else None
 
         for _ in range(num_epochs):
-            for i in range(num_mini_batches):
-                start = i * mini_batch_size
-                # The last chunk absorbs the remainder, so that every environment is trained exactly once even
-                # when num_envs is not a multiple of num_mini_batches.
-                stop = self.num_train_envs if i == num_mini_batches - 1 else (i + 1) * mini_batch_size
+            for start, stop in chunks:
                 envs = slice(start, stop)
 
                 memory_fields: dict[str, torch.Tensor] = {}
