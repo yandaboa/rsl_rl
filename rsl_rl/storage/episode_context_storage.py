@@ -66,6 +66,7 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         actor_obs_normalizer: torch.nn.Module | None = None,
         memory_tokens: int = 0,
         d_model: int = 0,
+        num_eval_envs: int = 0,
         **kwargs,
     ) -> None:
         """
@@ -84,6 +85,10 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 :attr:`ActorCriticEpisodeContext.context_prefix_length`).
             memory_tokens: ``M`` of the policy. ``0`` (the default) switches every memory buffer and every memory
                 code path off -- the storage is then exactly the memory-free one.
+            num_eval_envs: Trailing environments that act deterministically and are EXCLUDED from the update
+                (see ``EpisodeContextPPO.eval_env_fraction``). Their rows are still collected, still get
+                returns/advantages, and still feed the ring buffer -- the minibatch generator simply never
+                hands them out, and the advantage normalization ignores them.
             d_model: Trunk width of the policy. Only read when ``memory_tokens > 0`` (it sizes the ``H``
                 snapshots); one dense ``[num_envs, M + T, d]`` slot is allocated, which is the whole persistent
                 cost of the feature.
@@ -96,6 +101,13 @@ class EpisodeContextRolloutStorage(RolloutStorage):
             raise ValueError("EpisodeContextRolloutStorage does not support a carry region (carry_steps > 0).")
         kwargs.pop("carry_steps", None)
         super().__init__(training_type, num_envs, num_transitions_per_env, obs, actions_shape, device=device, **kwargs)
+
+        self.num_eval_envs = int(num_eval_envs)
+        assert 0 <= self.num_eval_envs < num_envs, (
+            f"num_eval_envs={self.num_eval_envs} does not leave a training pool out of {num_envs} environments."
+        )
+        # The eval pool is the TRAILING block, so the training pool stays one contiguous slice.
+        self.num_train_envs = num_envs - self.num_eval_envs
 
         self.actor_obs_groups = list(obs.keys()) if actor_obs_groups is None else list(actor_obs_groups)
         self.actor_obs_normalizer = actor_obs_normalizer
@@ -221,6 +233,23 @@ class EpisodeContextRolloutStorage(RolloutStorage):
     # ------------------------------------------------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------------------------------------------------
+
+    def compute_returns(
+        self, last_values: torch.Tensor, gamma: float, lam: float, normalize_advantage: bool = True
+    ) -> None:
+        """Stock GAE, but the advantage normalization statistics come from the TRAINING pool only.
+
+        GAE itself still runs over every environment (harmless, and it keeps the tensors uniform); the eval
+        rows are simply never trained on, so letting them move the mean/std of the rows that are would be a
+        silent leak of the deterministic pool into the update.
+        """
+        if self.num_eval_envs == 0:
+            super().compute_returns(last_values, gamma, lam, normalize_advantage)
+            return
+        super().compute_returns(last_values, gamma, lam, normalize_advantage=False)
+        if normalize_advantage:
+            train_advantages = self.advantages[:, : self.num_train_envs]
+            self.advantages = (self.advantages - train_advantages.mean()) / (train_advantages.std() + 1e-8)
 
     def clear(self) -> None:
         """Free the buffer for the next rollout, first folding this rollout's ``H`` snapshots into the sources.
@@ -379,6 +408,9 @@ class EpisodeContextRolloutStorage(RolloutStorage):
           the ``shared_trunk`` one reuses the actor's ``h``). With a memory policy the prefix additionally
           carries the per-segment source episodes and the explicit segment ids (see :meth:`_segment_sources`),
         * ``masks_batch = None``: there is nothing to mask, which keeps the stock loss reductions exact.
+
+        With an eval pool (``num_eval_envs > 0``) the chunks cover ``[0, num_train_envs)`` only: those
+        environments acted deterministically, so their rows are off-policy for this update and are dropped.
         """
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
@@ -387,8 +419,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 f"The rollout is incomplete ({self.step} of {self.num_collect_steps} steps). The episode-context"
                 " generator reconstructs a contiguous window and cannot skip rows."
             )
-        num_mini_batches = min(num_mini_batches, self.num_envs)
-        mini_batch_size = self.num_envs // num_mini_batches
+        num_mini_batches = min(num_mini_batches, self.num_train_envs)
+        mini_batch_size = self.num_train_envs // num_mini_batches
         if mini_batch_size < 2 or self.num_collect_steps < 2:
             # ppo.py reduces with ``torch.squeeze(advantages_batch)``, which drops EVERY size-one dimension --
             # a one-environment (or one-step) minibatch would silently broadcast the surrogate into a [W, W]
@@ -408,7 +440,7 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 start = i * mini_batch_size
                 # The last chunk absorbs the remainder, so that every environment is trained exactly once even
                 # when num_envs is not a multiple of num_mini_batches.
-                stop = self.num_envs if i == num_mini_batches - 1 else (i + 1) * mini_batch_size
+                stop = self.num_train_envs if i == num_mini_batches - 1 else (i + 1) * mini_batch_size
                 envs = slice(start, stop)
 
                 memory_fields: dict[str, torch.Tensor] = {}

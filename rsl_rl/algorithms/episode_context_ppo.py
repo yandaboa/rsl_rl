@@ -5,13 +5,15 @@
 
 """PPO for the single-episode context transformer.
 
-This is the **stock** :class:`~rsl_rl.algorithms.ppo.PPO` -- ``act``, ``compute_returns`` and the whole
-``update()`` are inherited byte-for-byte from the known-good implementation. There are two overrides:
+This is the **stock** :class:`~rsl_rl.algorithms.ppo.PPO` -- ``compute_returns`` and the whole ``update()``
+are inherited byte-for-byte from the known-good implementation. There are three overrides:
 
 * :meth:`init_storage`, which builds an :class:`EpisodeContextRolloutStorage` instead of a plain
   :class:`RolloutStorage`; that storage's ``recurrent_mini_batch_generator`` then feeds PPO's existing recurrent
   branch (``policy.is_recurrent`` is ``True``) with ``[W, B, ...]`` minibatches whose prefix rides in the
   hidden-state slot,
+* :meth:`act`, and ONLY when ``eval_env_fraction > 0``: the last envs execute the distribution mean instead
+  of a sample (a deterministic eval pool, excluded from the update by the storage),
 * :meth:`process_env_step`, and ONLY when the policy carries a cross-episode memory (``memory_tokens > 0``): the
   frozen ``ppo.py`` ends its step with ``policy.reset(dones)``, which -- with no trial signal -- would put ``Z``
   back to ``z_init`` at every episode boundary, and it has nowhere to hand the storage the ``H`` of the episode
@@ -44,6 +46,7 @@ class EpisodeContextPPO(PPO):
         defer_obs_normalization: bool = True,
         noise_prior_kl_coef: float = 0.0,
         noise_prior_dims: int = 0,
+        eval_env_fraction: float = 0.0,
         **kwargs,
     ) -> None:
         """Same signature as :class:`PPO`, except that ``defer_obs_normalization`` defaults to ``True``.
@@ -55,6 +58,11 @@ class EpisodeContextPPO(PPO):
         ``noise_prior_kl_coef`` / ``noise_prior_dims`` add ``coef * KL(pi_z || N(0, I))`` on the first
         ``noise_prior_dims`` action dims (RFS: those dims are the frozen flow's x0, which is only valid inside
         the unit Gaussian it was trained on). ``0`` leaves the loss untouched.
+
+        ``eval_env_fraction`` carves a deterministic eval pool out of the LAST environments: they act on the
+        distribution MEAN and their rows never enter the update. Their success rate is what a success-gated
+        curriculum should grade on -- a sampled rollout under gSDE runs well below deterministic capability,
+        so a curriculum gated on it stalls. ``0`` (the default) is the stock behavior, bit for bit.
         """
         if not isinstance(policy, ActorCriticEpisodeContext):
             raise ValueError(
@@ -74,6 +82,12 @@ class EpisodeContextPPO(PPO):
         )
         self.noise_prior_kl_coef = float(noise_prior_kl_coef)
         self.noise_prior_dims = int(noise_prior_dims)
+        assert 0.0 <= eval_env_fraction < 1.0, f"eval_env_fraction must be in [0, 1), got {eval_env_fraction}."
+        self.eval_env_fraction = float(eval_env_fraction)
+        # Filled in by init_storage, which is the first place the environment count is known.
+        self.eval_env_ids: torch.Tensor | None = None
+        # ``None`` (not an all-False mask) with no eval pool: act() then takes the untouched stock path.
+        self._eval_mask: torch.Tensor | None = None
 
     def init_storage(
         self,
@@ -83,6 +97,19 @@ class EpisodeContextPPO(PPO):
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
     ) -> None:
+        num_eval_envs = round(self.eval_env_fraction * num_envs)
+        assert num_eval_envs < num_envs, (
+            f"eval_env_fraction={self.eval_env_fraction} leaves no training environment ({num_eval_envs} of"
+            f" {num_envs} would be eval)."
+        )
+        if num_eval_envs > 0:
+            self.eval_env_ids = torch.arange(num_envs, device=self.device)[-num_eval_envs:]
+            self._eval_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            self._eval_mask[self.eval_env_ids] = True
+        else:
+            self.eval_env_ids = torch.zeros(0, dtype=torch.long, device=self.device)
+            self._eval_mask = None
+
         self.storage = EpisodeContextRolloutStorage(
             training_type,
             num_envs,
@@ -90,6 +117,7 @@ class EpisodeContextPPO(PPO):
             obs,
             actions_shape,
             self.device,
+            num_eval_envs=num_eval_envs,
             actor_obs_groups=self.policy.obs_groups["policy"],
             context_length=self.policy.context_length,
             max_episode_length=self.policy.max_episode_length,
@@ -99,6 +127,23 @@ class EpisodeContextPPO(PPO):
             d_model=self.policy.d_model,
             max_policy_lag=self.max_policy_lag,
         )
+
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        """Stock :meth:`PPO.act`, except that the eval pool executes the distribution MEAN.
+
+        The eval environments run the very same forward pass as any other one -- their KV ring advances in
+        lockstep -- so only the executed action is swapped, off the distribution the policy just left behind
+        (no second trunk pass, which is what ``act_inference`` would cost and what would desynchronize the
+        cache). The log-prob is recomputed against the executed action so the stored row stays self-consistent;
+        the update never sees it (see :class:`EpisodeContextRolloutStorage`).
+        """
+        actions = super().act(obs)
+        if self._eval_mask is None:
+            return actions
+        actions = torch.where(self._eval_mask.unsqueeze(-1), self.policy.action_mean.detach(), actions)
+        self.transition.actions = actions
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(actions).detach()
+        return actions
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
