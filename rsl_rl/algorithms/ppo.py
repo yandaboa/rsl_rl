@@ -149,6 +149,10 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        # Optional KL(pi || N(0, I)) penalty on the leading action dims. Set by subclasses (RFS steers a
+        # frozen flow, whose noise channel has to stay inside the unit Gaussian it was trained on); 0 = off.
+        self.noise_prior_kl_coef = 0.0
+        self.noise_prior_dims = 0
         # If set, the observation normalizers are not updated during collection. The runner is then
         # responsible for calling :meth:`commit_obs_normalization` once the rollout has been consumed,
         # so that a rollout is acted and reconstructed under identical normalizer statistics.
@@ -385,6 +389,15 @@ class PPO:
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
 
+    def _noise_prior_kl(self, mu: torch.Tensor, sigma: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Mean KL(N(mu, sigma^2) || N(0, I)) over the first ``noise_prior_dims`` action dims."""
+        mu = mu[..., : self.noise_prior_dims]
+        sigma = sigma[..., : self.noise_prior_dims]
+        kl = 0.5 * (mu.pow(2) + sigma.pow(2) - 1.0 - 2.0 * torch.log(sigma.clamp_min(1e-8))).sum(-1)
+        if mask is not None:
+            kl = kl[mask]
+        return kl.mean()
+
     def update(self) -> dict[str, float]:
         # The trial-memory policy trains on adjacent episode pairs, not on flat transitions
         if self.is_trial_memory:
@@ -393,6 +406,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_noise_prior_kl = 0.0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -531,6 +545,12 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Gaussian-prior penalty on the noise dims (RFS)
+            if self.noise_prior_kl_coef > 0.0 and self.noise_prior_dims > 0:
+                noise_prior_kl = self._noise_prior_kl(mu_batch, sigma_batch, masks_batch)
+                loss = loss + self.noise_prior_kl_coef * noise_prior_kl
+                mean_noise_prior_kl += noise_prior_kl.item()
+
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions
@@ -614,6 +634,7 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_noise_prior_kl /= num_updates
         mean_ratio /= num_updates
         mean_ratio_std /= num_updates
         mean_ratio_clip_frac /= num_updates
@@ -637,6 +658,8 @@ class PPO:
             "ratio_max": ratio_max,
             "ratio_clip_frac": mean_ratio_clip_frac,
         }
+        if self.noise_prior_kl_coef > 0.0:
+            loss_dict["noise_prior_kl"] = mean_noise_prior_kl
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -705,6 +728,7 @@ class PPO:
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
+        mean_noise_prior_kl = 0.0
         # Probability-ratio diagnostics -- the reconstruction canary of the design doc lives here.
         # Note: the canary statement ("with unchanged parameters the ratio is 1") only holds for trials whose
         #   behavior policy IS the current one. A trial carried across a rollout boundary was partly collected
@@ -847,6 +871,12 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Gaussian-prior penalty on the noise dims (RFS); mu/sigma here are already loss-masked.
+            if self.noise_prior_kl_coef > 0.0 and self.noise_prior_dims > 0:
+                noise_prior_kl = self._noise_prior_kl(mu_batch, sigma_batch)
+                loss = loss + self.noise_prior_kl_coef * noise_prior_kl
+                mean_noise_prior_kl += noise_prior_kl.item()
+
             # Gradient step.
             # Order under fp16: backward on the SCALED loss -> (multi-GPU all-reduce, still scaled) ->
             #   ``scaler.unscale_(optimizer)`` -> clip -> ``scaler.step``. The unscale MUST come before the clip:
@@ -890,7 +920,7 @@ class PPO:
         self.storage.policy_version += 1
 
         lag0_batches = max(lag0_batches, 1)
-        return {
+        loss_dict = {
             "value_function": mean_value_loss / num_updates,
             "surrogate": mean_surrogate_loss / num_updates,
             "entropy": mean_entropy / num_updates,
@@ -919,6 +949,9 @@ class PPO:
             "pool_dropped_truncated_trials": float(pool["dropped_truncated_trials"]),
             "pool_envs_without_data": float(pool["envs_without_data"]),
         }
+        if self.noise_prior_kl_coef > 0.0:
+            loss_dict["noise_prior_kl"] = mean_noise_prior_kl / num_updates
+        return loss_dict
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""

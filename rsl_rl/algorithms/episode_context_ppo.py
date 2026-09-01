@@ -17,8 +17,10 @@ This is the **stock** :class:`~rsl_rl.algorithms.ppo.PPO` -- ``act``, ``compute_
   back to ``z_init`` at every episode boundary, and it has nowhere to hand the storage the ``H`` of the episode
   that just finished. With ``memory_tokens == 0`` the override is a plain ``super()`` call.
 
-Everything else a reader might expect to be different here -- the loss, the ratio, the KL schedule, the
-clipping, the diagnostics -- is not.
+Everything else a reader might expect to be different here -- the ratio, the KL schedule, the clipping, the
+diagnostics -- is not. The one loss addition is opt-in and off by default: ``noise_prior_kl_coef > 0`` adds
+``KL(pi || N(0, I))`` on the first ``noise_prior_dims`` action dims (the hook itself lives in ``ppo.py``, next
+to the entropy term).
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ class EpisodeContextPPO(PPO):
         policy: ActorCriticEpisodeContext,
         *args,
         defer_obs_normalization: bool = True,
+        noise_prior_kl_coef: float = 0.0,
+        noise_prior_dims: int = 0,
         **kwargs,
     ) -> None:
         """Same signature as :class:`PPO`, except that ``defer_obs_normalization`` defaults to ``True``.
@@ -47,6 +51,10 @@ class EpisodeContextPPO(PPO):
         It has to: the update re-infers every window from the RAW stored frames, so if the normalizer moved
         during collection the reconstruction would run under different statistics than the acting path did and
         the PPO ratio would be off at epoch 0 by construction.
+
+        ``noise_prior_kl_coef`` / ``noise_prior_dims`` add ``coef * KL(pi_z || N(0, I))`` on the first
+        ``noise_prior_dims`` action dims (RFS: those dims are the frozen flow's x0, which is only valid inside
+        the unit Gaussian it was trained on). ``0`` leaves the loss untouched.
         """
         if not isinstance(policy, ActorCriticEpisodeContext):
             raise ValueError(
@@ -60,6 +68,12 @@ class EpisodeContextPPO(PPO):
                 stacklevel=2,
             )
         super().__init__(policy, *args, defer_obs_normalization=defer_obs_normalization, **kwargs)
+        assert noise_prior_kl_coef >= 0.0, "noise_prior_kl_coef must be non-negative."
+        assert 0 <= noise_prior_dims <= policy.num_actions, (
+            f"noise_prior_dims={noise_prior_dims} does not fit the policy's {policy.num_actions}-d action."
+        )
+        self.noise_prior_kl_coef = float(noise_prior_kl_coef)
+        self.noise_prior_dims = int(noise_prior_dims)
 
     def init_storage(
         self,
