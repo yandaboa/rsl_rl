@@ -238,6 +238,8 @@ class ActorCriticEpisodeContext(nn.Module):
         context_length: int = 80,
         d_model: int = 256,
         num_layers: int = 4,
+        num_loops: int = 1,
+        loop_input_injection: bool = False,
         num_heads: int = 8,
         max_episode_length: int = 80,
         ff_mult: int = 4,
@@ -268,7 +270,11 @@ class ActorCriticEpisodeContext(nn.Module):
             context_length: ``L``, the maximum number of frames a step attends over (itself included), always
                 clipped to the current episode. Values ``>= max_episode_length`` mean "the whole episode".
             d_model: Trunk width.
-            num_layers: Number of trunk layers.
+            num_layers: Number of trunk layers (UNIQUE blocks).
+            num_loops: How many times the ``num_layers`` blocks are applied in sequence (weights shared across
+                passes). Effective depth is ``num_layers * num_loops``; ``1`` (the default) is a plain trunk.
+            loop_input_injection: With ``num_loops > 1``, add the trunk input back to the residual stream at the
+                start of every pass after the first.
             num_heads: Number of attention heads.
             max_episode_length: ``T``, the number of control steps in one episode. Positions are RoPE'd, so
                 this bounds the buffers only (the KV cache / :attr:`context_span`, the writer's ``H``
@@ -334,6 +340,12 @@ class ActorCriticEpisodeContext(nn.Module):
         self.num_actions = num_actions
         self.d_model = d_model
         self.num_layers = num_layers
+        assert num_loops >= 1, f"num_loops must be >= 1, got {num_loops}"
+        self.num_loops = int(num_loops)
+        self.loop_input_injection = bool(loop_input_injection)
+        # Effective depth: the same ``num_layers`` blocks re-applied ``num_loops`` times. Every per-layer runtime
+        # buffer (KV caches, memory caches) is sized on this -- a shared block sees different inputs each pass.
+        self.depth = self.num_layers * self.num_loops
         self.num_heads = num_heads
         self.max_episode_length = int(max_episode_length)
         self.context_length = int(context_length)
@@ -426,7 +438,8 @@ class ActorCriticEpisodeContext(nn.Module):
         self._reset_runtime_state()
 
         print(
-            f"Episode-context trunk: L={num_layers} d={d_model} heads={num_heads}"
+            f"Episode-context trunk: L={num_layers} loops={self.num_loops} inj={self.loop_input_injection}"
+            f" d={d_model} heads={num_heads}"
             f" context={self.context_length} (span {self.context_span}) T={self.max_episode_length}"
             + (
                 f" M={self.num_memory_tokens} memory tokens prepended to the sequence (K={self.episodes_per_trial})"
@@ -442,7 +455,8 @@ class ActorCriticEpisodeContext(nn.Module):
             )
         elif self.critic_design == "separate_trunk":
             print(
-                f"Critic head (SEPARATE critic_* trunk: L={num_layers} d={d_model} over the same observation,"
+                f"Critic head (SEPARATE critic_* trunk: L={num_layers} loops={self.num_loops} d={d_model} over"
+                f" the same observation,"
                 f" no actor parameter in the value graph): {self.critic}"
             )
         else:
@@ -459,7 +473,7 @@ class ActorCriticEpisodeContext(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        residual_scale = (2.0 * max(self.num_layers, 1)) ** -0.5
+        residual_scale = (2.0 * max(self.depth, 1)) ** -0.5
         for block in self.blocks:
             block.attn.out_proj.weight.data.mul_(residual_scale)
             block.ff[-1].weight.data.mul_(residual_scale)
@@ -548,10 +562,10 @@ class ActorCriticEpisodeContext(nn.Module):
         span = self.context_span
         self._num_envs = num_envs
         self._key_cache = [
-            torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.num_layers)
+            torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.depth)
         ]
         self._value_cache = [
-            torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.num_layers)
+            torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.depth)
         ]
         self._cache_positions = torch.full((num_envs, span), -1, device=device, dtype=torch.long)
         self._positions = torch.zeros(num_envs, device=device, dtype=torch.long)
@@ -563,20 +577,20 @@ class ActorCriticEpisodeContext(nn.Module):
         self._critic_window_hidden_obs = None
         if self.critic_design == "separate_trunk":
             self._critic_key_cache = [
-                torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.num_layers)
+                torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.depth)
             ]
             self._critic_value_cache = [
-                torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.num_layers)
+                torch.zeros(num_envs, span, self.d_model, device=device, dtype=dtype) for _ in range(self.depth)
             ]
         if self.num_memory_tokens > 0:
             self._memory = self.z_init.detach().to(device=device, dtype=dtype).unsqueeze(0).repeat(num_envs, 1, 1)
             self._memory_key_cache = [
                 torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
-                for _ in range(self.num_layers)
+                for _ in range(self.depth)
             ]
             self._memory_value_cache = [
                 torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
-                for _ in range(self.num_layers)
+                for _ in range(self.depth)
             ]
             self._hidden_history = torch.zeros(
                 num_envs, self.hidden_history_span, self.d_model, device=device, dtype=dtype
@@ -586,11 +600,11 @@ class ActorCriticEpisodeContext(nn.Module):
             if self.critic_design == "separate_trunk":
                 self._critic_memory_key_cache = [
                     torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
-                    for _ in range(self.num_layers)
+                    for _ in range(self.depth)
                 ]
                 self._critic_memory_value_cache = [
                     torch.zeros(num_envs, self.num_memory_tokens, self.d_model, device=device, dtype=dtype)
-                    for _ in range(self.num_layers)
+                    for _ in range(self.depth)
                 ]
             # Every episode opens with the memory rows already in the sequence, so their K/V (and their rows of
             # ``H``) have to exist before the first environment token is stepped.
@@ -609,15 +623,15 @@ class ActorCriticEpisodeContext(nn.Module):
     def context_prefix_length(self) -> int:
         """Frames the batched path needs IN FRONT of a window to reproduce the acting path exactly.
 
-        Not ``L - 1``: each block attends at most ``span - 1`` rows back, so after ``num_layers`` blocks a row's
-        receptive field reaches ``num_layers * (span - 1)`` frames back (the standard depth argument -- block 2
+        Not ``L - 1``: each block attends at most ``span - 1`` rows back, so after ``depth`` block applications
+        a row's receptive field reaches ``depth * (span - 1)`` frames back (the standard depth argument -- block 2
         reads block 1's states, which themselves read another ``span - 1`` rows). Capped at ``T - 1`` because the
         mask can never cross an episode start, so a full episode of history is always enough.
 
         For the target configuration (``L = T = 80``) this is ``79``, i.e. the whole episode, which is what makes
         the storage's ring buffer ``num_steps_per_env + min(L, T)`` slots.
         """
-        return min(self.max_episode_length - 1, self.num_layers * (self.context_span - 1))
+        return min(self.max_episode_length - 1, self.depth * (self.context_span - 1))
 
     # --------------------------------------------------------------------------------------------------------
     # Cross-episode memory
@@ -780,7 +794,8 @@ class ActorCriticEpisodeContext(nn.Module):
         cached K/V per layer.
 
         Returns:
-            Their readouts ``[B, M, d]`` (rows ``0 .. M - 1`` of ``H``) and the per-layer keys and values.
+            Their readouts ``[B, M, d]`` (rows ``0 .. M - 1`` of ``H``) and the keys and values, one entry per
+            depth index.
         """
         _, _, _, blocks, final_norm = self._pathway(critic)
         index = torch.arange(self.num_memory_tokens, device=rows.device)
@@ -790,7 +805,10 @@ class ActorCriticEpisodeContext(nn.Module):
         all_keys: list[torch.Tensor] = []
         all_values: list[torch.Tensor] = []
         hidden = rows
-        for block in blocks:
+        tokens0 = hidden
+        for depth, pass_index, block in self._block_schedule(blocks):
+            if self.loop_input_injection and pass_index > 0 and depth % self.num_layers == 0:
+                hidden = hidden + tokens0
             normed, keys, values = block.token_kv(hidden)
             all_keys.append(keys)
             all_values.append(values)
@@ -820,7 +838,7 @@ class ActorCriticEpisodeContext(nn.Module):
             return
         with torch.no_grad():
             hidden, keys, values = self._memory_trunk(self._memory_token_input(self._memory[env_ids].unsqueeze(1)))
-            for layer in range(self.num_layers):
+            for layer in range(self.depth):
                 self._memory_key_cache[layer][env_ids] = keys[layer].detach()
                 self._memory_value_cache[layer][env_ids] = values[layer].detach()
         # The memory rows are the first M rows of H, exactly as the writer (and the storage) expect them.
@@ -832,7 +850,7 @@ class ActorCriticEpisodeContext(nn.Module):
             with torch.no_grad():
                 rows = self._memory_token_input(self._memory[env_ids].unsqueeze(1), critic=True)
                 _, keys, values = self._memory_trunk(rows, critic=True)
-                for layer in range(self.num_layers):
+                for layer in range(self.depth):
                     self._critic_memory_key_cache[layer][env_ids] = keys[layer].detach()
                     self._critic_memory_value_cache[layer][env_ids] = values[layer].detach()
 
@@ -938,6 +956,14 @@ class ActorCriticEpisodeContext(nn.Module):
             self.critic_final_norm,
         )
 
+    def _block_schedule(self, blocks: nn.ModuleList) -> list[tuple[int, int, nn.Module]]:
+        """``(depth_index, pass_index, block)`` for every block application of one trunk pass.
+
+        The ``num_layers`` unique blocks are applied ``num_loops`` times in sequence, so a block is shared across
+        passes but every DEPTH index has its own K/V (it sees a different input each pass).
+        """
+        return [(depth, depth // self.num_layers, blocks[depth % self.num_layers]) for depth in range(self.depth)]
+
     def _embed_tokens(
         self, obs: torch.Tensor, positions: torch.Tensor, normalize_obs: bool = True, critic: bool = False
     ) -> torch.Tensor:
@@ -1030,7 +1056,10 @@ class ActorCriticEpisodeContext(nn.Module):
             # ``memory_pos_embed`` is what tells the rows apart, RoPE must not add a second ordering.
             memory_pos = torch.zeros(hidden.shape[0], num_memory_rows, device=rope_pos.device, dtype=rope_pos.dtype)
             rope_pos = torch.cat([memory_pos, rope_pos], dim=1)
-        for block in blocks:
+        tokens0 = hidden
+        for depth, pass_index, block in self._block_schedule(blocks):
+            if self.loop_input_injection and pass_index > 0 and depth % self.num_layers == 0:
+                hidden = hidden + tokens0
             normed, keys, values = block.token_kv(hidden)
             hidden = block.token_forward(hidden, normed, keys, values, attn_mask, q_pos=rope_pos, k_pos=rope_pos)
         hidden = final_norm(hidden)
@@ -1235,7 +1264,11 @@ class ActorCriticEpisodeContext(nn.Module):
             memory_pos = torch.zeros(num_envs, self.num_memory_tokens, device=obs.device, dtype=torch.long)
             key_pos = torch.cat([memory_pos, key_pos], dim=1)
         hidden = tokens
-        for layer, block in enumerate(blocks):
+        tokens0 = tokens
+        for layer, pass_index, block in self._block_schedule(blocks):
+            # ``layer`` is the DEPTH index: each of the ``depth`` block applications owns a K/V cache.
+            if self.loop_input_injection and pass_index > 0 and layer % self.num_layers == 0:
+                hidden = hidden + tokens0
             normed, keys, values = block.token_kv(hidden)
             if self.num_memory_tokens > 0:
                 all_keys = torch.cat([memory_key_cache[layer], key_cache[layer], keys], dim=1)
