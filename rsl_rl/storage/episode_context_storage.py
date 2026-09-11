@@ -132,6 +132,10 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         self.total_steps = 0
         # Set by the algorithm when the auxiliary next-state loss is on; off means the generator allocates nothing.
         self.with_next_state = False
+        # Optional privileged prediction target (see :meth:`enable_next_state_target`); nothing is allocated here.
+        self.next_state_target_group: str | None = None
+        self.next_state_target_dim = 0
+        self.frame_target: torch.Tensor | None = None
 
         # -- cross-episode memory (all of this is absent with memory_tokens = 0) --
         self.num_memory_tokens = int(memory_tokens)
@@ -156,6 +160,16 @@ class EpisodeContextRolloutStorage(RolloutStorage):
             )
             self._pending_episode_index: torch.Tensor | None = None
             self._clear_snapshots()
+
+    def enable_next_state_target(self, group: str, target_dim: int) -> None:
+        """Also ring-buffer the RAW ``obs[group]`` frames, whose next-step delta is an extra aux target.
+
+        The group is privileged: it is not part of the actor observation, so it is never normalized here.
+        """
+        assert target_dim > 0, f"next-state target group '{group}' needs a positive width, got {target_dim}."
+        self.next_state_target_group = group
+        self.next_state_target_dim = int(target_dim)
+        self.frame_target = torch.zeros(self.ring_size, self.num_envs, self.next_state_target_dim, device=self.device)
 
     def _clear_snapshots(self) -> None:
         """Drop the rollout-local ``H`` snapshots (kept as a list of ``[n, ...]`` chunks, in step order)."""
@@ -215,6 +229,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         slot = self.total_steps % self.ring_size
         self.frame_obs[slot].copy_(self.actor_obs(transition.observations))
         self.frame_positions[slot].copy_(self.episode_step)
+        if self.frame_target is not None:
+            self.frame_target[slot].copy_(transition.observations[self.next_state_target_group])
         if self.has_memory:
             if self._pending_episode_index is None:
                 raise RuntimeError(
@@ -397,14 +413,15 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         positions = self.frame_positions[slots]
         return self.frame_obs[slots[:prefix]], positions[:prefix], positions[prefix:]
 
-    def next_state_slice(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def next_state_slice(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Per-window-row successor deltas of the frames in the ring, for the auxiliary next-state loss.
 
         Returns:
-            ``next_delta`` ``[W, N, obs_dim]`` (normalized ``obs_{t+1} - obs_t``, zero where invalid) and
-            ``next_valid`` ``[W, N]``. A row is valid only if its successor frame is stored AND continues the
-            same episode (``position + 1``), which excludes every boundary, time-outs included; the last window
-            row never has a stored successor.
+            ``next_delta`` ``[W, N, obs_dim]`` (normalized ``obs_{t+1} - obs_t``, zero where invalid),
+            ``next_valid`` ``[W, N]`` and ``next_target_delta`` ``[W, N, target_dim]`` (RAW, zero where
+            invalid; ``None`` without a target group). A row is valid only if its successor frame is stored AND
+            continues the same episode (``position + 1``), which excludes every boundary, time-outs included;
+            the last window row never has a stored successor.
         """
         window = self.step
         first = self.total_steps - window
@@ -416,7 +433,10 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         # ``total_steps - 1`` is the newest stored global step.
         stored = (globals_ + 1 <= self.total_steps - 1).unsqueeze(1).expand(-1, self.num_envs)
         valid = stored & (next_positions == positions + 1)
-        return (next_obs - obs) * valid.unsqueeze(-1), valid
+        target_delta = None
+        if self.frame_target is not None:
+            target_delta = (self.frame_target[next_slots] - self.frame_target[slots]) * valid.unsqueeze(-1)
+        return (next_obs - obs) * valid.unsqueeze(-1), valid, target_delta
 
     def mini_batch_env_chunks(self, num_mini_batches: int) -> list[tuple[int, int]]:
         """``[start, stop)`` training-environment ranges of the LOGICAL minibatches, in the order handed out.
@@ -500,7 +520,9 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         prefix_obs, prefix_positions, window_positions = self.context_slice()
         num_prefix = prefix_obs.shape[0]
         snapshots = self._snapshot_index() if self.has_memory else None
-        next_delta, next_valid = self.next_state_slice() if self.with_next_state else (None, None)
+        next_delta, next_valid, next_target_delta = (
+            self.next_state_slice() if self.with_next_state else (None, None, None)
+        )
 
         for _ in range(num_epochs):
             for start, stop in chunks:
@@ -521,6 +543,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                 next_state_fields: dict[str, torch.Tensor] = {}
                 if next_delta is not None:
                     next_state_fields = dict(next_delta=next_delta[:, envs], next_valid=next_valid[:, envs])
+                    if next_target_delta is not None:
+                        next_state_fields["next_target_delta"] = next_target_delta[:, envs]
 
                 hidden_state_a_batch = EpisodeContextPrefix(
                     obs=prefix_obs[:, envs],

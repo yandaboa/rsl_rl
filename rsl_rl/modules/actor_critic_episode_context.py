@@ -216,6 +216,8 @@ class EpisodeContextPrefix:
             ``None`` unless the storage was asked for it (``with_next_state``).
         next_valid: Which window rows have a successor frame inside the same episode, ``[W, B]``. The last
             window row and every row at an episode boundary (time-outs included) are ``False``.
+        next_target_delta: RAW ``target_{t+1} - target_t`` of the privileged target group, ``[W, B, target_dim]``,
+            zero where invalid (same mask as :attr:`next_valid`). ``None`` unless a target group is configured.
     """
 
     obs: torch.Tensor
@@ -228,6 +230,7 @@ class EpisodeContextPrefix:
     segment_has_source: torch.Tensor | None = None
     next_delta: torch.Tensor | None = None
     next_valid: torch.Tensor | None = None
+    next_target_delta: torch.Tensor | None = None
 
 
 class ActorCriticEpisodeContext(nn.Module):
@@ -261,6 +264,8 @@ class ActorCriticEpisodeContext(nn.Module):
         episodes_per_trial: int = 2,
         next_state_head_hidden_dims: tuple[int] | list[int] | None = None,
         next_state_pred_dims: tuple[int, int] | list[int] | None = None,
+        next_state_target_group: str | None = None,
+        next_state_target_dim: int = 0,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the episode-context actor-critic.
@@ -310,6 +315,9 @@ class ActorCriticEpisodeContext(nn.Module):
                 head at all, so the policy is parameter-for-parameter the one without this feature.
             next_state_pred_dims: ``[start, end)`` slice of the actor observation the head predicts. ``None``
                 means every dimension.
+            next_state_target_group: Observation group carried ONLY as an extra prediction target (it is not an
+                actor input). Its next-step delta is appended to the head's output. ``None`` = off.
+            next_state_target_dim: Width of that group. Must be > 0 when the group is set.
             episodes_per_trial: ``K``, bookkeeping only: it is what :attr:`episode_index_in_trial` counts up to,
                 and what a caller that does not track trials itself can use to decide when to pass
                 ``trial_dones``. The writer recurrence itself is general in ``K``.
@@ -391,18 +399,34 @@ class ActorCriticEpisodeContext(nn.Module):
         self.critic = MLP(critic_input_dim, 1, list(critic_hidden_dims), activation)
 
         # Optional auxiliary next-state head on ``[h_t | a_t]``. Nothing exists with the default ``None``.
+        self.next_state_target_group = next_state_target_group
+        self.next_state_target_dim = int(next_state_target_dim)
+        self.next_state_target_normalizer = None
         if next_state_head_hidden_dims is None:
             self.next_state_head = None
             self.next_state_pred_start, self.next_state_pred_end = 0, 0
+            assert self.next_state_target_group is None, (
+                "next_state_target_group needs next_state_head_hidden_dims: there is no head to predict it with."
+            )
         else:
             start, end = (0, num_actor_obs) if next_state_pred_dims is None else next_state_pred_dims
             self.next_state_pred_start, self.next_state_pred_end = int(start), int(end)
             assert 0 <= self.next_state_pred_start < self.next_state_pred_end <= num_actor_obs, (
                 f"next_state_pred_dims=({start}, {end}) is not a slice of the {num_actor_obs}-d actor observation."
             )
+            if self.next_state_target_group is None:
+                assert self.next_state_target_dim == 0, "next_state_target_dim > 0 needs next_state_target_group."
+            else:
+                assert self.next_state_target_dim > 0, (
+                    f"next_state_target_group='{self.next_state_target_group}' needs next_state_target_dim > 0."
+                )
+                # Raw pose deltas are mm-scale; normalizing them puts their MSE on the same footing as the
+                # normalized-observation part of the head's output. The stock eps (1e-2) would dominate a
+                # 1e-3 std and squash the target instead of scaling it.
+                self.next_state_target_normalizer = EmpiricalNormalization(self.next_state_target_dim, eps=1e-6)
             self.next_state_head = MLP(
                 d_model + num_actions,
-                self.next_state_pred_end - self.next_state_pred_start,
+                self.next_state_pred_end - self.next_state_pred_start + self.next_state_target_dim,
                 list(next_state_head_hidden_dims),
                 activation,
             )
@@ -479,9 +503,12 @@ class ActorCriticEpisodeContext(nn.Module):
         else:
             print(f"Critic MLP (privileged, {num_critic_obs}-d observation): {self.critic}")
         if self.next_state_head is not None:
+            target = "" if self.next_state_target_group is None else (
+                f" + delta '{self.next_state_target_group}' ({self.next_state_target_dim}-d, normalized)"
+            )
             print(
                 f"Next-state head (predicts normalized delta obs[{self.next_state_pred_start}:"
-                f"{self.next_state_pred_end}] from [h_t | a_t]): {self.next_state_head}"
+                f"{self.next_state_pred_end}]{target} from [h_t | a_t]): {self.next_state_head}"
             )
 
     # --------------------------------------------------------------------------------------------------------
@@ -1355,11 +1382,16 @@ class ActorCriticEpisodeContext(nn.Module):
         """Whether the auxiliary next-state head was built."""
         return self.next_state_head is not None
 
+    @property
+    def next_state_obs_dim(self) -> int:
+        """Width of the observation part of the head's output (the rest is the privileged target group)."""
+        return self.next_state_pred_end - self.next_state_pred_start
+
     def next_state_from_hidden(self, hidden: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         """Predicted normalized ``obs_{t+1} - obs_t`` over the configured slice, from ``h_t`` and ``a_t``.
 
         Shape-agnostic like :meth:`value_from_hidden`: ``[..., d_model]`` and ``[..., num_actions]`` in,
-        ``[..., end - start]`` out.
+        ``[..., (end - start) + next_state_target_dim]`` out (the trailing block is the privileged target group).
         """
         assert self.next_state_head is not None, (
             "next_state_from_hidden() needs next_state_head_hidden_dims; this policy has no auxiliary head."

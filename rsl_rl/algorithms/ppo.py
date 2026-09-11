@@ -400,11 +400,12 @@ class PPO:
             kl = kl[mask]
         return kl.mean()
 
-    def _next_state_loss(self, actions: torch.Tensor, prefix) -> tuple[torch.Tensor, float]:
-        """Masked MSE between the aux head's predicted obs delta and the stored one, plus the valid fraction.
+    def _next_state_loss(self, actions: torch.Tensor, prefix) -> tuple[torch.Tensor, float, float, float]:
+        """Masked MSE of the aux head against the stored deltas: ``(total, obs part, target part, valid frac)``.
 
         Reuses the ``h`` the surrogate's ``act()`` just produced (``policy._window_hidden``) -- the trunk is NOT
-        re-run.
+        re-run. With a privileged target group the head's trailing block is scored against the NORMALIZED raw
+        delta of that group (the normalizer is fit on the valid rows, outside the graph).
         """
         assert prefix is not None and getattr(prefix, "next_delta", None) is not None, (
             "next_state_coef > 0 needs the next-state targets in the hidden-state slot (set"
@@ -415,8 +416,25 @@ class PPO:
         pred = self.policy.next_state_from_hidden(hidden, actions)
         target = prefix.next_delta[..., self.policy.next_state_pred_start : self.policy.next_state_pred_end]
         valid = prefix.next_valid
-        per_row = (pred - target).pow(2).mean(-1)
-        return (per_row * valid).sum() / valid.sum().clamp_min(1), valid.float().mean().item()
+        denominator = valid.sum().clamp_min(1)
+        obs_dim = self.policy.next_state_obs_dim
+        obs_loss = ((pred[..., :obs_dim] - target).pow(2).mean(-1) * valid).sum() / denominator
+        loss, target_value = obs_loss, 0.0
+        normalizer = self.policy.next_state_target_normalizer
+        if normalizer is not None:
+            assert getattr(prefix, "next_target_delta", None) is not None, (
+                f"the policy predicts the '{self.policy.next_state_target_group}' group, but the storage carries"
+                " no target ring (call EpisodeContextRolloutStorage.enable_next_state_target)."
+            )
+            with torch.no_grad():
+                rows = prefix.next_target_delta[valid]
+                if rows.numel() > 0:
+                    normalizer.update(rows)
+                target_delta = normalizer(prefix.next_target_delta)
+            target_loss = ((pred[..., obs_dim:] - target_delta).pow(2).mean(-1) * valid).sum() / denominator
+            loss = loss + target_loss
+            target_value = target_loss.item()
+        return loss, obs_loss.item(), target_value, valid.float().mean().item()
 
     def update(self) -> dict[str, float]:
         # The trial-memory policy trains on adjacent episode pairs, not on flat transitions
@@ -428,6 +446,8 @@ class PPO:
         mean_entropy = 0
         mean_noise_prior_kl = 0.0
         mean_next_state = 0.0
+        mean_next_state_obs = 0.0
+        mean_next_state_target = 0.0
         mean_next_state_valid = 0.0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
@@ -575,10 +595,14 @@ class PPO:
 
             # Auxiliary next-state prediction (episode-context trunk)
             if self.next_state_coef > 0.0:
-                next_state_loss, next_state_valid_frac = self._next_state_loss(actions_batch, hidden_states_batch[0])
+                next_state_loss, obs_part, target_part, valid_frac = self._next_state_loss(
+                    actions_batch, hidden_states_batch[0]
+                )
                 loss = loss + self.next_state_coef * next_state_loss
                 mean_next_state += next_state_loss.item()
-                mean_next_state_valid += next_state_valid_frac
+                mean_next_state_obs += obs_part
+                mean_next_state_target += target_part
+                mean_next_state_valid += valid_frac
 
             # Symmetry loss
             if self.symmetry:
@@ -665,6 +689,8 @@ class PPO:
         mean_entropy /= num_updates
         mean_noise_prior_kl /= num_updates
         mean_next_state /= num_updates
+        mean_next_state_obs /= num_updates
+        mean_next_state_target /= num_updates
         mean_next_state_valid /= num_updates
         mean_ratio /= num_updates
         mean_ratio_std /= num_updates
@@ -694,6 +720,9 @@ class PPO:
         if self.next_state_coef > 0.0:
             loss_dict["next_state"] = mean_next_state
             loss_dict["next_state_valid_frac"] = mean_next_state_valid
+            if self.policy.next_state_target_normalizer is not None:
+                loss_dict["next_state_obs"] = mean_next_state_obs
+                loss_dict["next_state_obj"] = mean_next_state_target
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

@@ -66,7 +66,8 @@ class EpisodeContextPPO(PPO):
 
         ``next_state_coef`` adds ``coef * MSE(head([h_t | a_t]), obs_{t+1} - obs_t)`` over the policy's
         ``next_state_pred_dims`` slice of the (normalized) actor observation, masked to transitions that stay
-        inside one episode. It needs a policy built with ``next_state_head_hidden_dims``. ``0`` = off.
+        inside one episode. It needs a policy built with ``next_state_head_hidden_dims``. ``0`` = off. A policy
+        with a ``next_state_target_group`` also predicts that privileged group's (normalized) delta.
 
         ``eval_env_fraction`` carves a deterministic eval pool out of the LAST environments: they act on the
         distribution MEAN and their rows never enter the update. Their success rate is what a success-gated
@@ -149,6 +150,16 @@ class EpisodeContextPPO(PPO):
             max_policy_lag=self.max_policy_lag,
         )
         self.storage.with_next_state = self.next_state_coef > 0.0
+        target_group = self.policy.next_state_target_group
+        if self.storage.with_next_state and target_group is not None:
+            assert target_group in obs, (
+                f"next_state_target_group='{target_group}' is not an observation group ({list(obs.keys())})."
+            )
+            assert obs[target_group].shape[-1] == self.policy.next_state_target_dim, (
+                f"next_state_target_dim={self.policy.next_state_target_dim} != the env's"
+                f" '{target_group}' width {obs[target_group].shape[-1]}."
+            )
+            self.storage.enable_next_state_target(target_group, self.policy.next_state_target_dim)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Stock :meth:`PPO.act`, except that the eval pool executes the distribution MEAN.
@@ -195,6 +206,8 @@ class EpisodeContextPPO(PPO):
         mean_entropy = 0.0
         mean_noise_prior_kl = 0.0
         mean_next_state = 0.0
+        mean_next_state_obs = 0.0
+        mean_next_state_target = 0.0
         mean_next_state_valid = 0.0
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_ratio = 0.0
@@ -304,10 +317,14 @@ class EpisodeContextPPO(PPO):
 
             # Auxiliary next-state prediction (episode-context trunk)
             if self.next_state_coef > 0.0:
-                next_state_loss, next_state_valid_frac = self._next_state_loss(actions_batch, hidden_states_batch[0])
+                next_state_loss, obs_part, target_part, valid_frac = self._next_state_loss(
+                    actions_batch, hidden_states_batch[0]
+                )
                 loss = loss + self.next_state_coef * next_state_loss
                 mean_next_state += next_state_loss.item()
-                mean_next_state_valid += next_state_valid_frac
+                mean_next_state_obs += obs_part
+                mean_next_state_target += target_part
+                mean_next_state_valid += valid_frac
 
             # RND loss
             if self.rnd:
@@ -376,6 +393,8 @@ class EpisodeContextPPO(PPO):
         mean_entropy /= num_updates
         mean_noise_prior_kl /= num_updates
         mean_next_state /= num_updates
+        mean_next_state_obs /= num_updates
+        mean_next_state_target /= num_updates
         mean_next_state_valid /= num_updates
         mean_ratio /= num_updates
         mean_ratio_std /= num_updates
@@ -402,6 +421,9 @@ class EpisodeContextPPO(PPO):
         if self.next_state_coef > 0.0:
             loss_dict["next_state"] = mean_next_state
             loss_dict["next_state_valid_frac"] = mean_next_state_valid
+            if self.policy.next_state_target_normalizer is not None:
+                loss_dict["next_state_obs"] = mean_next_state_obs
+                loss_dict["next_state_obj"] = mean_next_state_target
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         return loss_dict
