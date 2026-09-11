@@ -22,9 +22,9 @@ are inherited byte-for-byte from the known-good implementation. There are four o
   that just finished. With ``memory_tokens == 0`` the override is a plain ``super()`` call.
 
 Everything else a reader might expect to be different here -- the ratio, the KL schedule, the clipping, the
-diagnostics -- is not. The one loss addition is opt-in and off by default: ``noise_prior_kl_coef > 0`` adds
-``KL(pi || N(0, I))`` on the first ``noise_prior_dims`` action dims (the hook itself lives in ``ppo.py``, next
-to the entropy term).
+diagnostics -- is not. The two loss additions are opt-in and off by default: ``noise_prior_kl_coef > 0`` adds
+``KL(pi || N(0, I))`` on the first ``noise_prior_dims`` action dims, and ``next_state_coef > 0`` adds the
+auxiliary next-state prediction on the trunk readout (both hooks live in ``ppo.py``, next to the entropy term).
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ class EpisodeContextPPO(PPO):
         defer_obs_normalization: bool = True,
         noise_prior_kl_coef: float = 0.0,
         noise_prior_dims: int = 0,
+        next_state_coef: float = 0.0,
         eval_env_fraction: float = 0.0,
         grad_accumulation_steps: int = 1,
         **kwargs,
@@ -62,6 +63,10 @@ class EpisodeContextPPO(PPO):
         ``noise_prior_kl_coef`` / ``noise_prior_dims`` add ``coef * KL(pi_z || N(0, I))`` on the first
         ``noise_prior_dims`` action dims (RFS: those dims are the frozen flow's x0, which is only valid inside
         the unit Gaussian it was trained on). ``0`` leaves the loss untouched.
+
+        ``next_state_coef`` adds ``coef * MSE(head([h_t | a_t]), obs_{t+1} - obs_t)`` over the policy's
+        ``next_state_pred_dims`` slice of the (normalized) actor observation, masked to transitions that stay
+        inside one episode. It needs a policy built with ``next_state_head_hidden_dims``. ``0`` = off.
 
         ``eval_env_fraction`` carves a deterministic eval pool out of the LAST environments: they act on the
         distribution MEAN and their rows never enter the update. Their success rate is what a success-gated
@@ -91,6 +96,11 @@ class EpisodeContextPPO(PPO):
         )
         self.noise_prior_kl_coef = float(noise_prior_kl_coef)
         self.noise_prior_dims = int(noise_prior_dims)
+        assert next_state_coef >= 0.0, "next_state_coef must be non-negative."
+        assert next_state_coef == 0.0 or policy.next_state_enabled, (
+            "next_state_coef > 0 needs a policy built with next_state_head_hidden_dims."
+        )
+        self.next_state_coef = float(next_state_coef)
         assert 0.0 <= eval_env_fraction < 1.0, f"eval_env_fraction must be in [0, 1), got {eval_env_fraction}."
         self.eval_env_fraction = float(eval_env_fraction)
         assert grad_accumulation_steps >= 1, f"grad_accumulation_steps must be >= 1, got {grad_accumulation_steps}."
@@ -138,6 +148,7 @@ class EpisodeContextPPO(PPO):
             d_model=self.policy.d_model,
             max_policy_lag=self.max_policy_lag,
         )
+        self.storage.with_next_state = self.next_state_coef > 0.0
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Stock :meth:`PPO.act`, except that the eval pool executes the distribution MEAN.
@@ -183,6 +194,8 @@ class EpisodeContextPPO(PPO):
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_noise_prior_kl = 0.0
+        mean_next_state = 0.0
+        mean_next_state_valid = 0.0
         mean_rnd_loss = 0.0 if self.rnd else None
         mean_ratio = 0.0
         mean_ratio_std = 0.0
@@ -289,6 +302,13 @@ class EpisodeContextPPO(PPO):
                 loss = loss + self.noise_prior_kl_coef * noise_prior_kl
                 mean_noise_prior_kl += noise_prior_kl.item()
 
+            # Auxiliary next-state prediction (episode-context trunk)
+            if self.next_state_coef > 0.0:
+                next_state_loss, next_state_valid_frac = self._next_state_loss(actions_batch, hidden_states_batch[0])
+                loss = loss + self.next_state_coef * next_state_loss
+                mean_next_state += next_state_loss.item()
+                mean_next_state_valid += next_state_valid_frac
+
             # RND loss
             if self.rnd:
                 with torch.no_grad():
@@ -355,6 +375,8 @@ class EpisodeContextPPO(PPO):
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_noise_prior_kl /= num_updates
+        mean_next_state /= num_updates
+        mean_next_state_valid /= num_updates
         mean_ratio /= num_updates
         mean_ratio_std /= num_updates
         mean_ratio_clip_frac /= num_updates
@@ -377,6 +399,9 @@ class EpisodeContextPPO(PPO):
         }
         if self.noise_prior_kl_coef > 0.0:
             loss_dict["noise_prior_kl"] = mean_noise_prior_kl
+        if self.next_state_coef > 0.0:
+            loss_dict["next_state"] = mean_next_state
+            loss_dict["next_state_valid_frac"] = mean_next_state_valid
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         return loss_dict

@@ -211,6 +211,11 @@ class EpisodeContextPrefix:
         source_valid: Validity of every row of :attr:`source_hidden`, ``[B, n_seg, M + T]``.
         segment_has_source: Whether a segment has a source episode at all, ``[B, n_seg]``. ``False`` means the
             segment is episode 0 of its trial and reads ``z_init``.
+        next_delta: Target of the auxiliary next-state loss, ``[W, B, obs_dim]``: the NORMALIZED
+            ``obs_{t+1} - obs_t`` of every window row, zero where the successor is not a valid transition.
+            ``None`` unless the storage was asked for it (``with_next_state``).
+        next_valid: Which window rows have a successor frame inside the same episode, ``[W, B]``. The last
+            window row and every row at an episode boundary (time-outs included) are ``False``.
     """
 
     obs: torch.Tensor
@@ -221,6 +226,8 @@ class EpisodeContextPrefix:
     source_hidden: torch.Tensor | None = None
     source_valid: torch.Tensor | None = None
     segment_has_source: torch.Tensor | None = None
+    next_delta: torch.Tensor | None = None
+    next_valid: torch.Tensor | None = None
 
 
 class ActorCriticEpisodeContext(nn.Module):
@@ -252,6 +259,8 @@ class ActorCriticEpisodeContext(nn.Module):
         detach_critic_trunk: bool = False,
         memory_tokens: int = 0,
         episodes_per_trial: int = 2,
+        next_state_head_hidden_dims: tuple[int] | list[int] | None = None,
+        next_state_pred_dims: tuple[int, int] | list[int] | None = None,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the episode-context actor-critic.
@@ -296,6 +305,11 @@ class ActorCriticEpisodeContext(nn.Module):
             memory_tokens: ``M``, the number of cross-episode memory rows PREPENDED to the trunk's sequence.
                 ``0`` (the default) builds no memory submodule at all and leaves every code path exactly as it
                 is without this feature.
+            next_state_head_hidden_dims: Hidden dims of the auxiliary next-state head, an MLP on
+                ``[h_t | a_t]`` predicting the NORMALIZED ``obs_{t+1} - obs_t``. ``None`` (the default) builds no
+                head at all, so the policy is parameter-for-parameter the one without this feature.
+            next_state_pred_dims: ``[start, end)`` slice of the actor observation the head predicts. ``None``
+                means every dimension.
             episodes_per_trial: ``K``, bookkeeping only: it is what :attr:`episode_index_in_trial` counts up to,
                 and what a caller that does not track trials itself can use to decide when to pass
                 ``trial_dones``. The writer recurrence itself is general in ``K``.
@@ -376,6 +390,23 @@ class ActorCriticEpisodeContext(nn.Module):
         critic_input_dim = num_critic_obs if self.critic_design == "privileged" else d_model
         self.critic = MLP(critic_input_dim, 1, list(critic_hidden_dims), activation)
 
+        # Optional auxiliary next-state head on ``[h_t | a_t]``. Nothing exists with the default ``None``.
+        if next_state_head_hidden_dims is None:
+            self.next_state_head = None
+            self.next_state_pred_start, self.next_state_pred_end = 0, 0
+        else:
+            start, end = (0, num_actor_obs) if next_state_pred_dims is None else next_state_pred_dims
+            self.next_state_pred_start, self.next_state_pred_end = int(start), int(end)
+            assert 0 <= self.next_state_pred_start < self.next_state_pred_end <= num_actor_obs, (
+                f"next_state_pred_dims=({start}, {end}) is not a slice of the {num_actor_obs}-d actor observation."
+            )
+            self.next_state_head = MLP(
+                d_model + num_actions,
+                self.next_state_pred_end - self.next_state_pred_start,
+                list(next_state_head_hidden_dims),
+                activation,
+            )
+
         # ``separate_trunk``: a second token pathway of the same shape, on the same observation. Every module is
         # named ``critic_*`` so a critic-only warm-up trains all of it. ``z_init`` and the writer are NOT
         # duplicated -- there is one memory, and it enters this pathway detached.
@@ -447,6 +478,11 @@ class ActorCriticEpisodeContext(nn.Module):
             )
         else:
             print(f"Critic MLP (privileged, {num_critic_obs}-d observation): {self.critic}")
+        if self.next_state_head is not None:
+            print(
+                f"Next-state head (predicts normalized delta obs[{self.next_state_pred_start}:"
+                f"{self.next_state_pred_end}] from [h_t | a_t]): {self.next_state_head}"
+            )
 
     # --------------------------------------------------------------------------------------------------------
     # Initialization / runtime state
@@ -481,6 +517,11 @@ class ActorCriticEpisodeContext(nn.Module):
             nn.init.normal_(self.critic_start_embed, mean=0.0, std=0.02)
             if self.num_memory_tokens > 0:
                 nn.init.normal_(self.critic_memory_pos_embed, mean=0.0, std=0.02)
+        if self.next_state_head is not None:
+            # Zero output layer: the aux head predicts exactly 0 at init, so a loaded BC policy that has no head
+            # in its checkpoint is behaviorally unchanged (the head only ever feeds its own loss anyway).
+            nn.init.zeros_(self.next_state_head[-1].weight)
+            nn.init.zeros_(self.next_state_head[-1].bias)
 
     _RUNTIME_STATE_ATTRS: tuple[str, ...] = (
         "_num_envs",
@@ -1308,6 +1349,22 @@ class ActorCriticEpisodeContext(nn.Module):
                 " ('separate_trunk'), not the actor's. Call evaluate(obs) instead."
             )
         return self.critic(hidden.detach() if self.detach_critic_trunk else hidden)
+
+    @property
+    def next_state_enabled(self) -> bool:
+        """Whether the auxiliary next-state head was built."""
+        return self.next_state_head is not None
+
+    def next_state_from_hidden(self, hidden: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Predicted normalized ``obs_{t+1} - obs_t`` over the configured slice, from ``h_t`` and ``a_t``.
+
+        Shape-agnostic like :meth:`value_from_hidden`: ``[..., d_model]`` and ``[..., num_actions]`` in,
+        ``[..., end - start]`` out.
+        """
+        assert self.next_state_head is not None, (
+            "next_state_from_hidden() needs next_state_head_hidden_dims; this policy has no auxiliary head."
+        )
+        return self.next_state_head(torch.cat([hidden, actions.to(dtype=hidden.dtype)], dim=-1))
 
     def _hidden_for_value(
         self,

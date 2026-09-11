@@ -153,6 +153,8 @@ class PPO:
         # frozen flow, whose noise channel has to stay inside the unit Gaussian it was trained on); 0 = off.
         self.noise_prior_kl_coef = 0.0
         self.noise_prior_dims = 0
+        # Optional auxiliary next-state prediction on the episode-context trunk. Set by EpisodeContextPPO; 0 = off.
+        self.next_state_coef = 0.0
         # If set, the observation normalizers are not updated during collection. The runner is then
         # responsible for calling :meth:`commit_obs_normalization` once the rollout has been consumed,
         # so that a rollout is acted and reconstructed under identical normalizer statistics.
@@ -398,6 +400,24 @@ class PPO:
             kl = kl[mask]
         return kl.mean()
 
+    def _next_state_loss(self, actions: torch.Tensor, prefix) -> tuple[torch.Tensor, float]:
+        """Masked MSE between the aux head's predicted obs delta and the stored one, plus the valid fraction.
+
+        Reuses the ``h`` the surrogate's ``act()`` just produced (``policy._window_hidden``) -- the trunk is NOT
+        re-run.
+        """
+        assert prefix is not None and getattr(prefix, "next_delta", None) is not None, (
+            "next_state_coef > 0 needs the next-state targets in the hidden-state slot (set"
+            " EpisodeContextRolloutStorage.with_next_state)."
+        )
+        hidden = self.policy._window_hidden
+        assert hidden is not None, "The next-state head reads the window hidden state act() leaves behind."
+        pred = self.policy.next_state_from_hidden(hidden, actions)
+        target = prefix.next_delta[..., self.policy.next_state_pred_start : self.policy.next_state_pred_end]
+        valid = prefix.next_valid
+        per_row = (pred - target).pow(2).mean(-1)
+        return (per_row * valid).sum() / valid.sum().clamp_min(1), valid.float().mean().item()
+
     def update(self) -> dict[str, float]:
         # The trial-memory policy trains on adjacent episode pairs, not on flat transitions
         if self.is_trial_memory:
@@ -407,6 +427,8 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_noise_prior_kl = 0.0
+        mean_next_state = 0.0
+        mean_next_state_valid = 0.0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -551,6 +573,13 @@ class PPO:
                 loss = loss + self.noise_prior_kl_coef * noise_prior_kl
                 mean_noise_prior_kl += noise_prior_kl.item()
 
+            # Auxiliary next-state prediction (episode-context trunk)
+            if self.next_state_coef > 0.0:
+                next_state_loss, next_state_valid_frac = self._next_state_loss(actions_batch, hidden_states_batch[0])
+                loss = loss + self.next_state_coef * next_state_loss
+                mean_next_state += next_state_loss.item()
+                mean_next_state_valid += next_state_valid_frac
+
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions
@@ -635,6 +664,8 @@ class PPO:
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_noise_prior_kl /= num_updates
+        mean_next_state /= num_updates
+        mean_next_state_valid /= num_updates
         mean_ratio /= num_updates
         mean_ratio_std /= num_updates
         mean_ratio_clip_frac /= num_updates
@@ -660,6 +691,9 @@ class PPO:
         }
         if self.noise_prior_kl_coef > 0.0:
             loss_dict["noise_prior_kl"] = mean_noise_prior_kl
+        if self.next_state_coef > 0.0:
+            loss_dict["next_state"] = mean_next_state
+            loss_dict["next_state_valid_frac"] = mean_next_state_valid
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

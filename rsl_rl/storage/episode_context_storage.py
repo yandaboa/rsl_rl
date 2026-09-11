@@ -130,6 +130,8 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         self.episode_step = torch.zeros(num_envs, dtype=torch.long, device=device)
         # Total frames ever written; the ring slot of global step ``g`` is ``g % ring_size``.
         self.total_steps = 0
+        # Set by the algorithm when the auxiliary next-state loss is on; off means the generator allocates nothing.
+        self.with_next_state = False
 
         # -- cross-episode memory (all of this is absent with memory_tokens = 0) --
         self.num_memory_tokens = int(memory_tokens)
@@ -395,6 +397,27 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         positions = self.frame_positions[slots]
         return self.frame_obs[slots[:prefix]], positions[:prefix], positions[prefix:]
 
+    def next_state_slice(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-window-row successor deltas of the frames in the ring, for the auxiliary next-state loss.
+
+        Returns:
+            ``next_delta`` ``[W, N, obs_dim]`` (normalized ``obs_{t+1} - obs_t``, zero where invalid) and
+            ``next_valid`` ``[W, N]``. A row is valid only if its successor frame is stored AND continues the
+            same episode (``position + 1``), which excludes every boundary, time-outs included; the last window
+            row never has a stored successor.
+        """
+        window = self.step
+        first = self.total_steps - window
+        globals_ = torch.arange(first, first + window, device=self.device)
+        slots = torch.remainder(globals_, self.ring_size)
+        next_slots = torch.remainder(globals_ + 1, self.ring_size)
+        obs, positions = self.frame_obs[slots], self.frame_positions[slots]
+        next_obs, next_positions = self.frame_obs[next_slots], self.frame_positions[next_slots]
+        # ``total_steps - 1`` is the newest stored global step.
+        stored = (globals_ + 1 <= self.total_steps - 1).unsqueeze(1).expand(-1, self.num_envs)
+        valid = stored & (next_positions == positions + 1)
+        return (next_obs - obs) * valid.unsqueeze(-1), valid
+
     def mini_batch_env_chunks(self, num_mini_batches: int) -> list[tuple[int, int]]:
         """``[start, stop)`` training-environment ranges of the LOGICAL minibatches, in the order handed out.
 
@@ -426,6 +449,9 @@ class EpisodeContextRolloutStorage(RolloutStorage):
           the ``shared_trunk`` one reuses the actor's ``h``). With a memory policy the prefix additionally
           carries the per-segment source episodes and the explicit segment ids (see :meth:`_segment_sources`),
         * ``masks_batch = None``: there is nothing to mask, which keeps the stock loss reductions exact.
+
+        With :attr:`with_next_state` the prefix also carries the auxiliary next-state targets (see
+        :meth:`next_state_slice`); without it nothing is computed or allocated for them.
 
         With an eval pool (``num_eval_envs > 0``) the chunks cover ``[0, num_train_envs)`` only: those
         environments acted deterministically, so their rows are off-policy for this update and are dropped.
@@ -474,6 +500,7 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         prefix_obs, prefix_positions, window_positions = self.context_slice()
         num_prefix = prefix_obs.shape[0]
         snapshots = self._snapshot_index() if self.has_memory else None
+        next_delta, next_valid = self.next_state_slice() if self.with_next_state else (None, None)
 
         for _ in range(num_epochs):
             for start, stop in chunks:
@@ -491,11 +518,16 @@ class EpisodeContextRolloutStorage(RolloutStorage):
                         memory_segments=memory_segments,
                     )
 
+                next_state_fields: dict[str, torch.Tensor] = {}
+                if next_delta is not None:
+                    next_state_fields = dict(next_delta=next_delta[:, envs], next_valid=next_valid[:, envs])
+
                 hidden_state_a_batch = EpisodeContextPrefix(
                     obs=prefix_obs[:, envs],
                     positions=prefix_positions[:, envs],
                     window_positions=window_positions[:, envs],
                     **memory_fields,
+                    **next_state_fields,
                 )
 
                 yield (
