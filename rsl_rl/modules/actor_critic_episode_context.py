@@ -266,6 +266,9 @@ class ActorCriticEpisodeContext(nn.Module):
         next_state_pred_dims: tuple[int, int] | list[int] | None = None,
         next_state_target_group: str | None = None,
         next_state_target_dim: int = 0,
+        privileged_group: str | None = None,
+        privileged_encoder_hidden_dims: tuple[int] | list[int] = [256, 128],
+        privileged_embed_dim: int = 32,
         **kwargs: dict[str, Any],
     ) -> None:
         """Initialize the episode-context actor-critic.
@@ -318,6 +321,15 @@ class ActorCriticEpisodeContext(nn.Module):
             next_state_target_group: Observation group carried ONLY as an extra prediction target (it is not an
                 actor input). Its next-step delta is appended to the head's output. ``None`` = off.
             next_state_target_dim: Width of that group. Must be > 0 when the group is set.
+            privileged_group: Observation group carried as the LAST entry of ``obs_groups["policy"]`` and fed to
+                the trunk through its own encoder instead of ``token_embed``. ``None`` (the default) builds
+                nothing, so the policy is parameter-for-parameter the one without this feature. The stored /
+                rolled-out frame stays the raw ``[policy | privileged]`` concat; only the token is built in two
+                pieces, and ``token_embed`` keeps the width of the NON-privileged part so a BC init trained
+                without the group loads with identical shapes.
+            privileged_encoder_hidden_dims: Hidden dims of the privileged encoder MLP (ELU).
+            privileged_embed_dim: Width the privileged group is compressed to before the (zero-initialized)
+                projection into ``d_model``.
             episodes_per_trial: ``K``, bookkeeping only: it is what :attr:`episode_index_in_trial` counts up to,
                 and what a caller that does not track trials itself can use to decide when to pass
                 ``trial_dones``. The writer recurrence itself is general in ``K``.
@@ -351,6 +363,22 @@ class ActorCriticEpisodeContext(nn.Module):
             assert len(obs[obs_group].shape) == 2, "The ActorCriticEpisodeContext module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
+        # Privileged group: the LAST entry of the policy groups, fed through its own encoder (see below). The
+        # frame the storage and the acting path carry stays the raw [policy | privileged] concat.
+        self.privileged_group = privileged_group
+        if privileged_group is None:
+            self.privileged_dim = 0
+        else:
+            assert obs_groups["policy"][-1] == privileged_group, (
+                f"privileged_group='{privileged_group}' must be the LAST entry of obs_groups['policy']"
+                f" ({obs_groups['policy']}): it is read off the tail of the concatenated frame."
+            )
+            self.privileged_dim = int(obs[privileged_group].shape[-1])
+            assert self.privileged_dim > 0, f"privileged_group='{privileged_group}' is empty."
+        # What ``token_embed`` and ``actor_obs_normalizer`` are sized on: a BC init trained without the
+        # privileged group loads into this policy with identical shapes.
+        self.num_token_obs = num_actor_obs - self.privileged_dim
+
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
@@ -368,10 +396,21 @@ class ActorCriticEpisodeContext(nn.Module):
         # Token embedding: Embed(o_t). No action/reward/done channels -- the policy observation already carries
         # the previous action, and nothing is meant to flow across the episode boundary.
         if len(embed_hidden_dims) == 0:
-            self.token_embed = nn.Linear(num_actor_obs, d_model)
+            self.token_embed = nn.Linear(self.num_token_obs, d_model)
         else:
-            self.token_embed = MLP(num_actor_obs, d_model, list(embed_hidden_dims), activation)
+            self.token_embed = MLP(self.num_token_obs, d_model, list(embed_hidden_dims), activation)
         self.start_embed = nn.Parameter(torch.zeros(d_model))
+
+        # Privileged encoder: token = token_embed(policy part) + privileged_proj(encoder(privileged part)).
+        # ``privileged_proj`` is zero-initialized, so at init the token is exactly the non-privileged one.
+        if self.privileged_dim > 0:
+            assert len(privileged_encoder_hidden_dims) > 0 and privileged_embed_dim > 0, (
+                "privileged_group needs privileged_encoder_hidden_dims and privileged_embed_dim > 0."
+            )
+            self.privileged_encoder = MLP(
+                self.privileged_dim, privileged_embed_dim, list(privileged_encoder_hidden_dims), "elu"
+            )
+            self.privileged_proj = nn.Linear(privileged_embed_dim, d_model)
 
         # Trunk
         ff_dim = ff_mult * d_model
@@ -436,9 +475,9 @@ class ActorCriticEpisodeContext(nn.Module):
         # duplicated -- there is one memory, and it enters this pathway detached.
         if self.critic_design == "separate_trunk":
             if len(embed_hidden_dims) == 0:
-                self.critic_token_embed = nn.Linear(num_actor_obs, d_model)
+                self.critic_token_embed = nn.Linear(self.num_token_obs, d_model)
             else:
-                self.critic_token_embed = MLP(num_actor_obs, d_model, list(embed_hidden_dims), activation)
+                self.critic_token_embed = MLP(self.num_token_obs, d_model, list(embed_hidden_dims), activation)
             self.critic_start_embed = nn.Parameter(torch.zeros(d_model))
             self.critic_blocks = nn.ModuleList([
                 TrunkBlock(d_model, num_heads, ff_dim, activation) for _ in range(num_layers)
@@ -451,9 +490,15 @@ class ActorCriticEpisodeContext(nn.Module):
         # handling (which pokes ``actor_obs_normalizer`` / ``critic_obs_normalizer``) works unchanged.
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs, until=normalizer_until)
+            self.actor_obs_normalizer = EmpiricalNormalization(self.num_token_obs, until=normalizer_until)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
+        # The privileged tail has its own statistics: ``actor_obs_normalizer`` keeps the width a BC checkpoint
+        # fitted it at, so its buffers load unchanged.
+        if self.privileged_dim > 0 and actor_obs_normalization:
+            self.privileged_normalizer = EmpiricalNormalization(self.privileged_dim, until=normalizer_until)
+        else:
+            self.privileged_normalizer = torch.nn.Identity()
         # A shared-trunk critic never touches the critic observation, so its normalizer would only accumulate
         # statistics nothing reads (and would crash ``update_normalization`` when the group does not exist).
         self.critic_obs_normalization = critic_obs_normalization and self.critic_design == "privileged"
@@ -502,6 +547,11 @@ class ActorCriticEpisodeContext(nn.Module):
             )
         else:
             print(f"Critic MLP (privileged, {num_critic_obs}-d observation): {self.critic}")
+        if self.privileged_dim > 0:
+            print(
+                f"Privileged encoder ('{self.privileged_group}', {self.privileged_dim}-d ->"
+                f" {privileged_embed_dim}-d, zero-init projection into d={d_model}): {self.privileged_encoder}"
+            )
         if self.next_state_head is not None:
             target = "" if self.next_state_target_group is None else (
                 f" + delta '{self.next_state_target_group}' ({self.next_state_target_dim}-d, normalized)"
@@ -544,6 +594,10 @@ class ActorCriticEpisodeContext(nn.Module):
             nn.init.normal_(self.critic_start_embed, mean=0.0, std=0.02)
             if self.num_memory_tokens > 0:
                 nn.init.normal_(self.critic_memory_pos_embed, mean=0.0, std=0.02)
+        if self.privileged_dim > 0:
+            # Exactly zero: a token is the non-privileged one at init, so a BC init is reproduced bit for bit.
+            nn.init.zeros_(self.privileged_proj.weight)
+            nn.init.zeros_(self.privileged_proj.bias)
         if self.next_state_head is not None:
             # Zero output layer: the aux head predicts exactly 0 at init, so a loaded BC policy that has no head
             # in its checkpoint is behaviorally unchanged (the head only ever feeds its own loss anyway).
@@ -972,9 +1026,32 @@ class ActorCriticEpisodeContext(nn.Module):
         obs_groups = self.obs_groups.get("critic", self.obs_groups["policy"])
         return torch.cat([obs[obs_group] for obs_group in obs_groups], dim=-1)
 
+    def split_privileged(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(policy part, privileged part)`` of a frame. The privileged part is ``None`` without the group."""
+        if self.privileged_dim == 0:
+            return obs, None
+        return obs[..., : self.num_token_obs], obs[..., self.num_token_obs :]
+
+    def normalize_actor_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        """Normalize a raw frame: the privileged tail goes through its own normalizer, the rest through the
+        actor's. Same width in and out, so a stored frame stays the raw ``[policy | privileged]`` concat."""
+        if self.privileged_dim == 0:
+            return self.actor_obs_normalizer(obs)
+        policy_obs, privileged_obs = self.split_privileged(obs)
+        return torch.cat([self.actor_obs_normalizer(policy_obs), self.privileged_normalizer(privileged_obs)], dim=-1)
+
+    @property
+    def frame_normalizer(self) -> Any:
+        """What normalizes a STORED frame (the storage holds the raw concat, normalized at collection time)."""
+        return self.actor_obs_normalizer if self.privileged_dim == 0 else self.normalize_actor_obs
+
     def update_normalization(self, obs: TensorDict | torch.Tensor) -> None:
         if self.actor_obs_normalization:
-            self.actor_obs_normalizer.update(self.get_actor_obs(obs).reshape(-1, self.num_actor_obs))
+            frames = self.get_actor_obs(obs).reshape(-1, self.num_actor_obs)
+            policy_obs, privileged_obs = self.split_privileged(frames)
+            self.actor_obs_normalizer.update(policy_obs)
+            if privileged_obs is not None:
+                self.privileged_normalizer.update(privileged_obs)
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self.get_critic_obs(obs).reshape(-1, self.num_critic_obs))
 
@@ -1015,12 +1092,16 @@ class ActorCriticEpisodeContext(nn.Module):
         supplies the episode-start flag on this path (and needs no clamping -- RoPE takes any integer).
 
         Both pathways normalize with the SAME ``actor_obs_normalizer``: there is one observation stream, and the
-        normalizer holds buffers only, so nothing differentiable is shared by this.
+        normalizer holds buffers only, so nothing differentiable is shared by this. With a privileged group the
+        frame's tail is split off and enters through ``privileged_encoder``/``privileged_proj`` instead.
         """
         token_embed, start_embed, _, _, _ = self._pathway(critic)
         if normalize_obs:
-            obs = self.actor_obs_normalizer(obs)
-        tokens = token_embed(obs)
+            obs = self.normalize_actor_obs(obs)
+        policy_obs, privileged_obs = self.split_privileged(obs)
+        tokens = token_embed(policy_obs)
+        if privileged_obs is not None:
+            tokens = tokens + self.privileged_proj(self.privileged_encoder(privileged_obs))
         is_start = (positions == 0).unsqueeze(-1).to(tokens.dtype)
         return tokens + is_start * start_embed
 
@@ -1192,7 +1273,7 @@ class ActorCriticEpisodeContext(nn.Module):
         # :class:`EpisodeContextPrefix`.
         window_obs = self.get_actor_obs(obs)
         if normalize_obs:
-            window_obs = self.actor_obs_normalizer(window_obs)
+            window_obs = self.normalize_actor_obs(window_obs)
         num_prefix = prefix.obs.shape[0]
         if num_prefix > 0:
             sequence = torch.cat([prefix.obs, window_obs], dim=0)

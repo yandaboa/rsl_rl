@@ -144,7 +144,7 @@ class EpisodeContextPPO(PPO):
             context_length=self.policy.context_length,
             max_episode_length=self.policy.max_episode_length,
             num_layers=self.policy.num_layers,
-            actor_obs_normalizer=self.policy.actor_obs_normalizer,
+            actor_obs_normalizer=self.policy.frame_normalizer,
             memory_tokens=self.policy.num_memory_tokens,
             d_model=self.policy.d_model,
             max_policy_lag=self.max_policy_lag,

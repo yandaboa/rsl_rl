@@ -41,7 +41,7 @@ the same ``hidden_states`` carrier as the prefix; the writer itself runs in the 
 from __future__ import annotations
 
 import torch
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from tensordict import TensorDict
 
 from rsl_rl.modules.actor_critic_episode_context import EpisodeContextPrefix
@@ -63,7 +63,7 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         context_length: int = 80,
         max_episode_length: int = 80,
         num_layers: int = 1,
-        actor_obs_normalizer: torch.nn.Module | None = None,
+        actor_obs_normalizer: Callable[[torch.Tensor], torch.Tensor] | None = None,
         memory_tokens: int = 0,
         d_model: int = 0,
         num_eval_envs: int = 0,
@@ -73,7 +73,9 @@ class EpisodeContextRolloutStorage(RolloutStorage):
         Args:
             actor_obs_groups: Observation groups the actor's tokens are built from (``obs_groups["policy"]``).
                 Defaults to every group in ``obs``.
-            actor_obs_normalizer: The policy's observation normalizer. Frames are stored **normalized**, at
+            actor_obs_normalizer: The policy's frame normalizer (``ActorCriticEpisodeContext.frame_normalizer``:
+                the plain observation normalizer, or the split one when the policy has a privileged group).
+                Frames are stored **normalized**, at
                 collection time, i.e. exactly as the acting path saw them: a prefix frame is usually read back
                 one or more rollouts (and therefore one or more normalizer commits) later, and re-normalizing it
                 with the statistics of that later update would rebuild a different token than the behavior
