@@ -165,8 +165,10 @@ class Logger:
             # Log episode extras
             extras_string = ""
             if self.ep_extras:
-                # Iterate over all keys in the episode info dictionary
-                for key in self.ep_extras[0]:
+                # Union of keys over the iteration (first-appearance order): a key absent from the first
+                # logged step (e.g. a bucket that only fires on some steps) would otherwise be dropped.
+                all_keys = dict.fromkeys(key for ep_info in self.ep_extras for key in ep_info)
+                for key in all_keys:
                     infotensor = torch.tensor([], device=self.device)
                     # Iterate over all steps
                     for ep_info in self.ep_extras:

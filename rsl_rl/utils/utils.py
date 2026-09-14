@@ -389,3 +389,30 @@ def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Ten
     else:
         # For standard Tensors, we must explicitly handle feature dimensions in view()
         return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)
+
+
+def pad_state_dict_to_model(
+    model: torch.nn.Module, state_dict: dict[str, torch.Tensor], log_prefix: str = "[load]"
+) -> dict[str, torch.Tensor]:
+    """Zero-pad / truncate shape-mismatched tensors of ``state_dict`` to the model's shapes (non-strict loads).
+
+    Keys absent from the model are left untouched; for every mismatched key a zero tensor of the model's shape is
+    filled with the overlapping slice of the checkpoint's tensor.
+    """
+    current = model.state_dict()
+    padded = dict(state_dict)
+    for key, current_value in current.items():
+        if key not in padded:
+            continue
+        ckpt_value = padded[key]
+        if not isinstance(ckpt_value, torch.Tensor) or ckpt_value.shape == current_value.shape:
+            continue
+        new_value = torch.zeros_like(current_value)
+        slices = tuple(slice(0, min(c, k)) for c, k in zip(current_value.shape, ckpt_value.shape))
+        new_value[slices] = ckpt_value[slices].to(new_value.dtype)
+        padded[key] = new_value
+        print(
+            f"{log_prefix} shape mismatch for '{key}': {tuple(ckpt_value.shape)} -> {tuple(current_value.shape)},"
+            " padded with zeros"
+        )
+    return padded

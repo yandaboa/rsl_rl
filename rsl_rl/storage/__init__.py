@@ -5,6 +5,7 @@
 
 """Storage for the learning algorithms."""
 
+from .episode_context_storage import EpisodeContextRolloutStorage
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["EpisodeContextRolloutStorage", "RolloutStorage"]

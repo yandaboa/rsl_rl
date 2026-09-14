@@ -18,6 +18,7 @@ from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalN
 from .rnn import RNN, HiddenState
 from .student_teacher import StudentTeacher
 from .student_teacher_vision import StudentTeacherVision
+from .transformer import MultiHeadAttention, TrunkBlock
 
 # NOTE: StudentTeacherRecurrent intentionally skipped — depends on rsl_rl.networks.Memory
 # which feature/manipulation hasn't ported. Re-add once the recurrent student is needed.
@@ -34,6 +35,8 @@ __all__ = [
     "HeteroscedasticGaussianDistribution",
     "TanhGaussianDistribution",
     "HiddenState",
+    "MultiHeadAttention",
     "StudentTeacher",
     "StudentTeacherVision",
+    "TrunkBlock",
 ]
