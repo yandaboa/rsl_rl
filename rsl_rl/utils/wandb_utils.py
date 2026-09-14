@@ -47,7 +47,6 @@ class WandbSummaryWriter(SummaryWriter):
             entity=entity,
             name=run_name,
             config={"log_dir": log_dir},
-            settings=wandb.Settings(start_method="thread"),
         )
         run_id = cfg.get("run_id")
         if run_id is not None:

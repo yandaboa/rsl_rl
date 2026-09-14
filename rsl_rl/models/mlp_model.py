@@ -103,7 +103,9 @@ class MLPModel(nn.Module):
         # ``__init__`` requires positional args, so ``Sequential.__getitem__``
         # with a slice tries to rebuild the wrong class.
         if self.distribution is not None and hasattr(self.distribution, "set_features"):
-            children = list(self.mlp.children())
+            # ``MLP`` reuses one activation instance after every hidden layer; ``children()``
+            # de-duplicates by identity and would drop all but the first activation.
+            children = list(self.mlp)
             features = latent
             for layer in children[:-1]:
                 features = layer(features)
