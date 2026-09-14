@@ -160,7 +160,7 @@ class EpisodeContextPPO(PPO):
             actor_obs_groups=model.obs_groups["actor"],
             context_length=model.context_length,
             max_episode_length=model.max_episode_length,
-            num_layers=model.num_layers,
+            num_layers=model.depth,  # receptive field grows with the looped depth, not the unique block count
             actor_obs_normalizer=model.frame_normalizer,
             memory_tokens=model.num_memory_tokens,
             d_model=model.d_model,
