@@ -32,7 +32,8 @@ ACTION_DIM = 4
 NUM_ENVS = 4
 T_EPISODE = 6
 STEPS_PER_ENV = 8
-LEGACY_REPO = "/home/yandabao/rsl_rl/.claude/worktrees/stable-ppo-225077"
+# a checkout of the 3.1 implementation (branch stable-ppo-rslrl3); skipped when absent
+LEGACY_REPO = os.environ.get("RSL_RL_LEGACY_REPO", "/home/yandabao/rsl_rl/.claude/worktrees/rslrl3-pin-6345d2a")
 
 MODEL_KWARGS = dict(
     context_length=T_EPISODE,
