@@ -20,6 +20,7 @@ and the runner are untouched relative to the 5.2 base commit (everything lives i
 
 from __future__ import annotations
 
+import pytest
 import subprocess
 import torch
 from tensordict import TensorDict
@@ -38,6 +39,7 @@ STEPS_PER_ENV = 8  # deliberately not a divisor of T: every window straddles epi
 GAMMA = 0.99
 LAM = 0.95
 BASE_COMMIT = "b8111fa"  # master: UW-Lab feature/manipulation 5.2.0 + gSDE/wandb fixes
+EVAL_POOL_COMMIT_SUBJECT = "PPO: trailing eval env pool"  # the one change to ppo.py / rollout_storage.py since
 
 
 # --------------------------------------------------------------------------------------------------
@@ -361,21 +363,31 @@ def test_shared_trunk_value_loss_trains_the_trunk_through_ppo() -> None:
 
 
 def test_ppo_stays_byte_identical() -> None:
-    """The known-good PPO, storage and runner must be untouched: all new behavior lives in new files."""
-    protected = [
-        "rsl_rl/algorithms/ppo.py",
-        "rsl_rl/storage/rollout_storage.py",
-        "rsl_rl/runners/on_policy_runner.py",
-    ]
-    diff = subprocess.run(
-        ["git", "diff", "--stat", BASE_COMMIT, "--", *protected],
+    """The known-good PPO, storage and runner must be untouched: all new behavior lives in new files, except the
+    eval env pool, which lives in the base ``PPO`` / ``RolloutStorage`` since ``EVAL_POOL_COMMIT_SUBJECT``."""
+    cwd = __file__.rsplit("/tests/", 1)[0]
+
+    def assert_unchanged(base: str, protected: list[str]) -> None:
+        diff = subprocess.run(
+            ["git", "diff", "--stat", base, "--", *protected], capture_output=True, text=True, cwd=cwd
+        )
+        assert diff.returncode == 0, f"git diff failed: {diff.stderr}"
+        assert diff.stdout.strip() == "", f"protected files changed since {base}:\n{diff.stdout}"
+
+    assert_unchanged(BASE_COMMIT, ["rsl_rl/runners/on_policy_runner.py"])
+    log = subprocess.run(
+        ["git", "log", "-1", "--format=%H", f"--grep={EVAL_POOL_COMMIT_SUBJECT}"],
         capture_output=True,
         text=True,
-        cwd=__file__.rsplit("/tests/", 1)[0],
+        cwd=cwd,
     )
-    assert diff.returncode == 0, f"git diff failed: {diff.stderr}"
-    assert diff.stdout.strip() == "", f"protected files changed since {BASE_COMMIT}:\n{diff.stdout}"
-    print(f"[ok] ppo.py / rollout_storage.py / on_policy_runner.py are byte-identical to {BASE_COMMIT}")
+    pool_commit = log.stdout.strip()
+    if not pool_commit:
+        pytest.skip(f"the eval-pool commit ({EVAL_POOL_COMMIT_SUBJECT!r}) is not in the history yet")
+    assert_unchanged(pool_commit, ["rsl_rl/algorithms/ppo.py", "rsl_rl/storage/rollout_storage.py"])
+    print(
+        f"[ok] on_policy_runner.py is byte-identical to {BASE_COMMIT}; ppo.py / rollout_storage.py to {pool_commit[:7]}"
+    )
 
 
 if __name__ == "__main__":

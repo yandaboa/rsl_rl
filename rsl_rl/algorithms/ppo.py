@@ -16,6 +16,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import EmpiricalNormalization
+from rsl_rl.modules.distribution import TanhGaussianDistribution
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import (
     GradientNoiseScaleTracker,
@@ -68,8 +69,17 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Gradient noise scale parameters
         gradient_noise_scale_cfg: dict | None = None,
+        # Eval env pool parameters
+        eval_env_fraction: float = 0.0,
+        eval_deterministic: bool = True,
     ) -> None:
-        """Initialize the algorithm with models, storage, and optimization settings."""
+        """Initialize the algorithm with models, storage, and optimization settings.
+
+        ``eval_env_fraction``: trailing fraction of the environments held out of the update and of the advantage
+        statistics (the storage must have been built with the matching ``num_eval_envs``, see
+        :meth:`_num_eval_envs`). ``eval_deterministic``: the pool executes the model's deterministic output
+        instead of the sample.
+        """
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
@@ -134,12 +144,61 @@ class PPO:
         # Gradient noise scale instrumentation (read-only metric; never writes p.grad)
         self.noise_scale_tracker = self._build_noise_scale_tracker(gradient_noise_scale_cfg)
 
+        # Eval env pool: the TRAILING ``num_eval_envs`` environments (one contiguous training slice in front)
+        assert 0.0 <= eval_env_fraction < 1.0, f"eval_env_fraction must be in [0, 1), got {eval_env_fraction}."
+        self.eval_env_fraction = float(eval_env_fraction)
+        self.eval_deterministic = bool(eval_deterministic)
+        num_envs = storage.num_envs
+        self.num_eval_envs = self._num_eval_envs(eval_env_fraction, num_envs)
+        assert storage.num_eval_envs == self.num_eval_envs, (
+            f"the storage was built with num_eval_envs={storage.num_eval_envs}, but eval_env_fraction="
+            f"{eval_env_fraction} x {num_envs} envs = {self.num_eval_envs}. Build it with the matching num_eval_envs."
+        )
+        if self.num_eval_envs > 0:
+            self.eval_env_ids = torch.arange(num_envs, device=self.device)[-self.num_eval_envs :]
+            self.eval_env_mask: torch.Tensor | None = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+            self.eval_env_mask[self.eval_env_ids] = True
+        else:
+            self.eval_env_ids = torch.zeros(0, dtype=torch.long, device=self.device)
+            # ``None`` (not an all-False mask): act() then takes the untouched stock path.
+            self.eval_env_mask = None
+
+    @property
+    def _eval_mask(self) -> torch.Tensor | None:
+        """Alias of :attr:`eval_env_mask` (older name)."""
+        return self.eval_env_mask
+
+    @staticmethod
+    def _num_eval_envs(eval_env_fraction: float, num_envs: int) -> int:
+        num_eval_envs = round(float(eval_env_fraction) * num_envs)
+        assert num_eval_envs < num_envs, (
+            f"eval_env_fraction={eval_env_fraction} leaves no training environment ({num_eval_envs} of {num_envs})."
+        )
+        return num_eval_envs
+
+    def deterministic_actions(self) -> torch.Tensor:
+        """The deterministic action of the distribution the actor's last forward pass left behind.
+
+        ``output_mean`` is the mean of the base Gaussian, which for a squashed distribution
+        (``TanhGaussianDistribution``) is pre-squash: apply the squash so the pool executes ``deterministic_output``.
+        """
+        mean = self.actor.output_mean
+        if isinstance(getattr(self.actor, "distribution", None), TanhGaussianDistribution):
+            mean = torch.tanh(mean)
+        return mean
+
     def act(self, obs: TensorDict) -> torch.Tensor:
-        """Sample actions and store transition data."""
+        """Sample actions and store transition data; a deterministic eval pool executes the mean instead."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
         self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+        if self.eval_env_mask is not None and self.eval_deterministic:
+            # Same forward pass (recurrent state / KV caches advance in lockstep); only the executed action is
+            # swapped, off the distribution the actor just left behind.
+            self.transition.actions = torch.where(
+                self.eval_env_mask.unsqueeze(-1), self.deterministic_actions().detach(), self.transition.actions
+            )
         self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
@@ -202,9 +261,10 @@ class PPO:
             st.returns[step] = advantage + st.values[step]
         # Compute the advantages
         st.advantages = st.returns - st.values
-        # Normalize the advantages if per minibatch normalization is not used
+        # Normalize the advantages if per minibatch normalization is not used (statistics of the training pool)
         if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            train_advantages = st.advantages[:, : st.num_train_envs]
+            st.advantages = (st.advantages - train_advantages.mean()) / (train_advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -524,8 +584,16 @@ class PPO:
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
 
-        # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        # Initialize the storage (sized for the eval pool, if any)
+        storage = RolloutStorage(
+            "rl",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            device,
+            num_eval_envs=PPO._num_eval_envs(cfg["algorithm"].get("eval_env_fraction", 0.0), env.num_envs),
+        )
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])

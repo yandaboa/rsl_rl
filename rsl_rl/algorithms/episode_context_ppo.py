@@ -48,7 +48,6 @@ class EpisodeContextPPO(PPO):
         noise_prior_kl_coef: float = 0.0,
         noise_prior_dims: int = 0,
         next_state_coef: float = 0.0,
-        eval_env_fraction: float = 0.0,
         grad_accumulation_steps: int = 1,
         **kwargs,
     ) -> None:
@@ -58,8 +57,8 @@ class EpisodeContextPPO(PPO):
         the update, so a rollout is acted and reconstructed under identical statistics (else the epoch-0 ratio
         is off by construction). ``noise_prior_kl_coef`` / ``noise_prior_dims``: ``coef * KL(pi || N(0, I))`` on
         the leading action dims. ``next_state_coef``: auxiliary next-state MSE on the trunk readout (needs a model
-        built with ``next_state_head_hidden_dims``). ``eval_env_fraction``: trailing deterministic eval pool,
-        excluded from the update (the storage must have been built with the matching ``num_eval_envs``; see
+        built with ``next_state_head_hidden_dims``). ``eval_env_fraction`` / ``eval_deterministic`` (base
+        :class:`PPO`): trailing eval pool, excluded from the update (build the storage with
         :meth:`build_storage`). ``grad_accumulation_steps``: micro-batches per minibatch, one optimizer step per
         logical minibatch (same transitions per step, ``1/G`` the peak activation memory).
         """
@@ -94,23 +93,6 @@ class EpisodeContextPPO(PPO):
         assert grad_accumulation_steps >= 1, f"grad_accumulation_steps must be >= 1, got {grad_accumulation_steps}."
         self.grad_accumulation_steps = int(grad_accumulation_steps)
 
-        assert 0.0 <= eval_env_fraction < 1.0, f"eval_env_fraction must be in [0, 1), got {eval_env_fraction}."
-        self.eval_env_fraction = float(eval_env_fraction)
-        num_envs = storage.num_envs
-        num_eval_envs = self._num_eval_envs(eval_env_fraction, num_envs)
-        assert storage.num_eval_envs == num_eval_envs, (
-            f"the storage was built with num_eval_envs={storage.num_eval_envs}, but eval_env_fraction="
-            f"{eval_env_fraction} x {num_envs} envs = {num_eval_envs}. Build it with EpisodeContextPPO.build_storage."
-        )
-        if num_eval_envs > 0:
-            self.eval_env_ids = torch.arange(num_envs, device=self.device)[-num_eval_envs:]
-            self._eval_mask: torch.Tensor | None = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-            self._eval_mask[self.eval_env_ids] = True
-        else:
-            self.eval_env_ids = torch.zeros(0, dtype=torch.long, device=self.device)
-            # ``None`` (not an all-False mask): act() then takes the untouched stock path.
-            self._eval_mask = None
-
         self.storage.with_next_state = self.next_state_coef > 0.0
         target_group = model.next_state_target_group
         if self.storage.with_next_state and target_group is not None:
@@ -131,14 +113,6 @@ class EpisodeContextPPO(PPO):
     # --------------------------------------------------------------------------------------------------------
 
     @staticmethod
-    def _num_eval_envs(eval_env_fraction: float, num_envs: int) -> int:
-        num_eval_envs = round(float(eval_env_fraction) * num_envs)
-        assert num_eval_envs < num_envs, (
-            f"eval_env_fraction={eval_env_fraction} leaves no training environment ({num_eval_envs} of {num_envs})."
-        )
-        return num_eval_envs
-
-    @staticmethod
     def build_storage(
         model: EpisodeContextModel,
         num_envs: int,
@@ -156,7 +130,7 @@ class EpisodeContextPPO(PPO):
             obs,
             actions_shape,
             device,
-            num_eval_envs=EpisodeContextPPO._num_eval_envs(eval_env_fraction, num_envs),
+            num_eval_envs=PPO._num_eval_envs(eval_env_fraction, num_envs),
             actor_obs_groups=model.obs_groups["actor"],
             context_length=model.context_length,
             max_episode_length=model.max_episode_length,
@@ -250,19 +224,8 @@ class EpisodeContextPPO(PPO):
     # Collection
     # --------------------------------------------------------------------------------------------------------
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
-        """Stock :meth:`PPO.act` through the views; the eval pool executes the distribution MEAN.
-
-        The eval envs run the same forward pass (their KV ring advances in lockstep); only the executed action is
-        swapped, off the distribution the model just left behind. The log-prob is recomputed against it.
-        """
-        actions = super().act(obs)
-        if self._eval_mask is None:
-            return actions
-        actions = torch.where(self._eval_mask.unsqueeze(-1), self.model.action_mean.detach(), actions)
-        self.transition.actions = actions
-        self.transition.actions_log_prob = self.model.get_actions_log_prob(actions).detach()
-        return actions
+    # ``act`` is the stock :meth:`PPO.act` through the views: the eval pool (if any) executes the distribution mean
+    # off the same forward pass, so the KV ring advances in lockstep and the stored rows re-infer exactly.
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]

@@ -57,16 +57,17 @@ class EpisodeContextRolloutStorage(RolloutStorage):
             context_length / max_episode_length / num_layers: ``L``, ``T`` and the trunk depth (which sizes the
                 prefix: a row's receptive field is ``num_layers * (span - 1)`` frames).
             memory_tokens / d_model: ``M`` and the trunk width; ``M = 0`` allocates nothing memory-related.
-            num_eval_envs: Trailing environments excluded from the update (see ``eval_env_fraction``).
+            num_eval_envs: Trailing environments excluded from the update (base :class:`RolloutStorage`).
         """
-        super().__init__(training_type, num_envs, num_transitions_per_env, obs, actions_shape, device=device)
-
-        self.num_eval_envs = int(num_eval_envs)
-        assert 0 <= self.num_eval_envs < num_envs, (
-            f"num_eval_envs={self.num_eval_envs} does not leave a training pool out of {num_envs} environments."
+        super().__init__(
+            training_type,
+            num_envs,
+            num_transitions_per_env,
+            obs,
+            actions_shape,
+            device=device,
+            num_eval_envs=num_eval_envs,
         )
-        # The eval pool is the TRAILING block, so the training pool stays one contiguous slice.
-        self.num_train_envs = num_envs - self.num_eval_envs
 
         self.actor_obs_groups = list(obs.keys()) if actor_obs_groups is None else list(actor_obs_groups)
         self.actor_obs_normalizer = actor_obs_normalizer

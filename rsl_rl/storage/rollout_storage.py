@@ -130,13 +130,24 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        num_eval_envs: int = 0,
     ) -> None:
-        """Allocate rollout buffers for a specific training mode and batch shape."""
+        """Allocate rollout buffers for a specific training mode and batch shape.
+
+        ``num_eval_envs``: trailing environments that are stored but never handed out by the RL generators
+        (the algorithm's eval pool). ``0`` is the stock storage.
+        """
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.num_eval_envs = int(num_eval_envs)
+        assert 0 <= self.num_eval_envs < num_envs, (
+            f"num_eval_envs={self.num_eval_envs} does not leave a training pool out of {num_envs} environments."
+        )
+        # The eval pool is the TRAILING block, so the training pool stays one contiguous slice.
+        self.num_train_envs = num_envs - self.num_eval_envs
 
         # Core
         self.observations = TensorDict(
@@ -223,18 +234,19 @@ class RolloutStorage:
         """Yield shuffled flat mini-batches for feedforward RL updates."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        batch_size = self.num_envs * self.num_transitions_per_env
+        batch_size = self.num_train_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        # Flatten the data
-        observations = self.observations.flatten(0, 1)
-        actions = self.actions.flatten(0, 1)
-        values = self.values.flatten(0, 1)
-        returns = self.returns.flatten(0, 1)
-        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
-        old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        # Flatten the data (training environments only; the eval pool is never handed out)
+        train = slice(None, self.num_train_envs)
+        observations = self.observations[:, train].flatten(0, 1)
+        actions = self.actions[:, train].flatten(0, 1)
+        values = self.values[:, train].flatten(0, 1)
+        returns = self.returns[:, train].flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob[:, train].flatten(0, 1)
+        advantages = self.advantages[:, train].flatten(0, 1)
+        old_distribution_params = tuple(p[:, train].flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -261,8 +273,13 @@ class RolloutStorage:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
-        mini_batch_size = self.num_envs // num_mini_batches
+        # Training environments only: trajectories are split from the leading ``num_train_envs`` columns, so the
+        # ``first_traj`` bookkeeping below never reaches an eval env either.
+        train = slice(None, self.num_train_envs)
+        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
+            self.observations[:, train], self.dones[:, train]
+        )
+        mini_batch_size = self.num_train_envs // num_mini_batches
 
         for ep in range(num_epochs):
             first_traj = 0
