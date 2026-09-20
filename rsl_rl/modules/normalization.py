@@ -15,7 +15,15 @@ from torch import nn
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 
-    def __init__(self, shape: int | tuple[int, ...] | list[int], eps: float = 1e-2, until: int | None = None) -> None:
+    def __init__(
+        self,
+        shape: int | tuple[int, ...] | list[int],
+        eps: float = 1e-2,
+        until: int | None = None,
+        clip: float | None = 10.0,
+        outlier_clip: float | None = 10.0,
+        outlier_warmup: int = 1_000_000,
+    ) -> None:
         """Initialize EmpiricalNormalization module.
 
         .. note:: The normalization parameters are computed over the whole batch, not for each environment separately.
@@ -24,10 +32,22 @@ class EmpiricalNormalization(nn.Module):
             shape: Shape of input values except batch axis.
             eps: Small value for stability.
             until: If this arg is specified, the module learns input values until the sum of batch sizes exceeds it.
+            clip: Clamp normalized outputs to ``[-clip, clip]`` (``None`` disables).
+            outlier_clip: Winsorize inputs to ``mean +- outlier_clip * std`` before they enter the running
+                moments (``None`` disables). The running variance never forgets, so a single glitched sample
+                (a 1e3 joint velocity from a PhysX blow-up) otherwise inflates a feature's std for the rest of
+                the run and silently rescales that input for the policy.
+            outlier_warmup: Winsorizing starts once ``count`` exceeds this many samples (the moments need to be
+                trustworthy first).
         """
         super().__init__()
         self.eps = eps
         self.until = until
+        self.clip = clip
+        self.outlier_clip = outlier_clip
+        self.outlier_warmup = outlier_warmup
+        # Fraction of elements winsorized by the last ``update`` (diagnostic, not checkpointed).
+        self.last_outlier_frac = 0.0
         self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0))
         self.register_buffer("_var", torch.ones(shape).unsqueeze(0))
         self.register_buffer("_std", torch.ones(shape).unsqueeze(0))
@@ -48,7 +68,19 @@ class EmpiricalNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize mean and variance of values based on empirical values."""
-        return (x - self._mean) / (self._std + self.eps)
+        y = (x - self._mean) / (self._std + self.eps)
+        if self.clip is not None:
+            y = y.clamp(-self.clip, self.clip)
+        return y
+
+    @torch.jit.unused
+    def _winsorize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.outlier_clip is None or int(self.count) < self.outlier_warmup:
+            return x
+        width = self.outlier_clip * (self._std + self.eps)
+        clamped = torch.maximum(torch.minimum(x, self._mean + width), self._mean - width)
+        self.last_outlier_frac = (clamped != x).float().mean()  # tensor: no device sync per step
+        return clamped
 
     @torch.jit.unused
     def update(self, x: torch.Tensor) -> None:
@@ -58,6 +90,7 @@ class EmpiricalNormalization(nn.Module):
         if self.until is not None and self.count >= self.until:
             return
 
+        x = self._winsorize(x)
         if self._distributed_sync_enabled:
             self._distributed_update(x)
             return
