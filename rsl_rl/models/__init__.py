@@ -5,6 +5,7 @@
 
 """Neural models for the learning algorithm."""
 
+from .block_conditioning import PhiConditionedLinear, attach_block_conditioning, block_context
 from .cnn_model import CNNModel
 from .encoder_model import MLPEncoderModel
 from .episode_context_model import (
@@ -19,6 +20,9 @@ from .rnn_model import RNNModel
 
 __all__ = [
     "CNNModel",
+    "PhiConditionedLinear",
+    "attach_block_conditioning",
+    "block_context",
     "EpisodeContextActorView",
     "EpisodeContextCriticView",
     "EpisodeContextModel",

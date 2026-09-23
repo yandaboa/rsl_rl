@@ -11,6 +11,7 @@ from .distillation_dagger import DistillationDAgger
 from .distillation_dagger_weighted import DistillationDAggerWeighted
 from .episode_context_ppo import EpisodeContextPPO
 from .ppo import PPO
+from .sapg import SAPG
 
 __all__ = [
     "Distillation",
@@ -19,4 +20,5 @@ __all__ = [
     "DistillationLegacy",
     "EpisodeContextPPO",
     "PPO",
+    "SAPG",
 ]
