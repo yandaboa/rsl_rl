@@ -10,6 +10,7 @@ from .distillation import Distillation
 from .distillation_dagger import DistillationDAgger
 from .distillation_dagger_weighted import DistillationDAggerWeighted
 from .episode_context_ppo import EpisodeContextPPO
+from .fpo import FPO
 from .ppo import PPO
 from .sapg import SAPG
 
@@ -19,6 +20,7 @@ __all__ = [
     "DistillationDAggerWeighted",
     "DistillationLegacy",
     "EpisodeContextPPO",
+    "FPO",
     "PPO",
     "SAPG",
 ]

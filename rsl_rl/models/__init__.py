@@ -15,6 +15,7 @@ from .episode_context_model import (
     EpisodeContextPrefix,
     MemoryTokenWriter,
 )
+from .flow_model import FlowMLPModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 
@@ -27,6 +28,7 @@ __all__ = [
     "EpisodeContextCriticView",
     "EpisodeContextModel",
     "EpisodeContextPrefix",
+    "FlowMLPModel",
     "MemoryTokenWriter",
     "MLPEncoderModel",
     "MLPModel",
