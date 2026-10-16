@@ -53,6 +53,7 @@ class SAPG(PPO):
         kl_reference: str = "previous_epoch",
         log_off_policy_grads_every: int = 0,
         relabel_chunk_size: int = 65536,
+        target_kl: float | None = None,
         **kwargs: object,
     ) -> None:
         """``num_blocks`` M, ``phi_dim`` d; everything else is PPO's (``kwargs``).
@@ -94,6 +95,8 @@ class SAPG(PPO):
         self.kl_reference = kl_reference
         self.log_off_policy_grads_every = int(log_off_policy_grads_every)
         self.relabel_chunk_size = int(relabel_chunk_size)
+        # cleanRL / ManiSkill early stop: approx KL of the on-policy rows before each step; above it the update ends
+        self.target_kl = None if target_kl is None else float(target_kl)
 
         num_envs = storage.num_envs
         assert num_envs % self.num_blocks == 0, (
@@ -396,8 +399,12 @@ class SAPG(PPO):
         grad_norms: dict[str, list[torch.Tensor]] = {"actor": [], "critic": [], "combined": []}
         epoch_kls: list[torch.Tensor] = []
         self.last_minibatch_debug = None
+        num_steps_run, stop, approx_kl_first, approx_kl_last = 0, False, 0.0, 0.0
 
         for epoch in range(self.num_learning_epochs):
+            if stop:
+                break
+            num_epoch_steps = 0
             # [sum over minibatch means (all rows), leader-on KL sum, leader-on count, relabeled KL sum, count]
             kl_acc = torch.zeros(5, device=self.device)
             for i in range(self.num_mini_batches):
@@ -441,6 +448,21 @@ class SAPG(PPO):
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+                num_steps_run += 1
+                num_epoch_steps += 1
+
+                if self.target_kl is not None:
+                    with torch.no_grad():
+                        on_ratio = terms["ratio"][~off].clamp_min(1e-12)
+                        approx_kl = ((on_ratio - 1.0) - on_ratio.log()).mean()
+                        if self.is_multi_gpu:
+                            torch.distributed.all_reduce(approx_kl, op=torch.distributed.ReduceOp.SUM)
+                            approx_kl /= self.gpu_world_size
+                    approx_kl_last = approx_kl.item()
+                    if num_steps_run == 1:
+                        approx_kl_first = approx_kl_last
+                    # the step above still applies (ManiSkill order), then the whole update ends
+                    stop = approx_kl_last > self.target_kl
 
                 acc("value", terms["value"])
                 acc("surrogate", terms["surrogate"])
@@ -452,18 +474,20 @@ class SAPG(PPO):
                     acc("_inside_off", inside[off].sum())
                     acc("_ratio_off", terms["ratio"][off].sum())
                     acc("_count_off", off.sum())
+                if stop:
+                    break
 
             # Epoch KL: mean over minibatches (all rows) or over leader on-policy rows; rank-averaged.
             if self.is_multi_gpu:
                 torch.distributed.all_reduce(kl_acc, op=torch.distributed.ReduceOp.SUM)
                 kl_acc[0] /= self.gpu_world_size
-            kl_all = kl_acc[0] / self.num_mini_batches
+            kl_all = kl_acc[0] / max(num_epoch_steps, 1)
             kl_leader = kl_acc[1] / kl_acc[2].clamp(min=1.0)
             kl_off = kl_acc[3] / kl_acc[4].clamp(min=1.0)
             epoch_kls.append(torch.stack([kl_all, kl_leader, kl_off]))
             self._adapt_learning_rate(kl_all if self.kl_rows == "all" else kl_leader)
 
-        num_updates = self.num_learning_epochs * self.num_mini_batches
+        num_updates = num_steps_run
         out = {k: v.item() for k, v in sums.items()}
         loss_dict: dict[str, float] = {
             "value": out["value"] / num_updates,
@@ -485,6 +509,11 @@ class SAPG(PPO):
             std = st.distribution_params[1].mean(dim=-1).mean(dim=0).view(-1)  # type: ignore[index]
             for j in range(self.num_blocks):
                 loss_dict[f"SAPG/block{j}_action_std"] = std[self.env_block_ids == j].mean().item()
+        if self.target_kl is not None:
+            loss_dict["kl_stop/mini_batch_updates"] = float(num_steps_run)
+            loss_dict["kl_stop/stopped"] = float(num_steps_run < self.num_learning_epochs * self.num_mini_batches)
+            loss_dict["kl_stop/approx_kl_first"] = approx_kl_first
+            loss_dict["kl_stop/approx_kl_last"] = approx_kl_last
         loss_dict.update(self._relabel_stats)
         # Episode stats ride on the loss dict (logged as ``Loss/SAPG/*``): the runner stays stock.
         loss_dict.update(self.episode_metrics())

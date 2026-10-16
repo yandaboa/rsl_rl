@@ -39,6 +39,7 @@ SAPG_KEYS = (
     "kl_reference",
     "log_off_policy_grads_every",
     "relabel_chunk_size",
+    "target_kl",
 )
 
 
@@ -445,6 +446,32 @@ def test_update_reports_metrics_and_grad_diagnostic() -> None:
     assert losses["SAPG/relabel_rows"] == NUM_STEPS * 4
     _collect(sapg)
     assert "SAPG/grad_cos_off_on" not in sapg.update()  # every 2nd iteration
+
+
+def test_target_kl_early_stop() -> None:
+    """A tiny target_kl ends the update after the first step (ManiSkill: the step applies, then stop); None runs all."""
+    full = _sapg(num_blocks=3, schedule="fixed", learning_rate=1e-2, num_learning_epochs=3, num_mini_batches=4)
+    _collect(full)
+    assert "kl_stop/mini_batch_updates" not in full.update()
+
+    sapg = _sapg(
+        num_blocks=3,
+        norm=False,  # a normalizer update during the rollout would already move the first minibatch's ratio
+        schedule="fixed",
+        learning_rate=1e-2,
+        num_learning_epochs=3,
+        num_mini_batches=4,
+        target_kl=1e-12,
+    )
+    before = [p.detach().clone() for p in sapg.actor.parameters()]
+    _collect(sapg)
+    losses = sapg.update()
+    # the first minibatch's pre-step KL is ~0 (params unchanged since the rollout); the second exceeds 1e-12
+    assert losses["kl_stop/mini_batch_updates"] == 2.0
+    assert losses["kl_stop/stopped"] == 1.0
+    assert losses["kl_stop/approx_kl_first"] < 1e-6 < losses["kl_stop/approx_kl_last"]
+    assert any(not torch.equal(b, p) for b, p in zip(before, sapg.actor.parameters()))
+    assert sapg.storage.step == 0 and sapg._rows is None
 
 
 @pytest.mark.parametrize("dist", ["GaussianDistribution", "GsdeDistribution"])
