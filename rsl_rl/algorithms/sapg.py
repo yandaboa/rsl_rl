@@ -54,6 +54,7 @@ class SAPG(PPO):
         log_off_policy_grads_every: int = 0,
         relabel_chunk_size: int = 65536,
         target_kl: float | None = None,
+        off_policy_sampling: str = "block",
         **kwargs: object,
     ) -> None:
         """``num_blocks`` M, ``phi_dim`` d; everything else is PPO's (``kwargs``).
@@ -68,6 +69,7 @@ class SAPG(PPO):
         assert off_policy_ratio >= 0.0, f"off_policy_ratio must be >= 0, got {off_policy_ratio}."
         assert kl_rows in ("all", "leader"), f"kl_rows must be 'all' or 'leader', got {kl_rows!r}."
         assert kl_reference in ("previous_epoch", "rollout"), f"unknown kl_reference {kl_reference!r}."
+        assert off_policy_sampling in ("block", "uniform"), f"unknown off_policy_sampling {off_policy_sampling!r}."
         assert float(kwargs.get("eval_env_fraction", 0.0) or 0.0) <= 0.0, (
             "SAPG grades / deploys on the leader block; the eval env pool (eval_env_fraction > 0) is not supported."
         )
@@ -89,6 +91,9 @@ class SAPG(PPO):
         self.phi_dim = int(phi_dim)
         self.per_block_std = bool(per_block_std)
         self.num_off_policy_blocks = min(self.num_blocks - 1, int(off_policy_ratio))
+        # "block": whole follower block(s) per iteration (play2perfect); "uniform": the same number of rows drawn
+        # uniformly over every follower transition (SAPG paper, Algorithm 1)
+        self.off_policy_sampling = off_policy_sampling
         self.sapg_entropy_scale = float(sapg_entropy_scale)
         self.leader_entropy_coef = float(leader_entropy_coef)
         self.kl_rows = kl_rows
@@ -218,6 +223,12 @@ class SAPG(PPO):
         off_blocks = self._draw_off_policy_blocks()
         if off_blocks:
             rel = self._relabel(obs, off_blocks)
+            if self.off_policy_sampling == "uniform":
+                num_keep = self.num_off_policy_blocks * self.num_leader_envs * st.num_transitions_per_env
+                keep = torch.randperm(rel["src"].shape[0], device=self.device)[:num_keep]
+                rel = {key: value[keep] for key, value in rel.items()}
+                self._relabel_stats["SAPG/relabel_rows"] = float(num_keep)
+                self._relabel_stats["SAPG/relabel_adv_mean"] = rel["advantages"].mean().item()
             for key, value in rel.items():
                 rows[key] = torch.cat([rows[key], value], dim=0)
         rows["entropy_coef"] = torch.cat([
@@ -245,6 +256,8 @@ class SAPG(PPO):
         """``num_off_policy_blocks`` distinct follower blocks, drawn on rank 0 and broadcast (same on every rank)."""
         if self.num_off_policy_blocks <= 0:
             return []
+        if self.off_policy_sampling == "uniform":
+            return list(range(1, self.num_blocks))
         draw = torch.randperm(self.num_blocks - 1, device=self.device)[: self.num_off_policy_blocks] + 1
         if self.is_multi_gpu:
             torch.distributed.broadcast(draw, src=0)
@@ -276,7 +289,7 @@ class SAPG(PPO):
 
         src = (torch.arange(num_steps, device=self.device).unsqueeze(1) * num_envs + env_ids.unsqueeze(0)).flatten()
         self._relabel_stats = {
-            "SAPG/relabel_block": float(blocks[0]),
+            "SAPG/relabel_block": float(blocks[0]) if len(blocks) == 1 else -1.0,
             "SAPG/relabel_rows": float(src.numel()),
             "SAPG/relabel_adv_mean": advantages.mean().item(),
             "SAPG/relabel_value_mean": v_lead.mean().item(),

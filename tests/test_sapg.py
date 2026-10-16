@@ -40,6 +40,7 @@ SAPG_KEYS = (
     "log_off_policy_grads_every",
     "relabel_chunk_size",
     "target_kl",
+    "off_policy_sampling",
 )
 
 
@@ -446,6 +447,31 @@ def test_update_reports_metrics_and_grad_diagnostic() -> None:
     assert losses["SAPG/relabel_rows"] == NUM_STEPS * 4
     _collect(sapg)
     assert "SAPG/grad_cos_off_on" not in sapg.update()  # every 2nd iteration
+
+
+def test_uniform_off_policy_sampling() -> None:
+    """Paper sampling: one leader block's worth of rows, drawn from every follower block, leader-critic targets."""
+    torch.manual_seed(0)
+    sapg = _sapg(num_blocks=4, off_policy_sampling="uniform")
+    _collect(sapg)
+    rows = sapg._rows
+    off = rows["off"]
+    num_leader_rows = NUM_STEPS * NUM_ENVS // 4
+    assert int(off.sum()) == num_leader_rows
+    assert bool((rows["block"][off] == 0).all())
+    env, _ = _off_env_time(sapg)
+    blocks = sapg.env_block_ids[env]
+    assert bool((blocks > 0).all())
+    # over a few draws every follower block contributes
+    assert len(set(blocks.tolist())) > 1  # one draw already mixes follower blocks
+    losses = sapg.update()
+    assert losses["SAPG/relabel_rows"] == num_leader_rows and losses["SAPG/relabel_block"] == -1.0
+    seen = set(blocks.tolist())
+    for seed in range(5):
+        _collect(sapg, seed=seed + 2)
+        seen |= set(sapg.env_block_ids[_off_env_time(sapg)[0]].tolist())
+        sapg.update()
+    assert seen == {1, 2, 3}
 
 
 def test_target_kl_early_stop() -> None:
