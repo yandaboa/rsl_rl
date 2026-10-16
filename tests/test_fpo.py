@@ -173,6 +173,24 @@ def test_update_changes_params_and_is_finite():
     assert any(not torch.equal(b, p) for b, p in zip(before, alg.actor.parameters()))
 
 
+def test_target_kl_early_stop():
+    """None / a loose target_kl run every minibatch; a tiny one stops after at most two steps (ManiSkill order)."""
+    for target, expect_all in ((None, True), (1e6, True), (1e-12, False)):
+        torch.manual_seed(5)
+        alg = _fpo(target_kl=target)
+        before = [p.detach().clone() for p in alg.actor.parameters()]
+        _rollout(alg)
+        out = alg.update()
+        planned = alg.num_learning_epochs * alg.num_mini_batches
+        assert math.isfinite(out["fpo/approx_kl_mean"]) and out["fpo/approx_kl_mean"] >= 0.0
+        if expect_all:
+            assert out["kl_stop/mini_batch_updates"] == planned and out["kl_stop/stopped"] == 0.0
+        else:
+            assert 1 <= out["kl_stop/mini_batch_updates"] <= 2 and out["kl_stop/stopped"] == 1.0
+        assert any(not torch.equal(b, p) for b, p in zip(before, alg.actor.parameters()))
+        assert alg.storage.step == 0
+
+
 def test_knn_entropy_runs():
     torch.manual_seed(5)
     alg = _fpo(knn_entropy_coef=0.01, knn_entropy_k=1)

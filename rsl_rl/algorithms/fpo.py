@@ -90,6 +90,7 @@ class FPO(PPO):
         knn_entropy_coef: float = 0.0,
         knn_entropy_k: int = 1,
         storage_action_noise_std: float = 0.0,
+        target_kl: float | None = None,
         **kwargs,
     ) -> None:
         assert isinstance(actor, FlowMLPModel), f"FPO needs a FlowMLPModel actor, got {type(actor).__name__}"
@@ -114,6 +115,9 @@ class FPO(PPO):
 
         self.n_samples_per_action = int(n_samples_per_action)
         self.trust_region_mode = trust_region_mode
+        # cleanRL / ManiSkill early stop on approx KL = mean((r - 1) - log r) of the per-sample ratios before each
+        # step; the step still applies, then the whole update ends above it. None = off (approx KL still logged)
+        self.target_kl = None if target_kl is None else float(target_kl)
         self.cfm_loss_clamp = cfm_loss_clamp
         self.cfm_loss_clamp_negative_advantages = cfm_loss_clamp_negative_advantages
         self.cfm_loss_clamp_negative_advantages_max = cfm_loss_clamp_negative_advantages_max
@@ -232,6 +236,8 @@ class FPO(PPO):
             )
         }
         kl_values: list[torch.Tensor] = []
+        approx_kls: list[float] = []
+        stopped = False
         pos_clamp, neg_clamp = self.advantage_clamp
         params = list(chain(self.actor.parameters(), self.critic.parameters()))
 
@@ -280,6 +286,12 @@ class FPO(PPO):
                 )
             log_ratio = clamp_ste(old_loss - cfm_loss, max=self.cfm_diff_clamp_max)
             ratio = torch.exp(log_ratio)  # [B, S]
+            with torch.no_grad():
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(approx_kl, op=torch.distributed.ReduceOp.SUM)
+                    approx_kl /= self.gpu_world_size
+            approx_kls.append(approx_kl.item())
             surrogate_loss = self._surrogate_loss(ratio, advantages)
 
             if self.use_clipped_value_loss:
@@ -322,6 +334,10 @@ class FPO(PPO):
                 stats["grad_norm/combined"].append((actor_sq + critic_sq).sqrt())
                 stats["grad_norm/combined_after_clip"].append(after_sq.sqrt())
 
+            if self.target_kl is not None and approx_kls[-1] > self.target_kl:
+                stopped = True
+                break
+
         self.storage.clear()
 
         # EMA once per update (reference: reset to current weights at the warmup step, then blend)
@@ -343,6 +359,10 @@ class FPO(PPO):
                 loss_dict[key] = stacked.mean().item()
         if kl_values:
             loss_dict["fpo/kl_proxy"] = torch.stack(kl_values).mean().item()
+        loss_dict["fpo/approx_kl_first"] = approx_kls[0]
+        loss_dict["fpo/approx_kl_mean"] = sum(approx_kls) / len(approx_kls)
+        loss_dict["kl_stop/mini_batch_updates"] = float(len(approx_kls))
+        loss_dict["kl_stop/stopped"] = float(stopped)
         loss_dict["fpo/lr"] = float(self.learning_rate)
         loss_dict["fpo/ema_active"] = float(self._ema_active())
         return loss_dict
