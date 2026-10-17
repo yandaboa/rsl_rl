@@ -92,7 +92,7 @@ class FPO(PPO):
         storage_action_noise_std: float = 0.0,
         target_kl: float | None = None,
         cfm_loss_neg_adv_max_increase: float | None = None,
-        lr_decay_final: float | None = None,
+        lr_decay_final: float = 0.0,
         lr_decay_updates: int = 0,
         **kwargs,
     ) -> None:
@@ -123,10 +123,9 @@ class FPO(PPO):
         self.target_kl = None if target_kl is None else float(target_kl)
         # negative-advantage samples stop receiving gradient once their CFM loss exceeds the rollout loss by this
         # (log ratio >= -delta per sample, the mirror of cfm_diff_clamp_max); None = only the absolute clamp
-        # linear learning-rate decay (schedule="fixed" only): initial lr -> lr_decay_final over lr_decay_updates updates
-        assert lr_decay_final is None or lr_decay_updates > 0, "lr_decay_final needs lr_decay_updates > 0"
+        # linear learning-rate decay (schedule="fixed", on when lr_decay_updates > 0): lr -> lr_decay_final
         self.lr_initial = float(self.learning_rate)
-        self.lr_decay_final = None if lr_decay_final is None else float(lr_decay_final)
+        self.lr_decay_final = float(lr_decay_final)
         self.lr_decay_updates = int(lr_decay_updates)
         self.cfm_loss_neg_adv_max_increase = (
             None if cfm_loss_neg_adv_max_increase is None else float(cfm_loss_neg_adv_max_increase)
@@ -249,7 +248,7 @@ class FPO(PPO):
                 "grad_norm/combined_after_clip",
             )
         }
-        if self.lr_decay_final is not None and self.schedule == "fixed":
+        if self.lr_decay_updates > 0 and self.schedule == "fixed":
             frac = min(self.tot_timesteps / self.lr_decay_updates, 1.0)
             self.learning_rate = self.lr_initial + frac * (self.lr_decay_final - self.lr_initial)
             for param_group in self.optimizer.param_groups:
