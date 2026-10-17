@@ -91,6 +91,7 @@ class FPO(PPO):
         knn_entropy_k: int = 1,
         storage_action_noise_std: float = 0.0,
         target_kl: float | None = None,
+        cfm_loss_neg_adv_max_increase: float | None = None,
         **kwargs,
     ) -> None:
         assert isinstance(actor, FlowMLPModel), f"FPO needs a FlowMLPModel actor, got {type(actor).__name__}"
@@ -118,6 +119,11 @@ class FPO(PPO):
         # cleanRL / ManiSkill early stop on approx KL = mean((r - 1) - log r) of the per-sample ratios before each
         # step; the step still applies, then the whole update ends above it. None = off (approx KL still logged)
         self.target_kl = None if target_kl is None else float(target_kl)
+        # negative-advantage samples stop receiving gradient once their CFM loss exceeds the rollout loss by this
+        # (log ratio >= -delta per sample, the mirror of cfm_diff_clamp_max); None = only the absolute clamp
+        self.cfm_loss_neg_adv_max_increase = (
+            None if cfm_loss_neg_adv_max_increase is None else float(cfm_loss_neg_adv_max_increase)
+        )
         self.cfm_loss_clamp = cfm_loss_clamp
         self.cfm_loss_clamp_negative_advantages = cfm_loss_clamp_negative_advantages
         self.cfm_loss_clamp_negative_advantages_max = cfm_loss_clamp_negative_advantages_max
@@ -229,6 +235,7 @@ class FPO(PPO):
                 "fpo/clip_frac",
                 "fpo/cfm_loss_mean",
                 "fpo/log_ratio_abs_max",
+                "fpo/neg_adv_clamp_frac",
                 "grad_norm/actor",
                 "grad_norm/critic",
                 "grad_norm/combined",
@@ -284,6 +291,11 @@ class FPO(PPO):
                 cfm_loss = torch.where(
                     advantages < 0, cfm_loss.clamp(max=self.cfm_loss_clamp_negative_advantages_max), cfm_loss
                 )
+            neg_clamped = None
+            if self.cfm_loss_neg_adv_max_increase is not None:
+                bound = old_loss + self.cfm_loss_neg_adv_max_increase
+                neg_clamped = (advantages < 0) & (cfm_loss > bound)
+                cfm_loss = torch.where(advantages < 0, torch.minimum(cfm_loss, bound), cfm_loss)
             log_ratio = clamp_ste(old_loss - cfm_loss, max=self.cfm_diff_clamp_max)
             ratio = torch.exp(log_ratio)  # [B, S]
             with torch.no_grad():
@@ -329,6 +341,9 @@ class FPO(PPO):
                 stats["fpo/clip_frac"].append(((ratio.detach() - 1.0).abs() > self.clip_param).float().mean())
                 stats["fpo/cfm_loss_mean"].append(cfm_loss.detach().mean())
                 stats["fpo/log_ratio_abs_max"].append(log_ratio.detach().abs().max())
+                stats["fpo/neg_adv_clamp_frac"].append(
+                    neg_clamped.float().mean() if neg_clamped is not None else torch.zeros((), device=self.device)
+                )
                 stats["grad_norm/actor"].append(actor_sq.sqrt())
                 stats["grad_norm/critic"].append(critic_sq.sqrt())
                 stats["grad_norm/combined"].append((actor_sq + critic_sq).sqrt())

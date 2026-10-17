@@ -191,6 +191,27 @@ def test_target_kl_early_stop():
         assert alg.storage.step == 0
 
 
+def test_neg_adv_relative_clamp_bounds_push_away():
+    """With a relative bound, no negative-advantage sample's log ratio drops below -delta (gradient stops there)."""
+    torch.manual_seed(6)
+    alg = _fpo(learning_rate=5e-2, num_learning_epochs=4, cfm_loss_neg_adv_max_increase=0.05, cfm_diff_clamp_max=3.0)
+    _rollout(alg)
+    seen = []
+    orig = alg._surrogate_loss
+
+    def spy(ratio, advantages):
+        seen.append((ratio.detach().log(), advantages.detach()))
+        return orig(ratio, advantages)
+
+    alg._surrogate_loss = spy
+    out = alg.update()
+    assert all(math.isfinite(v) for v in out.values())
+    assert out["fpo/neg_adv_clamp_frac"] > 0.0  # the high learning rate pushes some samples past the bound
+    for log_ratio, adv in seen:
+        neg = (adv < 0).expand_as(log_ratio)
+        assert log_ratio[neg].min() >= -0.05 - 1e-5
+
+
 def test_knn_entropy_runs():
     torch.manual_seed(5)
     alg = _fpo(knn_entropy_coef=0.01, knn_entropy_k=1)
