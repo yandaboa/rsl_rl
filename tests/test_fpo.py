@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+import pytest
 import torch
 from tensordict import TensorDict
 
@@ -210,6 +211,18 @@ def test_neg_adv_relative_clamp_bounds_push_away():
     for log_ratio, adv in seen:
         neg = (adv < 0).expand_as(log_ratio)
         assert log_ratio[neg].min() >= -0.05 - 1e-5
+
+
+def test_linear_lr_decay():
+    """lr goes linearly from the initial value to lr_decay_final over lr_decay_updates updates, then holds."""
+    torch.manual_seed(7)
+    alg = _fpo(learning_rate=3e-4, schedule="fixed", lr_decay_final=1e-4, lr_decay_updates=2)
+    lrs = []
+    for _ in range(4):
+        _rollout(alg)
+        lrs.append(alg.update()["fpo/lr"])
+    assert lrs == pytest.approx([3e-4, 2e-4, 1e-4, 1e-4])
+    assert alg.optimizer.param_groups[0]["lr"] == pytest.approx(1e-4)
 
 
 def test_knn_entropy_runs():
