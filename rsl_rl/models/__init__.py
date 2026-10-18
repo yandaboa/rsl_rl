@@ -17,6 +17,7 @@ from .episode_context_model import (
 )
 from .flow_model import FlowMLPModel
 from .mlp_model import MLPModel
+from .policyflow_model import PolicyFlowModel
 from .rnn_model import RNNModel
 
 __all__ = [
@@ -32,5 +33,6 @@ __all__ = [
     "MemoryTokenWriter",
     "MLPEncoderModel",
     "MLPModel",
+    "PolicyFlowModel",
     "RNNModel",
 ]
