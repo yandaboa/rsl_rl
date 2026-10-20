@@ -11,6 +11,9 @@ head LayerNorm). The first Linear is split into ``W x + W_phi phi_j + b`` (the s
 
 The distribution's std parameter (``log_std_param`` / ``std_param``) stays the leader's (block 0), so exporters
 reading it get the leader; followers 1..M-1 live in ``sapg_follower_std`` (play2perfect ``fixed_sigma: coef_cond``).
+
+With ``shared_layers`` the MLP's Linear layers past the first ``shared_layers`` become per-block heads
+(``BlockLinear``); a bare forward (no block ids) runs block 0.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import torch.nn as nn
 from collections.abc import Iterator
 from tensordict import TensorDict
 from torch.distributions import Normal
+from typing import Optional
 
 from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import HiddenState
@@ -57,6 +61,69 @@ class PhiConditionedLinear(nn.Linear):
                 x[..., self.in_features :], self.phi_weight
             )
         return nn.functional.linear(x, self.weight, self.bias) + nn.functional.linear(self.phi[0], self.phi_weight)
+
+
+class BlockLinear(nn.Module):
+    """``M`` independent Linear layers; row ``i`` uses block ``_sapg_block_ids[i]`` (``None`` = block 0 for every row).
+
+    Block 0 is the replaced layer; blocks 1..M-1 are fresh orthogonal draws with its gain and a copy of its bias.
+    """
+
+    # Real type (not a postponed string) so TorchScript exporters can script the bare-latent (leader) path.
+    __annotations__ = {"_sapg_block_ids": Optional[torch.Tensor]}
+
+    def __init__(self, linear: nn.Linear, num_blocks: int) -> None:
+        """Replace ``linear`` (needs an orthogonally-initialized weight: the gain is read off its singular values)."""
+        super().__init__()
+        assert linear.bias is not None, "BlockLinear needs a Linear with a bias."
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.num_blocks = int(num_blocks)
+        self._sapg_block_ids = None
+        with torch.no_grad():
+            svals = torch.linalg.svdvals(linear.weight.detach().float())
+            gain = float(svals[0])
+            assert abs(gain - float(svals[-1])) <= 1e-3, (
+                f"per-block heads re-draw an orthogonal init; this layer is not orthogonal (singular values"
+                f" {float(svals[-1]):.4f}..{gain:.4f})."
+            )
+            weight = linear.weight.detach().unsqueeze(0).repeat(self.num_blocks, 1, 1)
+            for j in range(1, self.num_blocks):
+                nn.init.orthogonal_(weight[j], gain=gain)
+            bias = linear.bias.detach().unsqueeze(0).repeat(self.num_blocks, 1)
+        self.weight = nn.Parameter(weight, requires_grad=linear.weight.requires_grad)
+        self.bias = nn.Parameter(bias, requires_grad=linear.bias.requires_grad)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Row ``i`` through block ``_sapg_block_ids[i]``; every row through block 0 when no ids are set."""
+        ids = self._sapg_block_ids
+        if ids is None:
+            return nn.functional.linear(x, self.weight[0], self.bias[0])
+        assert ids.shape[0] == x.shape[0], "SAPG block ids do not match the batch."
+        out = x.new_empty(x.shape[0], self.out_features)
+        # One matmul per block over its rows (a per-row weight gather would be B x out x in).
+        for j in range(self.num_blocks):
+            mask = ids == j
+            out[mask] = nn.functional.linear(x[mask], self.weight[j], self.bias[j])
+        return out
+
+    def extra_repr(self) -> str:
+        """Layer summary for ``print(model)``."""
+        return f"num_blocks={self.num_blocks}, in_features={self.in_features}, out_features={self.out_features}"
+
+
+def attach_block_heads(model: MLPModel, num_blocks: int, shared_layers: int) -> MLPModel:
+    """Turn every Linear of ``model.mlp`` after the first ``shared_layers`` into a per-block ``BlockLinear``."""
+    positions = [i for i, m in enumerate(model.mlp) if isinstance(m, nn.Linear)]
+    assert 0 <= shared_layers < len(positions), (
+        f"shared_layers must be in [0, {len(positions) - 1}] for a {len(positions)}-Linear MLP, got {shared_layers}."
+    )
+    for i in positions[shared_layers:]:
+        layer = model.mlp[i]
+        assert type(layer) is nn.Linear, f"expected nn.Linear at mlp[{i}], got {type(layer).__name__}."
+        model.mlp[i] = BlockLinear(layer, num_blocks)
+    model.sapg_shared_layers = int(shared_layers)  # type: ignore[attr-defined]
+    return model
 
 
 class _BlockStdMixin:
@@ -155,6 +222,7 @@ class _BlockConditionedMixin:
         """Forward passes inside the context use block ``block_ids`` per sample (``None`` = leader)."""
         dist = getattr(self, "distribution", None)
         targets = [self] + ([dist] if isinstance(dist, _BlockStdMixin) else [])
+        targets += [m for m in self.modules() if isinstance(m, BlockLinear)]  # type: ignore[attr-defined]
         previous = [t._sapg_block_ids for t in targets]
         for t in targets:
             t._sapg_block_ids = block_ids
@@ -201,15 +269,20 @@ def attach_block_conditioning(
     num_blocks: int,
     phi_dim: int,
     per_block_std: bool = False,
+    shared_layers: int | None = None,
 ) -> MLPModel:
     """Condition ``model`` (in place) on its block; returns the model.
 
-    Adds a ``[num_blocks, phi_dim]`` phi table (if ``phi_dim > 0``) and, with ``per_block_std``, one exploration
-    std per block on its distribution.
+    Adds a ``[num_blocks, phi_dim]`` phi table (if ``phi_dim > 0``), with ``per_block_std`` one exploration
+    std per block on its distribution, and with ``shared_layers`` per-block heads after that many shared Linears.
     """
     assert isinstance(model, MLPModel), f"SAPG conditioning needs an MLPModel-family model, got {type(model).__name__}."
     assert not model.is_recurrent, "SAPG conditioning supports feedforward models only."
     assert not is_block_conditioned(model), "model is already block-conditioned."
+    if shared_layers is not None:
+        # phi lives on the first Linear, which must then stay shared
+        assert phi_dim == 0 or shared_layers >= 1, "phi_dim > 0 needs shared_layers >= 1."
+        attach_block_heads(model, num_blocks, shared_layers)
     if phi_dim > 0:
         first = model.mlp[0]
         assert type(first) is nn.Linear, f"expected the MLP's first layer to be nn.Linear, got {type(first).__name__}."

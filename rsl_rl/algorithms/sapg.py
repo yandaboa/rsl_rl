@@ -55,6 +55,9 @@ class SAPG(PPO):
         relabel_chunk_size: int = 65536,
         target_kl: float | None = None,
         off_policy_sampling: str = "block",
+        shared_layers: int | None = None,
+        normalize_advantage_per_block: bool = False,
+        follower_entropy_coef: float | None = None,
         **kwargs: object,
     ) -> None:
         """``num_blocks`` M, ``phi_dim`` d; everything else is PPO's (``kwargs``).
@@ -63,6 +66,10 @@ class SAPG(PPO):
         drive the adaptive LR. ``kl_reference``: ``"previous_epoch"`` (play2perfect: a row's stored distribution is
         overwritten with the one it was just evaluated at, so epoch k>0 measures the step since epoch k-1) or
         ``"rollout"`` (rsl_rl: always against the behavior distribution).
+
+        ``shared_layers``: actor and critic share only their first ``shared_layers`` Linears (and the obs normalizer);
+        the rest are per-block heads (``None`` = one MLP for every block). ``follower_entropy_coef``: one constant
+        entropy coef for every block (incl. block 0), replacing the leader / ladder schedule.
         """
         assert num_blocks >= 1, f"num_blocks must be >= 1, got {num_blocks}."
         assert phi_dim >= 0, f"phi_dim must be >= 0, got {phi_dim}."
@@ -77,8 +84,8 @@ class SAPG(PPO):
         assert not kwargs.get("rnd_cfg"), "SAPG does not support RND."
         assert not (actor.is_recurrent or critic.is_recurrent), "SAPG supports feedforward models only."
         # Conditioning parameters must exist before PPO builds the optimizer over the model parameters.
-        attach_block_conditioning(actor, num_blocks, phi_dim, per_block_std=per_block_std)
-        attach_block_conditioning(critic, num_blocks, phi_dim)
+        attach_block_conditioning(actor, num_blocks, phi_dim, per_block_std=per_block_std, shared_layers=shared_layers)
+        attach_block_conditioning(critic, num_blocks, phi_dim, shared_layers=shared_layers)
         super().__init__(actor, critic, storage, **kwargs)
         assert self.noise_scale_tracker is None, "SAPG does not support the gradient-noise-scale tracker."
         if self.entropy_coef:
@@ -90,6 +97,9 @@ class SAPG(PPO):
         self.num_blocks = int(num_blocks)
         self.phi_dim = int(phi_dim)
         self.per_block_std = bool(per_block_std)
+        self.shared_layers = None if shared_layers is None else int(shared_layers)
+        self.normalize_advantage_per_block = bool(normalize_advantage_per_block)
+        self.follower_entropy_coef = None if follower_entropy_coef is None else float(follower_entropy_coef)
         self.num_off_policy_blocks = min(self.num_blocks - 1, int(off_policy_ratio))
         # "block": whole follower block(s) per iteration (play2perfect); "uniform": the same number of rows drawn
         # uniformly over every follower transition (SAPG paper, Algorithm 1)
@@ -113,9 +123,12 @@ class SAPG(PPO):
         self.num_leader_envs = int(self.leader_env_mask.sum())
         # play2perfect: linspace(0.5, 0, M)[b] * scale with its leader last; ours is block 0, so follower j gets
         # 0.5 * j / (M - 1) * scale (the largest bonus on block M-1).
-        self.block_entropy_coefs = [self.leader_entropy_coef] + [
-            self.sapg_entropy_scale * 0.5 * j / (self.num_blocks - 1) for j in range(1, self.num_blocks)
-        ]
+        if self.follower_entropy_coef is not None:
+            self.block_entropy_coefs = [self.follower_entropy_coef] * self.num_blocks
+        else:
+            self.block_entropy_coefs = [self.leader_entropy_coef] + [
+                self.sapg_entropy_scale * 0.5 * j / (self.num_blocks - 1) for j in range(1, self.num_blocks)
+            ]
         self._env_entropy_coef = torch.tensor(self.block_entropy_coefs, device=self.device)[self.env_block_ids]
 
         num_steps = storage.num_transitions_per_env
@@ -191,6 +204,8 @@ class SAPG(PPO):
         for j in range(self.num_blocks):
             if count[j] > 0:
                 metrics[f"SAPG/block{j}_return"] = float(ret[j] / count[j])
+                if self.episode_success_fn is not None:
+                    metrics[f"SAPG/block{j}_success"] = float(success[j] / count[j])
         return metrics
 
     # ------------------------------------------------------------------------------------------------
@@ -233,7 +248,7 @@ class SAPG(PPO):
                 rows[key] = torch.cat([rows[key], value], dim=0)
         rows["entropy_coef"] = torch.cat([
             self._env_entropy_coef.repeat(st.num_transitions_per_env),
-            torch.full((rows["src"].shape[0] - num_on,), self.leader_entropy_coef, device=self.device),
+            torch.full((rows["src"].shape[0] - num_on,), self.block_entropy_coefs[0], device=self.device),
         ])
         if not self.normalize_advantage_per_mini_batch:
             rows["advantages"] = self._normalize(rows["advantages"])
@@ -322,7 +337,17 @@ class SAPG(PPO):
         advantages = rows["advantages"][idx].view(-1)
         if self.normalize_advantage_per_mini_batch:
             with torch.no_grad():
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                if self.normalize_advantage_per_block:
+                    normalized = torch.empty_like(advantages)
+                    for j in range(self.num_blocks):
+                        mask = block == j
+                        if bool(mask.any()):
+                            adv_j = advantages[mask]
+                            std_j = adv_j.std() if adv_j.numel() > 1 else adv_j.new_zeros(())
+                            normalized[mask] = (adv_j - adv_j.mean()) / (std_j + 1e-8)
+                    advantages = normalized
+                else:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         with block_context(block, self.actor, self.critic):
             self.actor(obs, stochastic_output=True)
@@ -561,7 +586,12 @@ class SAPG(PPO):
     def save(self) -> dict:
         """PPO checkpoint (phi / per-block std live in the actor/critic state dicts) plus the block layout."""
         saved = super().save()
-        saved["sapg"] = {"num_blocks": self.num_blocks, "phi_dim": self.phi_dim, "per_block_std": self.per_block_std}
+        saved["sapg"] = {
+            "num_blocks": self.num_blocks,
+            "phi_dim": self.phi_dim,
+            "per_block_std": self.per_block_std,
+            "shared_layers": self.shared_layers,
+        }
         return saved
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -573,5 +603,8 @@ class SAPG(PPO):
         assert saved["num_blocks"] == self.num_blocks and saved["phi_dim"] == self.phi_dim, (
             f"SAPG checkpoint has num_blocks={saved['num_blocks']}, phi_dim={saved['phi_dim']};"
             f" this run has {self.num_blocks}, {self.phi_dim}."
+        )
+        assert saved.get("shared_layers") == self.shared_layers, (
+            f"SAPG checkpoint has shared_layers={saved.get('shared_layers')}; this run has {self.shared_layers}."
         )
         return super().load(loaded_dict, load_cfg, strict)

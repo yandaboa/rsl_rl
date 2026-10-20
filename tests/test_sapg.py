@@ -17,7 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.algorithms import PPO, SAPG
-from rsl_rl.models import MLPEncoderModel, MLPModel, block_context
+from rsl_rl.models import BlockLinear, MLPEncoderModel, MLPModel, attach_block_heads, block_context
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 from tests.runners.test_on_policy_runner import DummyEnv
@@ -527,3 +527,162 @@ def test_runner_learns_saves_and_loads(tmp_path, dist: str) -> None:
     assert torch.equal(runner.alg.actor.sapg_phi, other.alg.actor.sapg_phi)
     assert torch.equal(runner.alg.actor.distribution.sapg_follower_std, other.alg.actor.distribution.sapg_follower_std)
     runner.export_policy_to_jit(str(tmp_path), "policy.pt")
+
+
+# --------------------------------------------------------------------------------------------------
+# Per-block heads (leaderless "split" SAPG)
+# --------------------------------------------------------------------------------------------------
+
+
+def _orthogonal_models(seed: int = 0) -> tuple[MLPModel, MLPModel]:
+    """``_models("mlp")`` with cleanRL layer_init (orthogonal weights, zero biases), as the per-block heads need."""
+    actor, critic = _models("mlp", GAUSSIAN, seed)
+    for model, out_gain in ((actor, 0.01), (critic, 1.0)):
+        linears = [m for m in model.mlp if isinstance(m, torch.nn.Linear)]
+        for i, layer in enumerate(linears):
+            torch.nn.init.orthogonal_(layer.weight, out_gain if i == len(linears) - 1 else 2.0**0.5)
+            torch.nn.init.zeros_(layer.bias)
+    return actor, critic
+
+
+def _split_sapg(shared_layers: int = 1, num_blocks: int = 3, phi_dim: int = 0, **overrides) -> SAPG:
+    actor, critic = _orthogonal_models()
+    sapg_kw = {k: overrides.pop(k) for k in list(overrides) if k in SAPG_KEYS}
+    sapg_kw.setdefault("off_policy_ratio", 0.0)
+    return SAPG(
+        actor,
+        critic,
+        _storage(),
+        num_blocks=num_blocks,
+        phi_dim=phi_dim,
+        shared_layers=shared_layers,
+        **sapg_kw,
+        **_alg_kwargs(**overrides),
+    )
+
+
+def test_block_linear_init_and_leader_default() -> None:
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(6, 5)
+    torch.nn.init.orthogonal_(linear.weight, gain=1.7)
+    head = BlockLinear(linear, num_blocks=3)
+    x = torch.randn(10, 6)
+    # (a) ids None == block 0 == the original layer
+    assert torch.allclose(head(x), linear(x))
+    head._sapg_block_ids = torch.zeros(10, dtype=torch.long)
+    assert torch.allclose(head(x), linear(x))
+    # (b) fresh blocks differ, same orthogonal gain, same bias
+    for j in (1, 2):
+        assert not torch.allclose(head.weight[j], head.weight[0])
+        assert torch.allclose(torch.linalg.svdvals(head.weight[j]), torch.full((5,), 1.7), atol=1e-4)
+        assert torch.equal(head.bias[j], head.bias[0])
+    assert not torch.allclose(head.weight[1], head.weight[2])
+    ids = torch.arange(10) % 3
+    head._sapg_block_ids = ids
+    out = head(x)
+    for j in range(3):
+        assert torch.allclose(out[ids == j], x[ids == j] @ head.weight[j].T + head.bias[j])
+    with pytest.raises(AssertionError):
+        BlockLinear(torch.nn.Linear(6, 5), num_blocks=2)  # default (kaiming) init is not orthogonal
+
+
+@pytest.mark.parametrize("shared_layers", [0, 1, 2])
+def test_attach_block_heads_layout(shared_layers: int) -> None:
+    actor, _ = _orthogonal_models()
+    obs = _obs()
+    with torch.no_grad():
+        before = actor(obs)
+    attach_block_heads(actor, num_blocks=3, shared_layers=shared_layers)
+    kinds = [type(m) for m in actor.mlp if isinstance(m, (torch.nn.Linear, BlockLinear))]
+    assert kinds == [torch.nn.Linear] * shared_layers + [BlockLinear] * (3 - shared_layers)
+    assert actor.sapg_shared_layers == shared_layers
+    with torch.no_grad():
+        assert torch.allclose(actor(obs), before)
+    with pytest.raises(AssertionError):
+        attach_block_heads(_orthogonal_models()[0], num_blocks=3, shared_layers=3)
+
+
+def test_block_heads_gradients_are_per_block() -> None:
+    sapg = _split_sapg(shared_layers=1, num_blocks=3)
+    actor = sapg.actor
+    heads = [m for m in actor.mlp if isinstance(m, BlockLinear)]
+    shared = actor.mlp[0]
+    assert type(shared) is torch.nn.Linear and len(heads) == 2
+    obs = _obs()
+    ids = sapg.env_block_ids
+    j = 1
+    with block_context(ids, actor):
+        out = actor(obs)
+    out[ids == j].pow(2).sum().backward()
+    assert shared.weight.grad is not None and shared.weight.grad.abs().sum() > 0
+    for head in heads:
+        for k in range(3):
+            touched = head.weight.grad[k].abs().sum() > 0
+            assert bool(touched) == (k == j), (k, j)
+            assert torch.all(head.bias.grad[k] == 0) == (k != j)
+
+
+def test_sapg_blocks_context_reaches_heads() -> None:
+    sapg = _split_sapg(shared_layers=1, num_blocks=3)
+    obs = _obs()
+    heads = [m for m in sapg.actor.modules() if isinstance(m, BlockLinear)]
+    ids = sapg.env_block_ids
+    with torch.no_grad():
+        leader = sapg.actor(obs)
+        with block_context(ids, sapg.actor, sapg.critic):
+            assert all(h._sapg_block_ids is ids for h in heads)
+            assert all(h._sapg_block_ids is ids for h in sapg.critic.modules() if isinstance(h, BlockLinear))
+            mixed = sapg.actor(obs)
+        assert all(h._sapg_block_ids is None for h in heads)
+        with block_context(torch.zeros_like(ids), sapg.actor):
+            assert torch.allclose(sapg.actor(obs), leader)
+    assert torch.allclose(mixed[ids == 0], leader[ids == 0])
+    assert not torch.allclose(mixed[ids != 0], leader[ids != 0])
+    # Exporters walk model.mlp on a bare latent: the leader.
+    jit = torch.jit.script(sapg.actor.as_jit())
+    with torch.no_grad():
+        assert torch.allclose(jit(torch.cat([obs[g] for g in sapg.actor.obs_groups], dim=-1)), leader, atol=1e-6)
+
+
+def test_split_sapg_update_entropy_and_checkpoint() -> None:
+    sapg = _split_sapg(shared_layers=1, num_blocks=3, follower_entropy_coef=0.01, normalize_advantage_per_block=True)
+    assert sapg.block_entropy_coefs == [0.01] * 3 and sapg.num_off_policy_blocks == 0
+    sapg.episode_success_fn = lambda: torch.arange(NUM_ENVS) % 2 == 0
+    _collect(sapg)
+    assert torch.allclose(sapg._rows["entropy_coef"], torch.full((NUM_ENVS * NUM_STEPS,), 0.01))
+    loss = sapg.update()
+    for j in range(3):
+        assert f"SAPG/block{j}_success" in loss
+    saved = copy.deepcopy(sapg.save())
+    assert saved["sapg"]["shared_layers"] == 1
+    other = _split_sapg(shared_layers=1, num_blocks=3)
+    other.load(saved, None, strict=True)
+    with pytest.raises(AssertionError):
+        _split_sapg(shared_layers=2, num_blocks=3).load(saved, None, strict=True)
+
+
+def test_per_block_advantage_normalization() -> None:
+    sapg = _split_sapg(shared_layers=1, num_blocks=3, normalize_advantage_per_block=True)
+    assert sapg.normalize_advantage_per_mini_batch is False
+    sapg.normalize_advantage_per_mini_batch = True
+    _collect(sapg)
+    rows = sapg._rows
+    # Offset each block so a joint normalization would leave the per-block means far from 0.
+    rows["advantages"] = rows["advantages"] + rows["block"].float().view_as(rows["advantages"]) * 10.0
+    st = sapg.storage
+    flat = {
+        "observations": st.observations.flatten(0, 1),
+        "actions": st.actions.flatten(0, 1),
+        "actions_log_prob": st.actions_log_prob.flatten(0, 1),
+    }
+    idx = torch.randperm(rows["src"].shape[0])
+    old = tuple(p.flatten(0, 1)[rows["src"]][idx] for p in st.distribution_params)
+    with torch.no_grad():
+        terms = sapg.minibatch_losses(idx, flat, old)
+    # Near the behavior policy every ratio is inside the clip, so the surrogate row is -advantage * ratio.
+    ratio = terms["ratio"].view(-1)
+    assert torch.all((ratio - 1.0).abs() < sapg.clip_param)
+    adv = -terms["surrogate_rows"].view(-1) / ratio
+    for j in range(3):
+        assert adv[terms["block"] == j].mean().abs() < 1e-4
+        assert adv[terms["block"] == j].std() == pytest.approx(1.0, abs=1e-3)

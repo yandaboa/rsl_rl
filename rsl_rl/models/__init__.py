@@ -5,7 +5,13 @@
 
 """Neural models for the learning algorithm."""
 
-from .block_conditioning import PhiConditionedLinear, attach_block_conditioning, block_context
+from .block_conditioning import (
+    BlockLinear,
+    PhiConditionedLinear,
+    attach_block_conditioning,
+    attach_block_heads,
+    block_context,
+)
 from .cnn_model import CNNModel
 from .encoder_model import MLPEncoderModel
 from .episode_context_model import (
@@ -21,9 +27,11 @@ from .policyflow_model import PolicyFlowModel
 from .rnn_model import RNNModel
 
 __all__ = [
+    "BlockLinear",
     "CNNModel",
     "PhiConditionedLinear",
     "attach_block_conditioning",
+    "attach_block_heads",
     "block_context",
     "EpisodeContextActorView",
     "EpisodeContextCriticView",
