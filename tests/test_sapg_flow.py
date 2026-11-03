@@ -553,3 +553,97 @@ class _OrthoMLPModel(MLPModel):
             if isinstance(layer, torch.nn.Linear):
                 torch.nn.init.orthogonal_(layer.weight, 1.0)
                 torch.nn.init.zeros_(layer.bias)
+
+
+# ---- leader_encoder="trunk": Gaussian SAPG actor as is (shared MLP + phi), flow head on the leader's trunk ----
+TRUNK_FLOW_CFG = {**FLOW_CFG, "hidden_dims": [16]}
+
+
+def _trunk_alg(num_blocks: int = 3, **kw) -> SAPGFlow:
+    actor, critic = _models()
+    storage = RolloutStorage("rl", NUM_ENVS - NUM_ENVS % num_blocks, NUM_STEPS, _obs(NUM_ENVS - NUM_ENVS % num_blocks), [NUM_ACTIONS])
+    kw.setdefault("num_latents", K)
+    return SAPGFlow(
+        actor,
+        critic,
+        storage,
+        flow_cfg=copy.deepcopy(TRUNK_FLOW_CFG),
+        leader_encoder="trunk",
+        num_blocks=num_blocks,
+        phi_dim=4,
+        per_block_std=True,
+        off_policy_ratio=1.0,
+        off_policy_sampling="uniform",
+        num_learning_epochs=2,
+        num_mini_batches=2,
+        learning_rate=1e-3,
+        schedule="fixed",
+        desired_kl=None,
+        entropy_coef=0.0,
+        target_kl=None,
+        **kw,
+    )
+
+
+def _trunk_collect(alg: SAPGFlow, seed: int = 1) -> None:
+    n = alg.storage.num_envs
+    generator = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed + 100)
+    obs = _obs(n, generator=generator)
+    with torch.inference_mode():
+        for _ in range(NUM_STEPS):
+            alg.act(obs)
+            obs = _obs(n, generator=generator)
+            rewards = torch.randn(n, generator=generator)
+            dones = (torch.rand(n, generator=generator) < 0.25).float()
+            alg.process_env_step(obs, rewards, dones, {"time_outs": torch.zeros(n)})
+        alg.compute_returns(obs)
+
+
+def test_trunk_encoder_is_the_leaders_hidden_stack() -> None:
+    """The leader latent is the Gaussian actor's last hidden layer under phi[0]; only the velocity head loops."""
+    alg = _trunk_alg()
+    actor = alg.actor
+    assert alg.flow_leader.encoder[0] is actor.obs_normalizer and len(alg.flow_leader.encoder) == len(actor.mlp)
+    obs = _obs(alg.storage.num_envs)
+    with torch.no_grad():
+        expected = torch.nn.Sequential(*list(actor.mlp)[:-1])(actor.get_latent(obs))  # no ids -> phi[0]
+        latent = alg.flow_leader.get_latent(obs)
+    assert torch.allclose(latent, expected, atol=1e-6) and alg.flow_leader.latent_dim == expected.shape[-1]
+    assert sum(isinstance(m, torch.nn.Linear) for m in alg.flow_leader.mlp) == 2  # one hidden layer + decode
+    assert id(actor.mlp[0].phi) in {id(p) for p in alg._encoder_params}
+
+
+def test_trunk_leader_rows_train_trunk_and_leader_phi_only() -> None:
+    alg = _trunk_alg()
+    _trunk_collect(alg)
+    lead = torch.nonzero(alg._rows["block"] == 0).view(-1)
+    terms = _losses(alg, lead)
+    alg.optimizer.zero_grad()
+    terms["loss"].backward()
+    phi = alg.actor.mlp[0].phi
+    assert _nonzero(alg.actor.mlp[0].weight) and _nonzero(alg.actor.mlp[2].weight)
+    assert float(phi.grad[0].abs().sum()) > 0 and float(phi.grad[1:].abs().sum()) == 0.0
+    assert not _nonzero(alg.actor.mlp[-1].weight)  # the Gaussian mean head never sees leader rows
+    assert not _nonzero(alg.actor.distribution.sapg_follower_std)
+    assert any(_nonzero(p) for p in alg.flow_leader.parameters())
+
+
+def test_trunk_awfm_and_update() -> None:
+    alg = _trunk_alg(num_blocks=3, fm_coef=1.0, lambda_off=0.0)
+    _trunk_collect(alg)
+    off = torch.nonzero(alg._rows["off"]).view(-1)
+    terms = _losses(alg, off)
+    alg.optimizer.zero_grad()
+    terms["loss"].backward()
+    assert terms["fm_loss"].item() > 0.0 and _nonzero(alg.actor.mlp[0].weight)
+    assert float(alg.actor.mlp[0].phi.grad[0].abs().sum()) > 0
+    loss = alg.update()
+    assert all(torch.isfinite(torch.tensor(v)) for v in loss.values())
+
+
+def test_trunk_requires_fully_shared_mlp() -> None:
+    with pytest.raises(AssertionError, match="fully shared"):
+        actor, critic = _models()
+        SAPGFlow(actor, critic, RolloutStorage("rl", 9, NUM_STEPS, _obs(9), [NUM_ACTIONS]), flow_cfg=copy.deepcopy(TRUNK_FLOW_CFG),
+                 leader_encoder="trunk", num_blocks=3, phi_dim=4, shared_layers=1)

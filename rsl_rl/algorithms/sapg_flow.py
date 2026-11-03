@@ -48,8 +48,10 @@ def _row_gaussian_kl(
 class SAPGFlow(SAPG):
     """Leader-follower SAPG whose leader (block 0) is a :class:`PolicyFlowModel`.
 
-    - Followers are the split-SAPG Gaussian heads (``shared_layers`` trunk, no phi). The flow leader shares the
-      follower actor's obs normalizer + first Linear + activation as its state encoder (owned by the actor).
+    - ``leader_encoder="first_layer"``: followers are the split-SAPG Gaussian heads (``shared_layers`` trunk, no phi)
+      and the flow leader shares the actor's obs normalizer + first Linear + activation as its state encoder.
+      ``leader_encoder="trunk"``: the Gaussian SAPG actor as is (fully shared MLP, phi per block); the flow leader
+      encodes with the whole hidden stack under the leader's phi[0], so only its velocity head loops when sampling.
     - Leader on-policy rows: the PolicyFlow loss (ratio ``N(n; dv, std_new) / N(n; 0, std_old)``, Brownian reg).
       ``leader_algo="fpo"`` / ``"reinflow"`` swap in FPO++ (CFM-loss ratio) / ReinFlow (per-step Euler noise chain);
       both need ``lambda_off=0`` (AWFM still applies).
@@ -89,6 +91,7 @@ class SAPGFlow(SAPG):
         reinflow_sigma_min: float = 0.05,
         reinflow_sigma_max: float = 0.3,
         reinflow_noise_hidden: int = 64,
+        leader_encoder: str = "first_layer",
         **sapg_kwargs,
     ) -> None:
         """``leader_algo``: the leader's on-policy objective, ``"policyflow"`` (Gaussian noise on phi(x0)), ``"fpo"``
@@ -101,19 +104,28 @@ class SAPGFlow(SAPG):
         assert fpo_trust_region in ("ppo", "spo", "aspo"), f"unknown fpo_trust_region {fpo_trust_region!r}"
         assert fpo_samples >= 1 and encoder_grad_minibatches >= 0
         assert 0.0 < reinflow_sigma_min < reinflow_sigma_max, "need 0 < reinflow_sigma_min < reinflow_sigma_max"
-        assert sapg_kwargs.get("shared_layers") is not None, "SAPGFlow needs shared_layers (the shared encoder)."
-        assert int(sapg_kwargs.get("phi_dim", 32)) == 0, "SAPGFlow needs phi_dim=0."
+        assert leader_encoder in ("first_layer", "trunk"), f"unknown leader_encoder {leader_encoder!r}"
+        if leader_encoder == "first_layer":
+            assert sapg_kwargs.get("shared_layers") is not None, "SAPGFlow needs shared_layers (the shared encoder)."
+            assert int(sapg_kwargs.get("phi_dim", 32)) == 0, "SAPGFlow needs phi_dim=0."
+        else:
+            assert sapg_kwargs.get("shared_layers") is None and sapg_kwargs.get("block_layers") is None, (
+                "leader_encoder='trunk' needs the fully shared SAPG MLP (no per-block heads)."
+            )
         assert int(sapg_kwargs.get("num_blocks", 6)) >= 2, "SAPGFlow needs num_blocks >= 2 (leader + followers)."
         assert num_latents >= 1 and mu_max > 0.0
         super().__init__(actor, critic, storage, **sapg_kwargs)
         # Block 0's Gaussian head exists (attach_block_conditioning) but never acts or trains: the flow leader does.
 
-        first = self._raw_actor.mlp[0]
-        assert type(first) is nn.Linear, (
-            f"the shared first layer must be a plain nn.Linear, got {type(first).__name__}."
-        )
-        encoder = (self._raw_actor.obs_normalizer, first, self._raw_actor.mlp[1])
-        self._encoder_params: list[nn.Parameter] = [p for p in (first.weight, first.bias) if p is not None]
+        mlp = self._raw_actor.mlp
+        if leader_encoder == "first_layer":
+            assert type(mlp[0]) is nn.Linear, f"the shared first layer must be a plain nn.Linear, got {type(mlp[0]).__name__}."
+            hidden = (mlp[0], mlp[1])
+        else:
+            # every layer but the mean head; a bare (phi-less) input makes the PhiConditionedLinear use phi[0]
+            hidden = tuple(list(mlp)[:-1])
+        encoder = (self._raw_actor.obs_normalizer, *hidden)
+        self._encoder_params: list[nn.Parameter] = [p for m in hidden for p in m.parameters()]
         flow_cfg = dict(flow_cfg)
         flow_class = resolve_callable(flow_cfg.pop("class_name", PolicyFlowModel))
         for key in _DEPRECATED_MODEL_KEYS:
