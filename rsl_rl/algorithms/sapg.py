@@ -18,7 +18,7 @@ from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
-from rsl_rl.models.block_conditioning import attach_block_conditioning, block_context
+from rsl_rl.models.block_conditioning import _BlockStdMixin, BlockLinear, attach_block_conditioning, block_context
 from rsl_rl.storage import RolloutStorage
 
 
@@ -37,6 +37,9 @@ class SAPG(PPO):
     - Advantages are normalized jointly over all rows (across ranks); the adaptive LR reads the epoch-mean KL and
       steps once per epoch.
     """
+
+    allow_uneven_blocks: bool = False
+    """Inference-only escape hatch (rollout probes): num_envs need not be a multiple of num_blocks."""
 
     def __init__(
         self,
@@ -58,6 +61,12 @@ class SAPG(PPO):
         shared_layers: int | None = None,
         normalize_advantage_per_block: bool = False,
         follower_entropy_coef: float | None = None,
+        block_layers: list[int] | None = None,
+        div_minibatches: int = 2,
+        freeze_shared_layers: bool = False,
+        block_init_std: list[float] | None = None,
+        critic_shared_layers: int | None = None,
+        critic_phi_dim: int | None = None,
         **kwargs: object,
     ) -> None:
         """``num_blocks`` M, ``phi_dim`` d; everything else is PPO's (``kwargs``).
@@ -68,8 +77,12 @@ class SAPG(PPO):
         ``"rollout"`` (rsl_rl: always against the behavior distribution).
 
         ``shared_layers``: actor and critic share only their first ``shared_layers`` Linears (and the obs normalizer);
-        the rest are per-block heads (``None`` = one MLP for every block). ``follower_entropy_coef``: one constant
+        the rest are per-block heads (``None`` = one MLP for every block). ``block_layers``: instead, exactly these
+        Linear indices (0 = first, negative from the end) are per-block. ``follower_entropy_coef``: one constant
         entropy coef for every block (incl. block 0), replacing the leader / ladder schedule.
+        ``div_minibatches``: the first N minibatches of epoch 0 log ``block_div/*`` (pairwise block action-mean
+        distances; 0 = off). ``critic_shared_layers`` / ``critic_phi_dim``: the critic's layout when it differs from
+        the actor's (``None`` = same as the actor; ``block_layers`` always applies to both).
         """
         assert num_blocks >= 1, f"num_blocks must be >= 1, got {num_blocks}."
         assert phi_dim >= 0, f"phi_dim must be >= 0, got {phi_dim}."
@@ -83,9 +96,34 @@ class SAPG(PPO):
         assert not kwargs.get("symmetry_cfg"), "SAPG does not support symmetry augmentation."
         assert not kwargs.get("rnd_cfg"), "SAPG does not support RND."
         assert not (actor.is_recurrent or critic.is_recurrent), "SAPG supports feedforward models only."
+        assert shared_layers is None or block_layers is None, "set either shared_layers or block_layers, not both."
+        assert div_minibatches >= 0, f"div_minibatches must be >= 0, got {div_minibatches}."
         # Conditioning parameters must exist before PPO builds the optimizer over the model parameters.
-        attach_block_conditioning(actor, num_blocks, phi_dim, per_block_std=per_block_std, shared_layers=shared_layers)
-        attach_block_conditioning(critic, num_blocks, phi_dim, shared_layers=shared_layers)
+        layout = {"shared_layers": shared_layers, "block_layers": block_layers}
+        attach_block_conditioning(actor, num_blocks, phi_dim, per_block_std=per_block_std, **layout)
+        if critic_shared_layers is not None:
+            assert block_layers is None, "critic_shared_layers needs the shared_layers layout, not block_layers."
+            layout = {"shared_layers": critic_shared_layers, "block_layers": None}
+        c_phi_dim = phi_dim if critic_phi_dim is None else int(critic_phi_dim)
+        attach_block_conditioning(critic, num_blocks, c_phi_dim, **layout)
+        if freeze_shared_layers:  # shared actor Linears stay at their random init (per-block ones are BlockLinear)
+            frozen = [m for m in actor.mlp if type(m) is nn.Linear]
+            assert frozen, "freeze_shared_layers: the actor has no shared Linear."
+            for m in frozen:
+                m.weight.requires_grad_(False)
+                m.bias.requires_grad_(False)
+            print(f"[SAPG] froze {len(frozen)} shared actor Linear(s)")
+        if block_init_std is not None:
+            assert per_block_std and len(block_init_std) == num_blocks, "block_init_std needs one std per block."
+            dist = actor.distribution
+            assert isinstance(dist, _BlockStdMixin), "block_init_std needs a per-block std distribution."
+            with torch.no_grad():
+                vals = torch.tensor([float(v) for v in block_init_std], device=dist.sapg_follower_std.device)
+                if dist.sapg_std_name == "log_std_param":
+                    vals = vals.log()
+                getattr(dist, dist.sapg_std_name).fill_(vals[0].item())
+                dist.sapg_follower_std.copy_(vals[1:].view(-1, *([1] * (dist.sapg_follower_std.dim() - 1))).expand_as(dist.sapg_follower_std))
+            print(f"[SAPG] per-block init std: {block_init_std}")
         super().__init__(actor, critic, storage, **kwargs)
         assert self.noise_scale_tracker is None, "SAPG does not support the gradient-noise-scale tracker."
         if self.entropy_coef:
@@ -98,6 +136,18 @@ class SAPG(PPO):
         self.phi_dim = int(phi_dim)
         self.per_block_std = bool(per_block_std)
         self.shared_layers = None if shared_layers is None else int(shared_layers)
+        self.critic_shared_layers = None if critic_shared_layers is None else int(critic_shared_layers)
+        self.critic_phi_dim = None if critic_phi_dim is None else int(critic_phi_dim)
+        num_linears = sum(isinstance(m, (nn.Linear, BlockLinear)) for m in actor.mlp)
+        # resolved by attach_block_heads (None = no per-block Linears configured)
+        self.block_layers: list[int] | None = getattr(actor, "sapg_block_layers", None)
+        per_block = self.block_layers or []
+        shared = [k for k in range(num_linears) if k not in per_block]
+        print(f"[SAPG] per-block actor Linears: {per_block} (shared: {shared})")
+        if self.critic_shared_layers is not None or self.critic_phi_dim is not None:
+            c_block = getattr(critic, "sapg_block_layers", None) or []
+            print(f"[SAPG] critic layout: per-block Linears {c_block}, phi_dim {c_phi_dim}")
+        self.div_minibatches = int(div_minibatches)
         self.normalize_advantage_per_block = bool(normalize_advantage_per_block)
         self.follower_entropy_coef = None if follower_entropy_coef is None else float(follower_entropy_coef)
         self.num_off_policy_blocks = min(self.num_blocks - 1, int(off_policy_ratio))
@@ -114,7 +164,7 @@ class SAPG(PPO):
         self.target_kl = None if target_kl is None else float(target_kl)
 
         num_envs = storage.num_envs
-        assert num_envs % self.num_blocks == 0, (
+        assert self.allow_uneven_blocks or num_envs % self.num_blocks == 0, (
             f"num_envs={num_envs} is not a multiple of num_blocks={self.num_blocks}."
         )
         # Contiguous equal blocks (the formula would also tolerate uneven ones).
@@ -124,7 +174,7 @@ class SAPG(PPO):
         # play2perfect: linspace(0.5, 0, M)[b] * scale with its leader last; ours is block 0, so follower j gets
         # 0.5 * j / (M - 1) * scale (the largest bonus on block M-1).
         if self.follower_entropy_coef is not None:
-            self.block_entropy_coefs = [self.follower_entropy_coef] * self.num_blocks
+            self.block_entropy_coefs = [self.leader_entropy_coef] + [self.follower_entropy_coef] * (self.num_blocks - 1)
         else:
             self.block_entropy_coefs = [self.leader_entropy_coef] + [
                 self.sapg_entropy_scale * 0.5 * j / (self.num_blocks - 1) for j in range(1, self.num_blocks)
@@ -409,6 +459,62 @@ class SAPG(PPO):
             "SAPG/grad_norm_off_over_on": g_off.norm() / (g_on.norm() + 1e-12),
         }
 
+    def _div_blocks(self) -> list[int]:
+        """Blocks whose Gaussian heads enter ``block_div/*`` (SAPGFlow: block 0's head is unused)."""
+        return list(range(1 if hasattr(self, "flow_leader") else 0, self.num_blocks))
+
+    @torch.no_grad()
+    def _block_diversity(self, obs: TensorDict) -> dict[str, torch.Tensor] | None:
+        """Pairwise distances between the blocks' deterministic action means on the same ``obs`` rows."""
+        blocks = self._div_blocks()
+        if len(blocks) < 2:
+            return None
+        n = obs.batch_size[0]
+        mus, stds = [], []
+        for j in blocks:
+            with block_context(torch.full((n,), j, dtype=torch.long, device=self.device), self.actor):
+                mu = self.actor(obs)
+                # Gaussian / gSDE: the mean is the raw MLP output; update() applies block j's std
+                self.actor.distribution.update(mu)  # type: ignore[union-attr]
+                std = self.actor.output_std.expand_as(mu)
+            mus.append(mu)
+            stds.append(std)
+        dist_std, kl, dist_raw, agree = [], [], [], []
+        for a in range(len(blocks)):
+            for b in range(a + 1, len(blocks)):
+                diff = mus[a] - mus[b]
+                var_a, var_b = stds[a].pow(2), stds[b].pow(2)
+                dist_std.append((diff / (0.5 * (stds[a] + stds[b]))).pow(2).mean().sqrt())
+                # symmetric KL of diag Gaussians, summed over action dims
+                kl_rows = 0.5 * ((var_a + diff.pow(2)) / var_b + (var_b + diff.pow(2)) / var_a - 2.0).sum(dim=-1)
+                kl.append(kl_rows.mean())
+                dist_raw.append(diff.pow(2).mean().sqrt())
+                agree.append((torch.sign(mus[a]) == torch.sign(mus[b])).all(dim=-1).float().mean())
+        dist_std_t = torch.stack(dist_std)
+        return {
+            "block_div/pair_dist_std_mean": dist_std_t.mean(),
+            "block_div/pair_dist_std_min": dist_std_t.min(),
+            "block_div/pair_kl_mean": torch.stack(kl).mean(),
+            "block_div/pair_dist_raw_mean": torch.stack(dist_raw).mean(),
+            "block_div/argmax_agree": torch.stack(agree).mean(),
+        }
+
+    def _accumulate_block_diversity(self, obs: TensorDict, sums: dict[str, torch.Tensor]) -> None:
+        """Add one minibatch's ``block_div/*`` values to ``sums`` (plus the ``_div_count`` counter)."""
+        metrics = self._block_diversity(obs)
+        if metrics is None:
+            return
+        for key, value in metrics.items():
+            sums[key] = sums[key] + value if key in sums else value
+        sums["_div_count"] = sums.get("_div_count", torch.zeros((), device=self.device)) + 1.0
+
+    @staticmethod
+    def _block_diversity_logs(out: dict[str, float]) -> dict[str, float]:
+        count = out.get("_div_count", 0.0)
+        if count <= 0:
+            return {}
+        return {k: v / count for k, v in out.items() if k.startswith("block_div/")}
+
     def update(self) -> dict[str, float]:
         """PPO epochs over the on-policy + relabeled rows; LR adapted once per epoch."""
         assert self._rows is not None, "compute_returns() must run before update()."
@@ -447,6 +553,8 @@ class SAPG(PPO):
             kl_acc = torch.zeros(5, device=self.device)
             for i in range(self.num_mini_batches):
                 idx = indices[i * mini_batch_size : (i + 1) * mini_batch_size]
+                if epoch == 0 and i < self.div_minibatches:
+                    self._accumulate_block_diversity(flat["observations"][rows["src"][idx]], sums)
                 terms = self.minibatch_losses(idx, flat, tuple(p[idx] for p in old_params))
                 if epoch == 0 and i == 0:
                     self.last_minibatch_debug = {
@@ -552,6 +660,7 @@ class SAPG(PPO):
             loss_dict["kl_stop/stopped"] = float(num_steps_run < self.num_learning_epochs * self.num_mini_batches)
             loss_dict["kl_stop/approx_kl_first"] = approx_kl_first
             loss_dict["kl_stop/approx_kl_last"] = approx_kl_last
+        loss_dict.update(self._block_diversity_logs(out))
         loss_dict.update(self._relabel_stats)
         # Episode stats ride on the loss dict (logged as ``Loss/SAPG/*``): the runner stays stock.
         loss_dict.update(self.episode_metrics())
@@ -591,6 +700,9 @@ class SAPG(PPO):
             "phi_dim": self.phi_dim,
             "per_block_std": self.per_block_std,
             "shared_layers": self.shared_layers,
+            "block_layers": self.block_layers,
+            "critic_shared_layers": self.critic_shared_layers,
+            "critic_phi_dim": self.critic_phi_dim,
         }
         return saved
 
@@ -607,4 +719,10 @@ class SAPG(PPO):
         assert saved.get("shared_layers") == self.shared_layers, (
             f"SAPG checkpoint has shared_layers={saved.get('shared_layers')}; this run has {self.shared_layers}."
         )
+        for k in ("critic_shared_layers", "critic_phi_dim"):
+            assert saved.get(k) == getattr(self, k), f"SAPG checkpoint has {k}={saved.get(k)}; this run has {getattr(self, k)}."
+        if "block_layers" in saved:
+            assert saved["block_layers"] == self.block_layers, (
+                f"SAPG checkpoint has block_layers={saved['block_layers']}; this run has {self.block_layers}."
+            )
         return super().load(loaded_dict, load_cfg, strict)

@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import copy
 import pytest
+import math
 import torch
 from tensordict import TensorDict
 
 from rsl_rl.algorithms import PPO, SAPG
 from rsl_rl.models import BlockLinear, MLPEncoderModel, MLPModel, attach_block_heads, block_context
+from rsl_rl.models.block_conditioning import PhiConditionedLinear
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 from tests.runners.test_on_policy_runner import DummyEnv
@@ -582,8 +584,12 @@ def test_block_linear_init_and_leader_default() -> None:
     out = head(x)
     for j in range(3):
         assert torch.allclose(out[ids == j], x[ids == j] @ head.weight[j].T + head.bias[j])
-    with pytest.raises(AssertionError):
-        BlockLinear(torch.nn.Linear(6, 5), num_blocks=2)  # default (kaiming) init is not orthogonal
+    # (c) a torch-default-init layer: blocks 1.. are fresh default-init draws (weights and biases)
+    plain = torch.nn.Linear(6, 5)
+    head = BlockLinear(plain, num_blocks=2)
+    assert torch.equal(head.weight[0], plain.weight) and torch.equal(head.bias[0], plain.bias)
+    assert not torch.allclose(head.weight[1], head.weight[0]) and not torch.equal(head.bias[1], head.bias[0])
+    assert head.weight[1].abs().max() <= 1.0 / math.sqrt(6) + 1e-6 and head.bias[1].abs().max() <= 1.0 / math.sqrt(6)
 
 
 @pytest.mark.parametrize("shared_layers", [0, 1, 2])
@@ -646,10 +652,11 @@ def test_sapg_blocks_context_reaches_heads() -> None:
 
 def test_split_sapg_update_entropy_and_checkpoint() -> None:
     sapg = _split_sapg(shared_layers=1, num_blocks=3, follower_entropy_coef=0.01, normalize_advantage_per_block=True)
-    assert sapg.block_entropy_coefs == [0.01] * 3 and sapg.num_off_policy_blocks == 0
+    assert sapg.block_entropy_coefs == [0.0, 0.01, 0.01] and sapg.num_off_policy_blocks == 0  # block 0 keeps leader coef
     sapg.episode_success_fn = lambda: torch.arange(NUM_ENVS) % 2 == 0
     _collect(sapg)
-    assert torch.allclose(sapg._rows["entropy_coef"], torch.full((NUM_ENVS * NUM_STEPS,), 0.01))
+    coef = sapg._rows["entropy_coef"]  # leader block rows 0.0, follower rows 0.01
+    assert torch.isclose((coef == 0.01).float().mean(), torch.tensor(2 / 3)) and torch.all((coef == 0.0) | (coef == 0.01))
     loss = sapg.update()
     for j in range(3):
         assert f"SAPG/block{j}_success" in loss
@@ -686,3 +693,128 @@ def test_per_block_advantage_normalization() -> None:
     for j in range(3):
         assert adv[terms["block"] == j].mean().abs() < 1e-4
         assert adv[terms["block"] == j].std() == pytest.approx(1.0, abs=1e-3)
+
+
+def _deep_orthogonal_models(num_hidden: int = 5) -> tuple[MLPModel, MLPModel]:
+    """``_orthogonal_models`` with ``num_hidden`` hidden layers (``num_hidden + 1`` Linears)."""
+    torch.manual_seed(0)
+    obs = _obs()
+    dims = [16] * num_hidden
+    actor = MLPModel(obs, OBS_GROUPS, "actor", NUM_ACTIONS, hidden_dims=dims, distribution_cfg=dict(GAUSSIAN))
+    critic = MLPModel(obs, OBS_GROUPS, "critic", 1, hidden_dims=dims)
+    for model, out_gain in ((actor, 0.01), (critic, 1.0)):
+        linears = [m for m in model.mlp if isinstance(m, torch.nn.Linear)]
+        for i, layer in enumerate(linears):
+            torch.nn.init.orthogonal_(layer.weight, out_gain if i == len(linears) - 1 else 2.0**0.5)
+            torch.nn.init.zeros_(layer.bias)
+    return actor, critic
+
+
+def _layout_sapg(phi_dim: int = 0, **layout) -> SAPG:
+    actor, critic = _deep_orthogonal_models()
+    return SAPG(
+        actor, critic, _storage(), num_blocks=3, phi_dim=phi_dim, off_policy_ratio=0.0, **layout, **_alg_kwargs()
+    )
+
+
+def _layout(model: MLPModel) -> list[type]:
+    return [type(m) for m in model.mlp if isinstance(m, (torch.nn.Linear, BlockLinear))]
+
+
+def test_block_layers_first_two_per_block() -> None:
+    sapg = _layout_sapg(block_layers=[0, 1])
+    expected = [BlockLinear] * 2 + [torch.nn.Linear] * 4
+    assert _layout(sapg.actor) == expected and _layout(sapg.critic) == expected
+    assert sapg.block_layers == [0, 1]
+    obs = _obs()
+    with torch.no_grad(), block_context(sapg.env_block_ids, sapg.actor, sapg.critic):
+        out = sapg.actor(obs)
+        sapg.critic(obs)
+    assert out.shape == (NUM_ENVS, NUM_ACTIONS) and torch.isfinite(out).all()
+    # negative indices resolve python-style
+    assert _layout_sapg(block_layers=[-6, 1]).block_layers == [0, 1]
+    with pytest.raises(AssertionError):
+        _layout_sapg(block_layers=[0], shared_layers=1)
+    with pytest.raises(AssertionError):
+        _layout_sapg(phi_dim=4, block_layers=[0])
+
+
+def test_block_layers_empty_with_phi() -> None:
+    sapg = _layout_sapg(phi_dim=32, block_layers=[])
+    assert not any(isinstance(m, BlockLinear) for m in sapg.actor.modules())
+    assert sapg.actor.sapg_phi is not None and sapg.actor.sapg_phi.shape == (3, 32)
+    assert sapg.critic.sapg_phi is not None
+
+
+def test_shared_layers_zero_all_per_block() -> None:
+    sapg = _layout_sapg(shared_layers=0)
+    assert _layout(sapg.actor) == [BlockLinear] * 6 and _layout(sapg.critic) == [BlockLinear] * 6
+    assert sapg.block_layers == list(range(6))
+    _collect(sapg)
+    sapg.update()
+
+
+def test_shared_layers_equals_block_layers() -> None:
+    a = _layout_sapg(shared_layers=1)
+    b = _layout_sapg(block_layers=[1, 2, 3, 4, 5])
+    assert a.block_layers == b.block_layers == [1, 2, 3, 4, 5]
+    assert _layout(a.actor) == _layout(b.actor) and _layout(a.critic) == _layout(b.critic)
+
+
+@pytest.mark.parametrize("div_minibatches", [2, 0])
+def test_block_diversity_metrics(div_minibatches: int) -> None:
+    sapg = _split_sapg(shared_layers=1, num_blocks=3, div_minibatches=div_minibatches)
+    _collect(sapg)
+    loss = sapg.update()
+    keys = [
+        "block_div/pair_dist_std_mean",
+        "block_div/pair_dist_std_min",
+        "block_div/pair_kl_mean",
+        "block_div/pair_dist_raw_mean",
+        "block_div/argmax_agree",
+    ]
+    if div_minibatches == 0:
+        assert not any(k.startswith("block_div/") for k in loss)
+        return
+    for key in keys:
+        assert key in loss and torch.isfinite(torch.tensor(loss[key])), key
+    assert loss["block_div/pair_dist_std_min"] <= loss["block_div/pair_dist_std_mean"]
+    assert loss["block_div/pair_dist_raw_mean"] > 0.0
+    assert 0.0 <= loss["block_div/argmax_agree"] <= 1.0
+
+
+@pytest.mark.parametrize("arm", ["actor_only", "critic_only"])
+def test_independent_actor_critic_layouts(arm: str) -> None:
+    if arm == "actor_only":  # shared first Linear + phi on the actor, fully separate critic heads
+        sapg = _layout_sapg(phi_dim=8, shared_layers=1, critic_shared_layers=0, critic_phi_dim=0)
+        assert _layout(sapg.actor) == [PhiConditionedLinear] + [BlockLinear] * 5
+        assert _layout(sapg.critic) == [BlockLinear] * 6 and sapg.critic.sapg_phi is None
+    else:  # fully separate actor heads, shared first Linear + phi on the critic
+        sapg = _layout_sapg(phi_dim=0, shared_layers=0, critic_shared_layers=1, critic_phi_dim=8)
+        assert _layout(sapg.actor) == [BlockLinear] * 6 and sapg.actor.sapg_phi is None
+        assert _layout(sapg.critic) == [PhiConditionedLinear] + [BlockLinear] * 5
+        assert sapg.critic.sapg_phi.shape == (3, 8)
+    _collect(sapg)
+    sapg.update()
+    saved = sapg.save()["sapg"]
+    assert (saved["critic_shared_layers"], saved["critic_phi_dim"]) == ((0, 0) if arm == "actor_only" else (1, 8))
+
+
+@pytest.mark.parametrize("layout", [dict(shared_layers=1), dict(shared_layers=1, critic_shared_layers=0, critic_phi_dim=0)])
+def test_default_init_gsde_split_blocks(layout: dict, tmp_path) -> None:
+    """Base-recipe models (torch default init, gSDE std from the last-layer features) get per-block heads."""
+    actor, critic = _models(dist=GSDE)
+    sapg = SAPG(actor, critic, _storage(), num_blocks=3, phi_dim=8, off_policy_ratio=0.0, **layout, **_alg_kwargs())
+    assert isinstance(sapg.actor.mlp[-1], BlockLinear) and isinstance(sapg.critic.mlp[-1], BlockLinear)
+    w = sapg.actor.mlp[-1].weight
+    assert not torch.allclose(w[0], w[1]) and w[1].abs().max() <= 1.0 / math.sqrt(w.shape[-1]) + 1e-6
+    assert sapg.actor.distribution.sapg_follower_std.shape[0] == 2
+    _collect(sapg)
+    sapg.update()
+    _collect(sapg)
+    saved = sapg.save()
+    torch.save(saved, tmp_path / "m.pt")
+    actor2, critic2 = _models(dist=GSDE, seed=3)
+    sapg2 = SAPG(actor2, critic2, _storage(), num_blocks=3, phi_dim=8, off_policy_ratio=0.0, **layout, **_alg_kwargs())
+    sapg2.load(torch.load(tmp_path / "m.pt", weights_only=False), None, True)
+    assert torch.equal(sapg2.actor.mlp[-1].weight, sapg.actor.mlp[-1].weight)

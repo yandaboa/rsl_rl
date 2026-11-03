@@ -14,6 +14,7 @@ from .fpo import FPO
 from .policyflow import PolicyFlow
 from .ppo import PPO
 from .sapg import SAPG
+from .sapg_flow import SAPGFlow
 
 __all__ = [
     "Distillation",
@@ -25,4 +26,5 @@ __all__ = [
     "PolicyFlow",
     "PPO",
     "SAPG",
+    "SAPGFlow",
 ]

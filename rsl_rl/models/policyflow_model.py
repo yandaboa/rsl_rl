@@ -65,17 +65,36 @@ class PolicyFlowModel(MLPModel):
         init_std: float = 1.0,
         log_std_min: float = -20.0,
         log_std_max: float = 4.0,
+        encoder: tuple[nn.Module, ...] | None = None,
+        encoder_out_dim: int | None = None,
+        integrator: str = "midpoint",
     ) -> None:
+        """``encoder``: modules applied in order to the concatenated raw obs instead of this model's normalizer.
+
+        They are owned by another model (SAPGFlow: the follower actor's normalizer + first Linear + activation) and
+        kept in a plain tuple, so they are not in this model's ``parameters()`` / ``state_dict()``; ``deepcopy``
+        still copies them. ``encoder_out_dim`` defaults to the last Linear's ``out_features``.
+        """
         assert distribution_cfg is None, "PolicyFlowModel has its own noise std; leave distribution_cfg=None."
         assert sampling_steps >= 1, "sampling_steps must be >= 1"
+        assert integrator in ("midpoint", "euler"), f"integrator must be 'midpoint' or 'euler', got {integrator!r}"
+        if encoder is not None:
+            assert not obs_normalization, "a shared encoder brings its own normalizer; set obs_normalization=False."
         super().__init__(obs, obs_groups, obs_set, output_dim, hidden_dims, activation, obs_normalization, None)
+        self.encoder: tuple[nn.Module, ...] | None = None if encoder is None else tuple(encoder)
+        if self.encoder is not None and encoder_out_dim is None:
+            linears = [m for m in self.encoder if isinstance(m, nn.Linear)]
+            assert linears, "encoder_out_dim is required when the encoder has no nn.Linear."
+            encoder_out_dim = linears[-1].out_features
+        self.latent_dim = self.obs_dim if self.encoder is None else int(encoder_out_dim)  # type: ignore[arg-type]
         self.num_actions = output_dim
         self.embed_dim = embed_dim
         self.sampling_steps = int(sampling_steps)
+        self.integrator = integrator
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
 
-        self.cond = nn.Linear(self.obs_dim, embed_dim)
+        self.cond = nn.Linear(self.latent_dim, embed_dim)
         self.time_embed = FourierEmbedding(embed_dim, fourier_scale)
         # Replaces the obs-only MLP the base class built.
         self.mlp = MLP(output_dim + embed_dim, output_dim, hidden_dims, activation)
@@ -108,12 +127,30 @@ class PolicyFlowModel(MLPModel):
     def std(self) -> torch.Tensor:
         return self.log_std.clamp(self.log_std_min, self.log_std_max).exp()
 
+    def get_latent(
+        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
+    ) -> torch.Tensor:
+        """Normalized obs, or the shared encoder's output ``[B, latent_dim]``."""
+        if self.encoder is None:
+            return super().get_latent(obs, masks, hidden_state)
+        latent = torch.cat([obs[group] for group in self.obs_groups], dim=-1)
+        for module in self.encoder:
+            latent = module(latent)
+        return latent
+
+    def sample_phi(self, latent: torch.Tensor, num_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``latent [B, D]`` -> ``(x0, phi)``, each ``[B, S, A]``: S flow samples per row in one batched integrate."""
+        batch = latent.shape[0]
+        x0 = torch.randn(batch * num_samples, self.num_actions, device=latent.device, dtype=latent.dtype)
+        phi = self.integrate(latent.repeat_interleave(num_samples, 0), x0)
+        return x0.view(batch, num_samples, -1), phi.view(batch, num_samples, -1)
+
     def velocity(self, latent: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """``latent [B, D], x [B, A], t [B] -> [B, A]``."""
         return self.mlp(torch.cat([x, self.time_embed(t) + self.cond(latent)], dim=-1))
 
     def integrate(self, latent: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
-        """RK2-midpoint from ``t=0`` (``x0``) to ``t=1``; returns ``phi = x_1``."""
+        """RK2-midpoint (or plain Euler) from ``t=0`` (``x0``) to ``t=1``; returns ``phi = x_1``."""
         steps = self.sampling_steps
         dt = 1.0 / steps
         x = x0
@@ -121,8 +158,9 @@ class PolicyFlowModel(MLPModel):
         for i in range(steps):
             t = torch.full((batch,), i / steps, device=latent.device, dtype=latent.dtype)
             v = self.velocity(latent, x, t)
-            x_mid = x + v * dt / 2
-            v = self.velocity(latent, x_mid, t + dt / 2)
+            if self.integrator == "midpoint":
+                x_mid = x + v * dt / 2
+                v = self.velocity(latent, x_mid, t + dt / 2)
             x = x + dt * v
         return x
 
@@ -190,15 +228,17 @@ class PolicyFlowModel(MLPModel):
 
     def as_jit(self) -> nn.Module:
         """TorchScript-able zero-noise sampler: ``forward(obs) -> action`` on the flat actor obs."""
+        assert self.encoder is None, "export of a flow model with a shared encoder is not supported."
         return _TorchPolicyFlowModel(self)
 
     def as_onnx(self, verbose: bool) -> nn.Module:
         """ONNX-exportable zero-noise sampler (the RK2 loop unrolls at trace time)."""
+        assert self.encoder is None, "export of a flow model with a shared encoder is not supported."
         return _OnnxPolicyFlowModel(self, verbose)
 
 
 class _TorchPolicyFlowModel(nn.Module):
-    """Normalizer + fixed-step zero-noise RK2 integration."""
+    """Normalizer + fixed-step zero-noise RK2 (or Euler) integration."""
 
     def __init__(self, model: PolicyFlowModel) -> None:
         super().__init__()
@@ -207,6 +247,7 @@ class _TorchPolicyFlowModel(nn.Module):
         self.cond = copy.deepcopy(model.cond)
         self.time_embed = copy.deepcopy(model.time_embed)
         self.sampling_steps = int(model.sampling_steps)
+        self.midpoint = model.integrator == "midpoint"
         self.num_actions = int(model.num_actions)
         self.input_size = int(model.obs_dim)
 
@@ -222,8 +263,9 @@ class _TorchPolicyFlowModel(nn.Module):
         for i in range(self.sampling_steps):
             t = torch.full((batch,), i / self.sampling_steps, device=latent.device, dtype=latent.dtype)
             v = self._velocity(cond, a, t)
-            a_mid = a + v * dt / 2
-            v = self._velocity(cond, a_mid, t + dt / 2)
+            if self.midpoint:
+                a_mid = a + v * dt / 2
+                v = self._velocity(cond, a_mid, t + dt / 2)
             a = a + dt * v
         return a
 
