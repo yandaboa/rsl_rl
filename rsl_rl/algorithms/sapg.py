@@ -11,6 +11,7 @@ Port of play2perfect's rl_games implementation (``use_others_experience: lf``, `
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 from itertools import chain
@@ -18,8 +19,16 @@ from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
-from rsl_rl.models.block_conditioning import _BlockStdMixin, BlockLinear, attach_block_conditioning, block_context
+from rsl_rl.models.block_conditioning import (
+    BlockLinear,
+    SplitBlockLinear,
+    _BlockStdMixin,
+    attach_block_conditioning,
+    block_context,
+    block_parameters,
+)
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import resolve_optimizer
 
 
 class SAPG(PPO):
@@ -36,6 +45,10 @@ class SAPG(PPO):
       j / (M - 1)``). PPO's ``entropy_coef`` is not used.
     - Advantages are normalized jointly over all rows (across ranks); the adaptive LR reads the epoch-mean KL and
       steps once per epoch.
+    - ``off_policy_update="awr"``: relabeled rows train the leader actor with ``-clamp(exp(A / beta), w_max) log pi_L``
+      instead of the clipped ratio surrogate (their value / entropy terms are unchanged).
+    - ``independent_blocks``: M fully separate PPO learners that only exchange the relabeled rows: per-block
+      parameters, observation normalizers, loss means, advantage normalization, grad clip and adaptive LR.
     """
 
     allow_uneven_blocks: bool = False
@@ -67,6 +80,11 @@ class SAPG(PPO):
         block_init_std: list[float] | None = None,
         critic_shared_layers: int | None = None,
         critic_phi_dim: int | None = None,
+        off_policy_update: str = "is",
+        awr_beta: float = 1.0,
+        awr_w_max: float = 10.0,
+        off_policy_coef: float = 1.0,
+        independent_blocks: bool = False,
         **kwargs: object,
     ) -> None:
         """``num_blocks`` M, ``phi_dim`` d; everything else is PPO's (``kwargs``).
@@ -83,6 +101,10 @@ class SAPG(PPO):
         ``div_minibatches``: the first N minibatches of epoch 0 log ``block_div/*`` (pairwise block action-mean
         distances; 0 = off). ``critic_shared_layers`` / ``critic_phi_dim``: the critic's layout when it differs from
         the actor's (``None`` = same as the actor; ``block_layers`` always applies to both).
+
+        ``off_policy_update``: ``"is"`` (clipped ratio surrogate on relabeled rows) or ``"awr"``. ``off_policy_coef``
+        scales the relabeled rows' loss. ``independent_blocks`` needs the fully separate layout (no shared Linear,
+        phi or std).
         """
         assert num_blocks >= 1, f"num_blocks must be >= 1, got {num_blocks}."
         assert phi_dim >= 0, f"phi_dim must be >= 0, got {phi_dim}."
@@ -98,12 +120,26 @@ class SAPG(PPO):
         assert not (actor.is_recurrent or critic.is_recurrent), "SAPG supports feedforward models only."
         assert shared_layers is None or block_layers is None, "set either shared_layers or block_layers, not both."
         assert div_minibatches >= 0, f"div_minibatches must be >= 0, got {div_minibatches}."
+        assert off_policy_update in ("is", "awr"), f"off_policy_update must be 'is' / 'awr', got {off_policy_update!r}."
+        assert awr_beta > 0.0 and awr_w_max > 0.0, f"awr_beta / awr_w_max must be > 0, got {awr_beta}, {awr_w_max}."
+        assert off_policy_coef >= 0.0, f"off_policy_coef must be >= 0, got {off_policy_coef}."
+        if independent_blocks:
+            assert shared_layers == 0 and block_layers is None and phi_dim == 0, (
+                "independent_blocks needs shared_layers=0, phi_dim=0 (and no block_layers)."
+            )
+            assert critic_shared_layers in (None, 0) and critic_phi_dim in (None, 0), (
+                "independent_blocks needs critic_shared_layers=0 and critic_phi_dim=0."
+            )
+            assert per_block_std and not freeze_shared_layers, "independent_blocks needs per_block_std (no shared std)."
+            assert normalize_advantage_per_block, "independent_blocks needs normalize_advantage_per_block=True."
+            assert target_kl is None, "independent_blocks: target_kl would stop every block at once; use desired_kl."
         # Conditioning parameters must exist before PPO builds the optimizer over the model parameters.
-        layout = {"shared_layers": shared_layers, "block_layers": block_layers}
+        indep = bool(independent_blocks)
+        layout = {"shared_layers": shared_layers, "block_layers": block_layers, "independent": indep}
         attach_block_conditioning(actor, num_blocks, phi_dim, per_block_std=per_block_std, **layout)
         if critic_shared_layers is not None:
             assert block_layers is None, "critic_shared_layers needs the shared_layers layout, not block_layers."
-            layout = {"shared_layers": critic_shared_layers, "block_layers": None}
+            layout = {"shared_layers": critic_shared_layers, "block_layers": None, "independent": indep}
         c_phi_dim = phi_dim if critic_phi_dim is None else int(critic_phi_dim)
         attach_block_conditioning(critic, num_blocks, c_phi_dim, **layout)
         if freeze_shared_layers:  # shared actor Linears stay at their random init (per-block ones are BlockLinear)
@@ -118,11 +154,17 @@ class SAPG(PPO):
             dist = actor.distribution
             assert isinstance(dist, _BlockStdMixin), "block_init_std needs a per-block std distribution."
             with torch.no_grad():
-                vals = torch.tensor([float(v) for v in block_init_std], device=dist.sapg_follower_std.device)
+                vals = torch.tensor([float(v) for v in block_init_std])
                 if dist.sapg_std_name == "log_std_param":
                     vals = vals.log()
-                getattr(dist, dist.sapg_std_name).fill_(vals[0].item())
-                dist.sapg_follower_std.copy_(vals[1:].view(-1, *([1] * (dist.sapg_follower_std.dim() - 1))).expand_as(dist.sapg_follower_std))
+                if dist.sapg_std_split:
+                    for param, value in zip(dist.sapg_std_params(), vals.tolist()):
+                        param.fill_(value)
+                else:
+                    getattr(dist, dist.sapg_std_name).fill_(vals[0].item())
+                    followers = dist.sapg_follower_std
+                    shape = (-1, *([1] * (followers.dim() - 1)))
+                    followers.copy_(vals[1:].to(followers.device).view(shape).expand_as(followers))
             print(f"[SAPG] per-block init std: {block_init_std}")
         super().__init__(actor, critic, storage, **kwargs)
         assert self.noise_scale_tracker is None, "SAPG does not support the gradient-noise-scale tracker."
@@ -138,7 +180,7 @@ class SAPG(PPO):
         self.shared_layers = None if shared_layers is None else int(shared_layers)
         self.critic_shared_layers = None if critic_shared_layers is None else int(critic_shared_layers)
         self.critic_phi_dim = None if critic_phi_dim is None else int(critic_phi_dim)
-        num_linears = sum(isinstance(m, (nn.Linear, BlockLinear)) for m in actor.mlp)
+        num_linears = sum(isinstance(m, (nn.Linear, BlockLinear, SplitBlockLinear)) for m in actor.mlp)
         # resolved by attach_block_heads (None = no per-block Linears configured)
         self.block_layers: list[int] | None = getattr(actor, "sapg_block_layers", None)
         per_block = self.block_layers or []
@@ -162,6 +204,17 @@ class SAPG(PPO):
         self.relabel_chunk_size = int(relabel_chunk_size)
         # cleanRL / ManiSkill early stop: approx KL of the on-policy rows before each step; above it the update ends
         self.target_kl = None if target_kl is None else float(target_kl)
+        self.off_policy_update = off_policy_update
+        self.awr_beta = float(awr_beta)
+        self.awr_w_max = float(awr_w_max)
+        self.off_policy_coef = float(off_policy_coef)
+        self.independent_blocks = bool(independent_blocks)
+        # relabeled rows form their own advantage-normalization group (else they join the leader / all rows)
+        self._off_own_adv_group = self.independent_blocks or self.off_policy_update == "awr"
+        self.block_params: list[list[nn.Parameter]] = []
+        self.block_learning_rates = [float(self.learning_rate)] * self.num_blocks
+        if self.independent_blocks:
+            self._build_block_optimizer(str(kwargs.get("optimizer", "adam")))
 
         num_envs = storage.num_envs
         assert self.allow_uneven_blocks or num_envs % self.num_blocks == 0, (
@@ -198,6 +251,24 @@ class SAPG(PPO):
 
         self.last_minibatch_debug: dict[str, torch.Tensor] | None = None
 
+    def _build_block_optimizer(self, optimizer: str) -> None:
+        """Group every trainable parameter by its block (asserting no sharing); one optimizer param group per block."""
+        actor_groups = block_parameters(self.actor, self.num_blocks)
+        critic_groups = block_parameters(self.critic, self.num_blocks)
+        self.block_params = [a + c for a, c in zip(actor_groups, critic_groups)]
+        owned = [id(p) for group in self.block_params for p in group]
+        assert len(owned) == len(set(owned)), "independent_blocks: a parameter is owned by more than one block."
+        trainable = [p for p in chain(self.actor.parameters(), self.critic.parameters()) if p.requires_grad]
+        unowned = [tuple(p.shape) for p in trainable if id(p) not in set(owned)]
+        assert not unowned, f"independent_blocks: parameters shared by every block: {unowned}."
+        assert len(owned) == len(trainable), "independent_blocks: a block owns a frozen / foreign parameter."
+        sizes = [sum(p.numel() for p in group) for group in self.block_params]
+        assert len(set(sizes)) == 1, f"independent_blocks: blocks differ in size: {sizes}."
+        self.optimizer = resolve_optimizer(optimizer)(
+            [{"params": group} for group in self.block_params], lr=self.learning_rate
+        )  # type: ignore
+        print(f"[SAPG] independent_blocks: {self.num_blocks} blocks, {sizes[0]} params each, 0 shared")
+
     # ------------------------------------------------------------------------------------------------
     # Rollout
     # ------------------------------------------------------------------------------------------------
@@ -217,7 +288,9 @@ class SAPG(PPO):
         else:
             self._time_outs[step].zero_()
         self._track_episodes(rewards, dones)
-        super().process_env_step(obs, rewards, dones, extras)
+        # per-block observation normalizers update from their own envs only
+        with block_context(self.env_block_ids, self.actor, self.critic):
+            super().process_env_step(obs, rewards, dones, extras)
 
     def _track_episodes(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
         self._ep_return += rewards.view(-1).to(self.device).float()
@@ -300,8 +373,22 @@ class SAPG(PPO):
             self._env_entropy_coef.repeat(st.num_transitions_per_env),
             torch.full((rows["src"].shape[0] - num_on,), self.block_entropy_coefs[0], device=self.device),
         ])
+        # advantage-normalization group: block j's on-policy rows (per-block / independent) or 0, relabeled rows M
+        per_block = self.normalize_advantage_per_block or self.independent_blocks
+        on_group = rows["block"] if per_block else torch.zeros_like(rows["block"])
+        rows["adv_group"] = torch.where(rows["off"] & self._off_own_adv_group, self.num_blocks, on_group)
         if not self.normalize_advantage_per_mini_batch:
-            rows["advantages"] = self._normalize(rows["advantages"])
+            if self._off_own_adv_group:
+                # the same group list on every rank (collectives inside _normalize)
+                groups = list(range(self.num_blocks)) if per_block else [0]
+                groups += [self.num_blocks] if off_blocks else []
+                normalized = torch.empty_like(rows["advantages"])
+                for g in groups:
+                    mask = rows["adv_group"] == g
+                    normalized[mask] = self._normalize(rows["advantages"][mask])
+                rows["advantages"] = normalized
+            else:
+                rows["advantages"] = self._normalize(rows["advantages"])
             st.advantages = rows["advantages"][:num_on].view_as(st.advantages).clone()
         self._rows = rows
 
@@ -387,10 +474,11 @@ class SAPG(PPO):
         advantages = rows["advantages"][idx].view(-1)
         if self.normalize_advantage_per_mini_batch:
             with torch.no_grad():
-                if self.normalize_advantage_per_block:
+                if self.normalize_advantage_per_block or self._off_own_adv_group:
+                    groups = rows["adv_group"][idx]
                     normalized = torch.empty_like(advantages)
-                    for j in range(self.num_blocks):
-                        mask = block == j
+                    for j in range(self.num_blocks + 1):
+                        mask = groups == j
                         if bool(mask.any()):
                             adv_j = advantages[mask]
                             std_j = adv_j.std() if adv_j.numel() > 1 else adv_j.new_zeros(())
@@ -411,13 +499,33 @@ class SAPG(PPO):
         surrogate = torch.max(
             -advantages * ratio, -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
         )
+        awr_w = awr_clamped = None
+        actor_rows = surrogate
+        if self.off_policy_update == "awr":
+            with torch.no_grad():
+                log_w = advantages / self.awr_beta
+                awr_clamped = log_w > math.log(self.awr_w_max)
+                awr_w = torch.exp(log_w.clamp(max=math.log(self.awr_w_max)))
+            actor_rows = torch.where(off, -awr_w * log_prob, surrogate)
         if self.use_clipped_value_loss:
             value_clipped = old_values + (values - old_values).clamp(-self.clip_param, self.clip_param)
             value_rows = torch.max((values - returns).pow(2), (value_clipped - returns).pow(2)).view(-1)
         else:
             value_rows = (returns - values).pow(2).view(-1)
         entropy_rows = rows["entropy_coef"][idx] * entropy
-        loss = surrogate.mean() + self.value_loss_coef * value_rows.mean() - entropy_rows.mean()
+        if self.independent_blocks:
+            # each block: mean over its own on-policy rows; the relabeled rows: their own mean, x off_policy_coef
+            per_row = actor_rows + self.value_loss_coef * value_rows - entropy_rows
+            group = torch.where(off, self.num_blocks, block)
+            sums = per_row.new_zeros(self.num_blocks + 1).index_add(0, group, per_row)
+            counts = torch.bincount(group, minlength=self.num_blocks + 1).clamp(min=1).to(per_row.dtype)
+            means = sums / counts
+            loss = means[: self.num_blocks].sum() + self.off_policy_coef * means[self.num_blocks]
+        elif self.off_policy_coef != 1.0 or self.off_policy_update != "is":
+            row_w = torch.where(off, self.off_policy_coef, 1.0)
+            loss = ((actor_rows + self.value_loss_coef * value_rows - entropy_rows) * row_w).mean()
+        else:
+            loss = surrogate.mean() + self.value_loss_coef * value_rows.mean() - entropy_rows.mean()
 
         with torch.no_grad():
             kl = self.actor.get_kl_divergence(old_params, tuple(p.detach() for p in params))  # type: ignore
@@ -428,6 +536,9 @@ class SAPG(PPO):
             "value": value_rows.mean(),
             "entropy": entropy.mean(),
             "surrogate_rows": surrogate,
+            "actor_rows": actor_rows,
+            "awr_w": awr_w,
+            "awr_clamped": awr_clamped,
             "value_rows": value_rows,
             "entropy_rows": entropy_rows,
             "entropy_raw": entropy.detach(),
@@ -441,7 +552,7 @@ class SAPG(PPO):
 
     def _grad_diagnostic(self, terms: dict) -> dict[str, torch.Tensor]:
         """play2perfect LOG_OFF_POLICY_GRADS: gradients of the relabeled vs on-policy parts of the loss."""
-        per_row = terms["surrogate_rows"] + self.value_loss_coef * terms["value_rows"] - terms["entropy_rows"]
+        per_row = terms["actor_rows"] + self.value_loss_coef * terms["value_rows"] - terms["entropy_rows"]
         n = per_row.shape[0]
         off = terms["off"]
         leader_on = (~off) & (terms["block"] == 0)
@@ -542,6 +653,7 @@ class SAPG(PPO):
 
         grad_norms: dict[str, list[torch.Tensor]] = {"actor": [], "critic": [], "combined": []}
         epoch_kls: list[torch.Tensor] = []
+        epoch_block_kls: list[torch.Tensor] = []
         self.last_minibatch_debug = None
         num_steps_run, stop, approx_kl_first, approx_kl_last = 0, False, 0.0, 0.0
 
@@ -551,6 +663,8 @@ class SAPG(PPO):
             num_epoch_steps = 0
             # [sum over minibatch means (all rows), leader-on KL sum, leader-on count, relabeled KL sum, count]
             kl_acc = torch.zeros(5, device=self.device)
+            # per-block [KL sum, row count] over each block's own on-policy rows
+            block_kl_acc = torch.zeros(2, self.num_blocks, device=self.device)
             for i in range(self.num_mini_batches):
                 idx = indices[i * mini_batch_size : (i + 1) * mini_batch_size]
                 if epoch == 0 and i < self.div_minibatches:
@@ -571,6 +685,9 @@ class SAPG(PPO):
                     kl[off].sum(),
                     off.sum().float(),
                 ])
+                on_block = terms["block"][~off]
+                block_kl_acc[0].index_add_(0, on_block, kl[~off].float())
+                block_kl_acc[1].index_add_(0, on_block, torch.ones_like(kl[~off], dtype=torch.float32))
                 if self.kl_reference == "previous_epoch":
                     for stored, new in zip(old_params, terms["params"]):
                         stored[idx] = new
@@ -590,9 +707,13 @@ class SAPG(PPO):
                     grad_norms["actor"].append(actor_sq.sqrt())
                     grad_norms["critic"].append(critic_sq.sqrt())
                     grad_norms["combined"].append((actor_sq + critic_sq).sqrt())
-                # Same two calls as PPO.update (uwlab's joint-clip patch recognizes them by parameter set).
-                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                if self.independent_blocks:
+                    for params in self.block_params:
+                        nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+                else:
+                    # Same two calls as PPO.update (uwlab's joint-clip patch recognizes them by parameter set).
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 num_steps_run += 1
                 num_epoch_steps += 1
@@ -619,7 +740,13 @@ class SAPG(PPO):
                     acc("_count_on", (~off).sum())
                     acc("_inside_off", inside[off].sum())
                     acc("_ratio_off", terms["ratio"][off].sum())
+                    acc("_ratio_sq_off", terms["ratio"][off].pow(2).sum())
+                    acc("_actor_off", terms["actor_rows"][off].detach().sum())
                     acc("_count_off", off.sum())
+                    if terms["awr_w"] is not None:
+                        acc("_awr_w", terms["awr_w"][off].sum())
+                        acc("_awr_w_sq", terms["awr_w"][off].pow(2).sum())
+                        acc("_awr_clamped", terms["awr_clamped"][off].sum())
                 if stop:
                     break
 
@@ -631,7 +758,14 @@ class SAPG(PPO):
             kl_leader = kl_acc[1] / kl_acc[2].clamp(min=1.0)
             kl_off = kl_acc[3] / kl_acc[4].clamp(min=1.0)
             epoch_kls.append(torch.stack([kl_all, kl_leader, kl_off]))
-            self._adapt_learning_rate(kl_all if self.kl_rows == "all" else kl_leader)
+            if self.independent_blocks:
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(block_kl_acc, op=torch.distributed.ReduceOp.SUM)
+                block_kl = block_kl_acc[0] / block_kl_acc[1].clamp(min=1.0)
+                epoch_block_kls.append(block_kl)
+                self._adapt_block_learning_rates(block_kl)
+            else:
+                self._adapt_learning_rate(kl_all if self.kl_rows == "all" else kl_leader)
 
         num_updates = num_steps_run
         out = {k: v.item() for k, v in sums.items()}
@@ -643,9 +777,23 @@ class SAPG(PPO):
         kls = torch.stack(epoch_kls).mean(dim=0).tolist()
         loss_dict["SAPG/kl_all"], loss_dict["SAPG/kl_leader"] = kls[0], kls[1]
         if out["_count_off"] > 0:
+            n_off = out["_count_off"]
             loss_dict["SAPG/kl_relabeled"] = kls[2]
-            loss_dict["SAPG/clip_inside_off"] = out["_inside_off"] / out["_count_off"]
-            loss_dict["SAPG/ratio_off_mean"] = out["_ratio_off"] / out["_count_off"]
+            loss_dict["SAPG/clip_inside_off"] = out["_inside_off"] / n_off
+            loss_dict["SAPG/clip_frac_off"] = 1.0 - out["_inside_off"] / n_off
+            loss_dict["SAPG/ratio_off_mean"] = out["_ratio_off"] / n_off
+            # ESS fraction (sum w)^2 / (n sum w^2), pooled over every minibatch of the update
+            loss_dict["SAPG/ratio_off_ess"] = out["_ratio_off"] ** 2 / max(n_off * out["_ratio_sq_off"], 1e-12)
+            loss_dict["SAPG/off_actor_loss"] = out["_actor_off"] / n_off
+            if "_awr_w" in out:
+                loss_dict["SAPG/awr_w_mean"] = out["_awr_w"] / n_off
+                loss_dict["SAPG/awr_w_max_frac"] = out["_awr_clamped"] / n_off
+                loss_dict["SAPG/awr_w_ess"] = out["_awr_w"] ** 2 / max(n_off * out["_awr_w_sq"], 1e-12)
+        if epoch_block_kls:
+            block_kls = torch.stack(epoch_block_kls).mean(dim=0).tolist()
+            for j in range(self.num_blocks):
+                loss_dict[f"SAPG/block{j}_kl"] = block_kls[j]
+                loss_dict[f"SAPG/block{j}_lr"] = self.block_learning_rates[j]
         loss_dict["SAPG/clip_inside_on"] = out["_inside_on"] / max(out["_count_on"], 1.0)
         if log_grads and out.get("SAPG/grad_diag_count", 0.0) > 0:
             count = out["SAPG/grad_diag_count"]
@@ -692,6 +840,30 @@ class SAPG(PPO):
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self.learning_rate
 
+    def _adapt_block_learning_rates(self, kl: torch.Tensor) -> None:
+        """The adaptive rule per block on its own KL; rank 0 decides, every rank gets its LRs."""
+        if self.desired_kl is None or self.schedule != "adaptive":
+            return
+        lrs = list(self.block_learning_rates)
+        if self.gpu_global_rank == 0:
+            for j, kl_value in enumerate(kl.tolist()):
+                if kl_value > self.desired_kl * 2.0:
+                    lrs[j] = max(1e-5, lrs[j] / 1.5)
+                elif kl_value < self.desired_kl / 2.0 and kl_value > 0.0:
+                    lrs[j] = min(1e-2, lrs[j] * 1.5)
+        if self.is_multi_gpu:
+            lr_tensor = torch.tensor(lrs, device=self.device, dtype=torch.float64)
+            torch.distributed.broadcast(lr_tensor, src=0)
+            lrs = lr_tensor.tolist()
+        self._set_block_learning_rates(lrs)
+
+    def _set_block_learning_rates(self, lrs: list[float]) -> None:
+        assert len(self.optimizer.param_groups) == len(lrs) == self.num_blocks, "one optimizer group per block."
+        for group, lr in zip(self.optimizer.param_groups, lrs):
+            group["lr"] = lr
+        self.block_learning_rates = list(lrs)
+        self.learning_rate = lrs[0]  # the runner logs the leader's
+
     def save(self) -> dict:
         """PPO checkpoint (phi / per-block std live in the actor/critic state dicts) plus the block layout."""
         saved = super().save()
@@ -703,6 +875,11 @@ class SAPG(PPO):
             "block_layers": self.block_layers,
             "critic_shared_layers": self.critic_shared_layers,
             "critic_phi_dim": self.critic_phi_dim,
+            "independent_blocks": self.independent_blocks,
+            "off_policy_update": self.off_policy_update,
+            "awr_beta": self.awr_beta,
+            "awr_w_max": self.awr_w_max,
+            "off_policy_coef": self.off_policy_coef,
         }
         return saved
 
@@ -725,4 +902,20 @@ class SAPG(PPO):
             assert saved["block_layers"] == self.block_layers, (
                 f"SAPG checkpoint has block_layers={saved['block_layers']}; this run has {self.block_layers}."
             )
-        return super().load(loaded_dict, load_cfg, strict)
+        assert bool(saved.get("independent_blocks", False)) == self.independent_blocks, (
+            f"SAPG checkpoint has independent_blocks={saved.get('independent_blocks', False)};"
+            f" this run has {self.independent_blocks}."
+        )
+        if self.independent_blocks:  # per-block normalizers / heads / stds must all be in the checkpoint
+            for key, model in (("actor_state_dict", self._raw_actor), ("critic_state_dict", self._raw_critic)):
+                missing = set(model.state_dict()) ^ set(loaded_dict[key])
+                assert not missing, f"SAPG independent_blocks: {key} key mismatch {sorted(missing)[:8]}."
+        load_iteration = super().load(loaded_dict, load_cfg, strict)
+        if load_cfg is None or load_cfg.get("optimizer"):
+            lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
+            if self.independent_blocks:
+                self._set_block_learning_rates(lrs)
+            else:
+                self.learning_rate = lrs[0]
+            print(f"[SAPG] restored learning rate(s) from the optimizer state: {lrs}")
+        return load_iteration

@@ -7,7 +7,9 @@
 
 from .block_conditioning import (
     BlockLinear,
+    BlockNormalization,
     PhiConditionedLinear,
+    SplitBlockLinear,
     attach_block_conditioning,
     attach_block_heads,
     block_context,
@@ -28,8 +30,10 @@ from .rnn_model import RNNModel
 
 __all__ = [
     "BlockLinear",
+    "BlockNormalization",
     "CNNModel",
     "PhiConditionedLinear",
+    "SplitBlockLinear",
     "attach_block_conditioning",
     "attach_block_heads",
     "block_context",

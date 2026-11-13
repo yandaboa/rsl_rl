@@ -19,6 +19,7 @@ With ``shared_layers`` the MLP's Linear layers past the first ``shared_layers`` 
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ from torch.distributions import Normal
 from typing import Optional
 
 from rsl_rl.models.mlp_model import MLPModel
-from rsl_rl.modules import HiddenState
+from rsl_rl.modules import EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution, GaussianDistribution, GsdeDistribution
 
 
@@ -64,6 +65,24 @@ class PhiConditionedLinear(nn.Linear):
         return nn.functional.linear(x, self.weight, self.bias) + nn.functional.linear(self.phi[0], self.phi_weight)
 
 
+def _block_init(linear: nn.Linear, num_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[M, out, in]`` / ``[M, out]``: block 0 = ``linear``, blocks 1.. fresh draws of its init scheme."""
+    with torch.no_grad():
+        svals = torch.linalg.svdvals(linear.weight.detach().float())
+        gain = float(svals[0])
+        orthogonal = abs(gain - float(svals[-1])) <= 1e-3
+        weight = linear.weight.detach().unsqueeze(0).repeat(num_blocks, 1, 1)
+        bias = linear.bias.detach().unsqueeze(0).repeat(num_blocks, 1)
+        for j in range(1, num_blocks):
+            if orthogonal:  # cleanRL-style layer: fresh orthogonal draw at the same gain, bias copied
+                nn.init.orthogonal_(weight[j], gain=gain)
+            else:  # torch-default Linear: fresh draw with nn.Linear.reset_parameters' scheme
+                nn.init.kaiming_uniform_(weight[j], a=math.sqrt(5))
+                bound = 1.0 / math.sqrt(linear.in_features)
+                nn.init.uniform_(bias[j], -bound, bound)
+    return weight, bias
+
+
 class BlockLinear(nn.Module):
     """``M`` independent Linear layers; row ``i`` uses block ``_sapg_block_ids[i]`` (``None`` = block 0 for every row).
 
@@ -82,19 +101,7 @@ class BlockLinear(nn.Module):
         self.out_features = linear.out_features
         self.num_blocks = int(num_blocks)
         self._sapg_block_ids = None
-        with torch.no_grad():
-            svals = torch.linalg.svdvals(linear.weight.detach().float())
-            gain = float(svals[0])
-            orthogonal = abs(gain - float(svals[-1])) <= 1e-3
-            weight = linear.weight.detach().unsqueeze(0).repeat(self.num_blocks, 1, 1)
-            bias = linear.bias.detach().unsqueeze(0).repeat(self.num_blocks, 1)
-            for j in range(1, self.num_blocks):
-                if orthogonal:  # cleanRL-style layer: fresh orthogonal draw at the same gain, bias copied
-                    nn.init.orthogonal_(weight[j], gain=gain)
-                else:  # torch-default Linear: fresh draw with nn.Linear.reset_parameters' scheme
-                    nn.init.kaiming_uniform_(weight[j], a=math.sqrt(5))
-                    bound = 1.0 / math.sqrt(self.in_features)
-                    nn.init.uniform_(bias[j], -bound, bound)
+        weight, bias = _block_init(linear, self.num_blocks)
         self.weight = nn.Parameter(weight, requires_grad=linear.weight.requires_grad)
         self.bias = nn.Parameter(bias, requires_grad=linear.bias.requires_grad)
 
@@ -114,6 +121,85 @@ class BlockLinear(nn.Module):
     def extra_repr(self) -> str:
         """Layer summary for ``print(model)``."""
         return f"num_blocks={self.num_blocks}, in_features={self.in_features}, out_features={self.out_features}"
+
+
+
+class SplitBlockLinear(nn.Module):
+    """``BlockLinear`` with one ``nn.Linear`` (own parameters) per block: per-block optimizer groups / grad clips."""
+
+    __annotations__ = {"_sapg_block_ids": Optional[torch.Tensor]}
+
+    def __init__(self, linear: nn.Linear, num_blocks: int) -> None:
+        """Same init as ``BlockLinear`` (block 0 keeps ``linear``'s weights)."""
+        super().__init__()
+        assert linear.bias is not None, "SplitBlockLinear needs a Linear with a bias."
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.num_blocks = int(num_blocks)
+        self._sapg_block_ids = None
+        weight, bias = _block_init(linear, self.num_blocks)
+        device = linear.weight.device
+        self.blocks = nn.ModuleList()
+        for j in range(self.num_blocks):
+            layer = nn.Linear(self.in_features, self.out_features, device=device)
+            with torch.no_grad():
+                layer.weight.copy_(weight[j])
+                layer.bias.copy_(bias[j])
+            self.blocks.append(layer)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Row ``i`` through block ``_sapg_block_ids[i]``; every row through block 0 when no ids are set."""
+        ids = self._sapg_block_ids
+        if ids is None:
+            return self.blocks[0](x)
+        assert ids.shape[0] == x.shape[0], "SAPG block ids do not match the batch."
+        out = x.new_empty(x.shape[0], self.out_features)
+        for j, layer in enumerate(self.blocks):
+            mask = ids == j
+            out[mask] = layer(x[mask])
+        return out
+
+    def extra_repr(self) -> str:
+        """Layer summary for ``print(model)``."""
+        return f"num_blocks={self.num_blocks}, in_features={self.in_features}, out_features={self.out_features}"
+
+
+class BlockNormalization(nn.Module):
+    """One ``EmpiricalNormalization`` per block; row ``i`` uses block ``_sapg_block_ids[i]`` (``None`` = block 0).
+
+    ``update`` feeds each block's statistics with its own rows only (it needs block ids).
+    """
+
+    __annotations__ = {"_sapg_block_ids": Optional[torch.Tensor]}
+
+    def __init__(self, normalizer: EmpiricalNormalization, num_blocks: int) -> None:
+        """``num_blocks`` copies of ``normalizer`` (statistics included)."""
+        super().__init__()
+        self.num_blocks = int(num_blocks)
+        self._sapg_block_ids = None
+        self.norms = nn.ModuleList([copy.deepcopy(normalizer) for _ in range(self.num_blocks)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize every row with its block's statistics."""
+        ids = self._sapg_block_ids
+        if ids is None:
+            return self.norms[0](x)
+        assert ids.shape[0] == x.shape[0], "SAPG block ids do not match the batch."
+        out = torch.empty_like(x)
+        for j, norm in enumerate(self.norms):
+            mask = ids == j
+            out[mask] = norm(x[mask])
+        return out
+
+    @torch.jit.unused
+    def update(self, x: torch.Tensor) -> None:
+        """Update block j's statistics from the rows of block j (rollout steps only)."""
+        if not self.training:
+            return
+        ids = self._sapg_block_ids
+        assert ids is not None and ids.shape[0] == x.shape[0], "BlockNormalization.update needs per-row block ids."
+        for j, norm in enumerate(self.norms):
+            norm.update(x[ids == j])
 
 
 def resolve_block_layers(
@@ -137,9 +223,13 @@ def resolve_block_layers(
 
 
 def attach_block_heads(
-    model: MLPModel, num_blocks: int, shared_layers: int | None = None, block_layers: list[int] | None = None
+    model: MLPModel,
+    num_blocks: int,
+    shared_layers: int | None = None,
+    block_layers: list[int] | None = None,
+    split: bool = False,
 ) -> MLPModel:
-    """Turn Linears of ``model.mlp`` into per-block ``BlockLinear``s.
+    """Turn Linears of ``model.mlp`` into per-block ``BlockLinear``s (``split``: ``SplitBlockLinear``s).
 
     Either every Linear after the first ``shared_layers``, or exactly the ones indexed by ``block_layers``
     (negative = from the end).
@@ -151,7 +241,7 @@ def attach_block_heads(
         i = positions[k]
         layer = model.mlp[i]
         assert type(layer) is nn.Linear, f"expected nn.Linear at mlp[{i}], got {type(layer).__name__}."
-        model.mlp[i] = BlockLinear(layer, num_blocks)
+        model.mlp[i] = (SplitBlockLinear if split else BlockLinear)(layer, num_blocks)
     model.sapg_block_layers = indices  # type: ignore[attr-defined]
     if shared_layers is not None:
         model.sapg_shared_layers = int(shared_layers)  # type: ignore[attr-defined]
@@ -163,13 +253,26 @@ class _BlockStdMixin:
 
     _sapg_block_ids: torch.Tensor | None = None
     sapg_std_name: str
-    sapg_follower_std: nn.Parameter
+    sapg_follower_std: nn.Parameter | nn.ParameterList
     _sapg_matrix_sampling: bool = False
 
     def sapg_std_table(self) -> torch.Tensor:
         """``[M, *std_shape]`` raw std parameters (leader first), in the parameter's own space (log or scalar)."""
+        return torch.stack(self.sapg_std_params()) if self.sapg_std_split else torch.cat(
+            [getattr(self, self.sapg_std_name).unsqueeze(0), self.sapg_follower_std], dim=0
+        )
+
+    @property
+    def sapg_std_split(self) -> bool:
+        """Whether every follower std is its own parameter (independent blocks)."""
+        return isinstance(self.sapg_follower_std, nn.ParameterList)
+
+    def sapg_std_params(self) -> list[nn.Parameter]:
+        """The std parameters: ``[leader, followers]`` (stacked) or ``[leader, f1, ..., fM-1]`` (split)."""
         leader = getattr(self, self.sapg_std_name)
-        return torch.cat([leader.unsqueeze(0), self.sapg_follower_std], dim=0)
+        if self.sapg_std_split:
+            return [leader, *self.sapg_follower_std]
+        return [leader, self.sapg_follower_std]  # type: ignore[list-item]
 
     def _block_std(self) -> torch.Tensor:
         """``[M, *std_shape]`` clamped std (not log)."""
@@ -254,7 +357,11 @@ class _BlockConditionedMixin:
         """Forward passes inside the context use block ``block_ids`` per sample (``None`` = leader)."""
         dist = getattr(self, "distribution", None)
         targets = [self] + ([dist] if isinstance(dist, _BlockStdMixin) else [])
-        targets += [m for m in self.modules() if isinstance(m, BlockLinear)]  # type: ignore[attr-defined]
+        targets += [
+            m
+            for m in self.modules()  # type: ignore[attr-defined]
+            if isinstance(m, (BlockLinear, SplitBlockLinear, BlockNormalization))
+        ]
         previous = [t._sapg_block_ids for t in targets]
         for t in targets:
             t._sapg_block_ids = block_ids
@@ -275,8 +382,11 @@ def _conditioned_class(base: type, mixin: type) -> type:
     return _CONDITIONED_CLASSES[key]  # type: ignore[index]
 
 
-def attach_block_std(dist: Distribution, num_blocks: int) -> Distribution:
-    """Give ``dist`` one state-independent std per block (in place), all starting at the leader's init."""
+def attach_block_std(dist: Distribution, num_blocks: int, split: bool = False) -> Distribution:
+    """Give ``dist`` one state-independent std per block (in place), all starting at the leader's init.
+
+    ``split``: each follower's std is its own parameter (``sapg_follower_std`` is a ``ParameterList``).
+    """
     assert isinstance(dist, GaussianDistribution) and type(dist).update in (
         GaussianDistribution.update,
         GsdeDistribution.update,
@@ -289,8 +399,13 @@ def attach_block_std(dist: Distribution, num_blocks: int) -> Distribution:
     dist.__class__ = _conditioned_class(type(dist), _BlockStdMixin)
     dist.sapg_std_name = name  # type: ignore[attr-defined]
     dist._sapg_matrix_sampling = matrix_sampling  # type: ignore[attr-defined]
-    followers = leader.detach().unsqueeze(0).repeat(num_blocks - 1, *([1] * leader.dim()))
-    dist.sapg_follower_std = nn.Parameter(followers, requires_grad=leader.requires_grad)  # type: ignore[attr-defined]
+    if split:
+        dist.sapg_follower_std = nn.ParameterList(  # type: ignore[attr-defined]
+            [nn.Parameter(leader.detach().clone(), requires_grad=leader.requires_grad) for _ in range(num_blocks - 1)]
+        )
+    else:
+        followers = leader.detach().unsqueeze(0).repeat(num_blocks - 1, *([1] * leader.dim()))
+        dist.sapg_follower_std = nn.Parameter(followers, requires_grad=leader.requires_grad)  # type: ignore[attr-defined]
     if matrix_sampling:
         dist.sample_weights()
     return dist
@@ -303,12 +418,14 @@ def attach_block_conditioning(
     per_block_std: bool = False,
     shared_layers: int | None = None,
     block_layers: list[int] | None = None,
+    independent: bool = False,
 ) -> MLPModel:
     """Condition ``model`` (in place) on its block; returns the model.
 
     Adds a ``[num_blocks, phi_dim]`` phi table (if ``phi_dim > 0``), with ``per_block_std`` one exploration
     std per block on its distribution, and with ``shared_layers`` per-block heads after that many shared Linears
-    (or ``block_layers``: exactly those Linear indices per-block).
+    (or ``block_layers``: exactly those Linear indices per-block). ``independent``: M fully separate models (every
+    Linear per block with its own parameters, per-block std parameters, per-block observation normalizer).
     """
     assert isinstance(model, MLPModel), f"SAPG conditioning needs an MLPModel-family model, got {type(model).__name__}."
     assert not model.is_recurrent, "SAPG conditioning supports feedforward models only."
@@ -318,15 +435,38 @@ def attach_block_conditioning(
         indices = resolve_block_layers(num_linears, shared_layers, block_layers)
         # phi lives on the first Linear, which must then stay shared
         assert phi_dim == 0 or 0 not in indices, "phi_dim > 0 needs a shared first Linear (no per-block layer 0)."
-        attach_block_heads(model, num_blocks, shared_layers, block_layers)
+        attach_block_heads(model, num_blocks, shared_layers, block_layers, split=independent)
+    if independent:
+        assert phi_dim == 0 and shared_layers == 0 and block_layers is None, (
+            "independent blocks need shared_layers=0, phi_dim=0 (no shared Linear or phi)."
+        )
+        if isinstance(model.obs_normalizer, EmpiricalNormalization):
+            model.obs_normalizer = BlockNormalization(model.obs_normalizer, num_blocks)
+        stray = [
+            n for n, m in model.named_modules() if isinstance(m, EmpiricalNormalization) and ".norms." not in f".{n}"
+        ]
+        assert not stray, f"independent blocks: normalizers shared by every block: {stray}."
     if phi_dim > 0:
         first = model.mlp[0]
         assert type(first) is nn.Linear, f"expected the MLP's first layer to be nn.Linear, got {type(first).__name__}."
         model.mlp[0] = PhiConditionedLinear(first, num_blocks, phi_dim)
     if per_block_std and num_blocks > 1 and model.distribution is not None:
-        attach_block_std(model.distribution, num_blocks)
+        attach_block_std(model.distribution, num_blocks, split=independent)
     model.__class__ = _conditioned_class(type(model), _BlockConditionedMixin)
     return model
+
+
+def block_parameters(model: nn.Module, num_blocks: int) -> list[list[nn.Parameter]]:
+    """Per-block parameter lists of an independent-blocks model (split heads + split std); others are unowned."""
+    groups: list[list[nn.Parameter]] = [[] for _ in range(num_blocks)]
+    for module in model.modules():
+        if isinstance(module, SplitBlockLinear):
+            for j, layer in enumerate(module.blocks):
+                groups[j] += list(layer.parameters())
+        elif isinstance(module, _BlockStdMixin) and module.sapg_std_split:
+            for j, param in enumerate(module.sapg_std_params()):
+                groups[j].append(param)
+    return groups
 
 
 def is_block_conditioned(model: nn.Module) -> bool:
