@@ -41,10 +41,12 @@ def _indep(update: str = "is", dist: dict = GSDE, seed: int = 0, **overrides) ->
         leader_entropy_coef=0.006,
         follower_entropy_coef=0.006,
     )
+    sapg_keys = ("awr_beta", "awr_w_max", "awr_advantage", "off_policy_coef", "kl_reference", "critic_shared_layers")
     for key in list(overrides):
-        if key in kw or key in ("awr_beta", "awr_w_max", "off_policy_coef", "kl_reference", "critic_shared_layers"):
+        if key in kw or key in sapg_keys:
             kw[key] = overrides.pop(key)
-    return SAPG(actor, critic, _storage(), **kw, **_alg_kwargs(normalize_advantage_per_mini_batch=True, **overrides))
+    ppo_kw = _alg_kwargs(**{"normalize_advantage_per_mini_batch": True, **overrides})
+    return SAPG(actor, critic, _storage(), **kw, **ppo_kw)
 
 
 def _grads(alg: SAPG) -> list[float]:
@@ -141,6 +143,7 @@ def test_update_logs_and_per_block_lr(update: str) -> None:
     keys += ["SAPG/off_actor_loss", "SAPG/ratio_off_mean", "SAPG/ratio_off_ess", "SAPG/clip_frac_off"]
     if update == "awr":
         keys += ["SAPG/awr_w_mean", "SAPG/awr_w_max_frac", "SAPG/awr_w_ess"]
+        keys += [f"SAPG/awr_w_{k}_f{j}" for j in range(1, NUM_BLOCKS) for k in ("mean", "ess")]
     for key in keys:
         assert key in losses and math.isfinite(losses[key]), key
     assert [g["lr"] for g in alg.optimizer.param_groups] == alg.block_learning_rates
@@ -270,3 +273,118 @@ def test_runner_learns_saves_and_resumes(tmp_path, update: str) -> None:
     assert other.alg.block_learning_rates == runner.alg.block_learning_rates
     other.learn(num_learning_iterations=1)
     runner.export_policy_to_jit(str(tmp_path), "policy.pt")
+
+
+# ------------------------------------------------------------------------------------------------
+# awr_advantage: the AWR weight from the leader-relabeled TD advantage or the source follower's own GAE advantage
+# ------------------------------------------------------------------------------------------------
+
+
+def _flat(alg: SAPG) -> dict:
+    st = alg.storage
+    return {
+        "observations": st.observations.flatten(0, 1),
+        "actions": st.actions.flatten(0, 1),
+        "actions_log_prob": st.actions_log_prob.flatten(0, 1),
+    }
+
+
+def _all_row_terms(alg: SAPG) -> dict:
+    rows = alg._rows
+    old = tuple(p.flatten(0, 1)[rows["src"]] for p in alg.storage.distribution_params)
+    idx = torch.arange(rows["src"].shape[0])
+    return alg.minibatch_losses(idx, _flat(alg), tuple(p[idx] for p in old))
+
+
+def _hand_follower_weights(alg: SAPG) -> torch.Tensor:
+    """clamp(exp(A_j / beta)) on the relabeled rows, A_j = follower j's raw GAE advantage normalized over its rows."""
+    rows, st = alg._rows, alg.storage
+    raw = (st.returns - st.values).flatten(0, 1).view(-1)[rows["src"]]
+    src_block = alg.env_block_ids.repeat(st.num_transitions_per_env)[rows["src"]]
+    expected = torch.full_like(raw, float("nan"))
+    for j in range(1, NUM_BLOCKS):
+        mask = rows["off"] & (src_block == j)
+        a = raw[mask]
+        expected[mask] = torch.exp((a - a.mean()) / (a.std() + 1e-8) / alg.awr_beta).clamp(max=alg.awr_w_max)
+    return expected[rows["off"]]
+
+
+@pytest.mark.parametrize("per_mini_batch", [True, False])
+def test_awr_leader_default_is_relabeled_td_advantage(per_mini_batch: bool) -> None:
+    """Default (no awr_advantage) == "leader": same loss, weights from the leader-relabeled advantage group."""
+    terms = []
+    for kw in ({}, {"awr_advantage": "leader"}):
+        alg = _indep("awr", awr_beta=0.7, awr_w_max=3.0, normalize_advantage_per_mini_batch=per_mini_batch, **kw)
+        _collect(alg)
+        terms.append(_all_row_terms(alg))
+    assert torch.equal(terms[0]["loss"], terms[1]["loss"]) and torch.equal(terms[0]["awr_w"], terms[1]["awr_w"])
+    rows, off = alg._rows, alg._rows["off"]
+    a = rows["advantages"][off].view(-1)
+    if per_mini_batch:  # normalized inside the (whole-set) minibatch; else already normalized in compute_returns
+        a = (a - a.mean()) / (a.std() + 1e-8)
+    expected = torch.exp(a / 0.7).clamp(max=3.0)
+    assert torch.allclose(terms[0]["awr_w"][off], expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("per_mini_batch", [True, False])
+def test_awr_follower_weights_from_follower_gae(per_mini_batch: bool) -> None:
+    kw = dict(awr_beta=0.7, awr_w_max=3.0, normalize_advantage_per_mini_batch=per_mini_batch)
+    alg = _indep("awr", awr_advantage="follower", **kw)
+    _collect(alg)
+    terms = _all_row_terms(alg)
+    off = terms["off"]
+    assert torch.allclose(terms["awr_w"][off], _hand_follower_weights(alg), atol=1e-6)
+    lead = _indep("awr", **kw)
+    _collect(lead)
+    lead_terms = _all_row_terms(lead)
+    assert not torch.allclose(terms["awr_w"][off], lead_terms["awr_w"][off], atol=1e-3)
+    # everything but the AWR weight is unchanged: value / entropy rows, on-policy rows
+    assert torch.equal(terms["value_rows"], lead_terms["value_rows"])
+    assert torch.equal(terms["entropy_rows"], lead_terms["entropy_rows"])
+    assert torch.equal(terms["actor_rows"][~off], lead_terms["actor_rows"][~off])
+
+
+def test_awr_follower_off_rows_only_train_the_leader() -> None:
+    alg = _indep("awr", awr_advantage="follower")
+    _collect(alg)
+    rows = alg._rows
+    old = tuple(p.flatten(0, 1)[rows["src"]] for p in alg.storage.distribution_params)
+    idx = torch.nonzero(rows["off"]).view(-1)
+    alg.optimizer.zero_grad()
+    alg.minibatch_losses(idx, _flat(alg), tuple(p[idx] for p in old))["loss"].backward()
+    grads = _grads(alg)
+    assert grads[0] > 0 and grads[1:] == [0.0] * (NUM_BLOCKS - 1), grads
+
+
+@pytest.mark.parametrize("per_mini_batch", [True, False])
+def test_awr_follower_normalized_per_follower(per_mini_batch: bool) -> None:
+    """Scaling follower 2's rewards leaves follower 1's weights untouched ("follower"), unlike the pooled "leader"."""
+
+    def weights(mode: str, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        alg = _indep("awr", awr_advantage=mode, normalize_advantage_per_mini_batch=per_mini_batch)
+        factor = torch.where(alg.env_block_ids == 2, scale, 1.0)
+        step = alg.process_env_step
+        alg.process_env_step = lambda obs, r, d, e: step(obs, r * factor + 5.0 * (factor != 1.0), d, e)
+        _collect(alg)
+        terms = _all_row_terms(alg)
+        w, src_block = terms["awr_w"], terms["src_block"]
+        return w[terms["off"] & (src_block == 1)], w[terms["off"] & (src_block == 2)]
+
+    base, scaled = weights("follower", 1.0), weights("follower", 10.0)
+    assert torch.equal(base[0], scaled[0])
+    assert not torch.allclose(base[1], scaled[1])
+    base, scaled = weights("leader", 1.0), weights("leader", 10.0)
+    assert not torch.allclose(base[0], scaled[0])
+
+
+def test_awr_advantage_validated_and_saved() -> None:
+    with pytest.raises(AssertionError):
+        _indep("awr", awr_advantage="critic")
+    with pytest.raises(AssertionError):
+        _indep("is", awr_advantage="follower")
+    alg = _indep("awr", awr_advantage="follower")
+    _collect(alg)
+    losses = alg.update()
+    for j in range(1, NUM_BLOCKS):
+        assert math.isfinite(losses[f"SAPG/awr_w_mean_f{j}"]) and 0 < losses[f"SAPG/awr_w_ess_f{j}"] <= 1 + 1e-6
+    assert alg.save()["sapg"]["awr_advantage"] == "follower"

@@ -83,6 +83,7 @@ class SAPG(PPO):
         off_policy_update: str = "is",
         awr_beta: float = 1.0,
         awr_w_max: float = 10.0,
+        awr_advantage: str = "leader",
         off_policy_coef: float = 1.0,
         independent_blocks: bool = False,
         **kwargs: object,
@@ -104,7 +105,8 @@ class SAPG(PPO):
 
         ``off_policy_update``: ``"is"`` (clipped ratio surrogate on relabeled rows) or ``"awr"``. ``off_policy_coef``
         scales the relabeled rows' loss. ``independent_blocks`` needs the fully separate layout (no shared Linear,
-        phi or std).
+        phi or std). ``awr_advantage``: the AWR weight's advantage on a relabeled row, ``"leader"`` (1-step TD
+        under the leader critic) or ``"follower"`` (the source follower's own GAE advantage, normalized per follower).
         """
         assert num_blocks >= 1, f"num_blocks must be >= 1, got {num_blocks}."
         assert phi_dim >= 0, f"phi_dim must be >= 0, got {phi_dim}."
@@ -123,6 +125,8 @@ class SAPG(PPO):
         assert off_policy_update in ("is", "awr"), f"off_policy_update must be 'is' / 'awr', got {off_policy_update!r}."
         assert awr_beta > 0.0 and awr_w_max > 0.0, f"awr_beta / awr_w_max must be > 0, got {awr_beta}, {awr_w_max}."
         assert off_policy_coef >= 0.0, f"off_policy_coef must be >= 0, got {off_policy_coef}."
+        assert awr_advantage in ("leader", "follower"), f"awr_advantage: 'leader' / 'follower', got {awr_advantage!r}."
+        assert awr_advantage == "leader" or off_policy_update == "awr", "awr_advantage='follower' needs AWR updates."
         if independent_blocks:
             assert shared_layers == 0 and block_layers is None and phi_dim == 0, (
                 "independent_blocks needs shared_layers=0, phi_dim=0 (and no block_layers)."
@@ -207,6 +211,9 @@ class SAPG(PPO):
         self.off_policy_update = off_policy_update
         self.awr_beta = float(awr_beta)
         self.awr_w_max = float(awr_w_max)
+        self.awr_advantage = awr_advantage
+        if off_policy_update == "awr":
+            print(f"[SAPG] awr_advantage={awr_advantage}")
         self.off_policy_coef = float(off_policy_coef)
         self.independent_blocks = bool(independent_blocks)
         # relabeled rows form their own advantage-normalization group (else they join the leader / all rows)
@@ -369,6 +376,11 @@ class SAPG(PPO):
                 self._relabel_stats["SAPG/relabel_adv_mean"] = rel["advantages"].mean().item()
             for key, value in rel.items():
                 rows[key] = torch.cat([rows[key], value], dim=0)
+        # behavior block of every row (relabeled rows: their source follower)
+        rows["src_block"] = self.env_block_ids.repeat(st.num_transitions_per_env)[rows["src"]]
+        if self.awr_advantage == "follower":
+            # the source follower's own raw GAE advantage (normalized per source follower below / per minibatch)
+            rows["awr_adv"] = st.advantages.flatten(0, 1)[rows["src"]].clone()
         rows["entropy_coef"] = torch.cat([
             self._env_entropy_coef.repeat(st.num_transitions_per_env),
             torch.full((rows["src"].shape[0] - num_on,), self.block_entropy_coefs[0], device=self.device),
@@ -390,6 +402,13 @@ class SAPG(PPO):
             else:
                 rows["advantages"] = self._normalize(rows["advantages"])
             st.advantages = rows["advantages"][:num_on].view_as(st.advantages).clone()
+            if self.awr_advantage == "follower":
+                # one group per drawn follower: off_blocks is identical on every rank (collectives inside _normalize)
+                awr_adv = rows["awr_adv"].clone()
+                for j in off_blocks:
+                    mask = rows["off"] & (rows["src_block"] == j)
+                    awr_adv[mask] = self._normalize(rows["awr_adv"][mask])
+                rows["awr_adv"] = awr_adv
         self._rows = rows
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
@@ -486,6 +505,21 @@ class SAPG(PPO):
                     advantages = normalized
                 else:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        awr_adv = advantages
+        if self.awr_advantage == "follower":
+            src_block = rows["src_block"][idx]
+            awr_adv = rows["awr_adv"][idx].view(-1)
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    normalized = awr_adv.clone()
+                    for j in range(1, self.num_blocks):
+                        mask = off & (src_block == j)
+                        if bool(mask.any()):
+                            adv_j = awr_adv[mask]
+                            std_j = adv_j.std() if adv_j.numel() > 1 else adv_j.new_zeros(())
+                            normalized[mask] = (adv_j - adv_j.mean()) / (std_j + 1e-8)
+                    awr_adv = normalized
+            awr_adv = torch.where(off, awr_adv, advantages)
 
         with block_context(block, self.actor, self.critic):
             self.actor(obs, stochastic_output=True)
@@ -503,7 +537,7 @@ class SAPG(PPO):
         actor_rows = surrogate
         if self.off_policy_update == "awr":
             with torch.no_grad():
-                log_w = advantages / self.awr_beta
+                log_w = awr_adv / self.awr_beta
                 awr_clamped = log_w > math.log(self.awr_w_max)
                 awr_w = torch.exp(log_w.clamp(max=math.log(self.awr_w_max)))
             actor_rows = torch.where(off, -awr_w * log_prob, surrogate)
@@ -547,6 +581,7 @@ class SAPG(PPO):
             "ratio": ratio.detach(),
             "params": tuple(p.detach() for p in params),
             "block": block,
+            "src_block": rows["src_block"][idx],
             "off": off,
         }
 
@@ -654,6 +689,8 @@ class SAPG(PPO):
         grad_norms: dict[str, list[torch.Tensor]] = {"actor": [], "critic": [], "combined": []}
         epoch_kls: list[torch.Tensor] = []
         epoch_block_kls: list[torch.Tensor] = []
+        # per source follower [sum w, sum w^2, count] of the AWR weights on relabeled rows
+        awr_f = torch.zeros(3, self.num_blocks, device=self.device)
         self.last_minibatch_debug = None
         num_steps_run, stop, approx_kl_first, approx_kl_last = 0, False, 0.0, 0.0
 
@@ -747,6 +784,10 @@ class SAPG(PPO):
                         acc("_awr_w", terms["awr_w"][off].sum())
                         acc("_awr_w_sq", terms["awr_w"][off].pow(2).sum())
                         acc("_awr_clamped", terms["awr_clamped"][off].sum())
+                        w_off, b_off = terms["awr_w"][off].float(), terms["src_block"][off]
+                        awr_f[0].index_add_(0, b_off, w_off)
+                        awr_f[1].index_add_(0, b_off, w_off.pow(2))
+                        awr_f[2].index_add_(0, b_off, torch.ones_like(w_off))
                 if stop:
                     break
 
@@ -789,6 +830,11 @@ class SAPG(PPO):
                 loss_dict["SAPG/awr_w_mean"] = out["_awr_w"] / n_off
                 loss_dict["SAPG/awr_w_max_frac"] = out["_awr_clamped"] / n_off
                 loss_dict["SAPG/awr_w_ess"] = out["_awr_w"] ** 2 / max(n_off * out["_awr_w_sq"], 1e-12)
+                w_sum, w_sq, w_n = awr_f.tolist()
+                for j in range(1, self.num_blocks):
+                    if w_n[j] > 0:
+                        loss_dict[f"SAPG/awr_w_mean_f{j}"] = w_sum[j] / w_n[j]
+                        loss_dict[f"SAPG/awr_w_ess_f{j}"] = w_sum[j] ** 2 / max(w_n[j] * w_sq[j], 1e-12)
         if epoch_block_kls:
             block_kls = torch.stack(epoch_block_kls).mean(dim=0).tolist()
             for j in range(self.num_blocks):
@@ -879,6 +925,7 @@ class SAPG(PPO):
             "off_policy_update": self.off_policy_update,
             "awr_beta": self.awr_beta,
             "awr_w_max": self.awr_w_max,
+            "awr_advantage": self.awr_advantage,
             "off_policy_coef": self.off_policy_coef,
         }
         return saved
