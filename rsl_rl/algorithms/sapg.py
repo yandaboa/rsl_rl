@@ -84,7 +84,9 @@ class SAPG(PPO):
         awr_beta: float = 1.0,
         awr_w_max: float = 10.0,
         awr_advantage: str = "leader",
+        awr_per_follower_norm: bool = False,
         off_policy_coef: float = 1.0,
+        leader_on_policy_coef: float = 1.0,
         independent_blocks: bool = False,
         **kwargs: object,
     ) -> None:
@@ -107,6 +109,8 @@ class SAPG(PPO):
         scales the relabeled rows' loss. ``independent_blocks`` needs the fully separate layout (no shared Linear,
         phi or std). ``awr_advantage``: the AWR weight's advantage on a relabeled row, ``"leader"`` (1-step TD
         under the leader critic) or ``"follower"`` (the source follower's own GAE advantage, normalized per follower).
+        ``awr_per_follower_norm``: with ``"leader"``, normalize the relabeled advantage per source follower (not pooled)
+        for the AWR weight only. ``leader_on_policy_coef`` scales only the leader's on-policy actor surrogate.
         """
         assert num_blocks >= 1, f"num_blocks must be >= 1, got {num_blocks}."
         assert phi_dim >= 0, f"phi_dim must be >= 0, got {phi_dim}."
@@ -127,6 +131,8 @@ class SAPG(PPO):
         assert off_policy_coef >= 0.0, f"off_policy_coef must be >= 0, got {off_policy_coef}."
         assert awr_advantage in ("leader", "follower"), f"awr_advantage: 'leader' / 'follower', got {awr_advantage!r}."
         assert awr_advantage == "leader" or off_policy_update == "awr", "awr_advantage='follower' needs AWR updates."
+        assert not awr_per_follower_norm or off_policy_update == "awr", "awr_per_follower_norm needs AWR updates."
+        assert leader_on_policy_coef >= 0.0, f"leader_on_policy_coef must be >= 0, got {leader_on_policy_coef}."
         if independent_blocks:
             assert shared_layers == 0 and block_layers is None and phi_dim == 0, (
                 "independent_blocks needs shared_layers=0, phi_dim=0 (and no block_layers)."
@@ -212,9 +218,18 @@ class SAPG(PPO):
         self.awr_beta = float(awr_beta)
         self.awr_w_max = float(awr_w_max)
         self.awr_advantage = awr_advantage
-        if off_policy_update == "awr":
-            print(f"[SAPG] awr_advantage={awr_advantage}")
+        self.awr_per_follower_norm = bool(awr_per_follower_norm)
+        # the AWR weight's advantage is normalized per source follower ("follower" always)
+        self._awr_per_follower = awr_advantage == "follower" or self.awr_per_follower_norm
         self.off_policy_coef = float(off_policy_coef)
+        self.leader_on_policy_coef = float(leader_on_policy_coef)
+        if off_policy_update == "awr":
+            print(
+                f"[SAPG] awr_advantage={awr_advantage} per_follower_norm={self.awr_per_follower_norm}"
+                f" leader_on_policy_coef={self.leader_on_policy_coef}"
+            )
+        elif self.leader_on_policy_coef != 1.0:
+            print(f"[SAPG] leader_on_policy_coef={self.leader_on_policy_coef}")
         self.independent_blocks = bool(independent_blocks)
         # relabeled rows form their own advantage-normalization group (else they join the leader / all rows)
         self._off_own_adv_group = self.independent_blocks or self.off_policy_update == "awr"
@@ -381,6 +396,9 @@ class SAPG(PPO):
         if self.awr_advantage == "follower":
             # the source follower's own raw GAE advantage (normalized per source follower below / per minibatch)
             rows["awr_adv"] = st.advantages.flatten(0, 1)[rows["src"]].clone()
+        elif self._awr_per_follower:
+            # the raw leader-relabeled advantage, normalized per source follower like "follower"
+            rows["awr_adv"] = rows["advantages"].clone()
         rows["entropy_coef"] = torch.cat([
             self._env_entropy_coef.repeat(st.num_transitions_per_env),
             torch.full((rows["src"].shape[0] - num_on,), self.block_entropy_coefs[0], device=self.device),
@@ -402,7 +420,7 @@ class SAPG(PPO):
             else:
                 rows["advantages"] = self._normalize(rows["advantages"])
             st.advantages = rows["advantages"][:num_on].view_as(st.advantages).clone()
-            if self.awr_advantage == "follower":
+            if self._awr_per_follower:
                 # one group per drawn follower: off_blocks is identical on every rank (collectives inside _normalize)
                 awr_adv = rows["awr_adv"].clone()
                 for j in off_blocks:
@@ -506,7 +524,7 @@ class SAPG(PPO):
                 else:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         awr_adv = advantages
-        if self.awr_advantage == "follower":
+        if self._awr_per_follower:
             src_block = rows["src_block"][idx]
             awr_adv = rows["awr_adv"][idx].view(-1)
             if self.normalize_advantage_per_mini_batch:
@@ -535,12 +553,15 @@ class SAPG(PPO):
         )
         awr_w = awr_clamped = None
         actor_rows = surrogate
+        leader_on = (~off) & (block == 0)
+        if self.leader_on_policy_coef != 1.0:
+            actor_rows = torch.where(leader_on, self.leader_on_policy_coef * surrogate, surrogate)
         if self.off_policy_update == "awr":
             with torch.no_grad():
                 log_w = awr_adv / self.awr_beta
                 awr_clamped = log_w > math.log(self.awr_w_max)
                 awr_w = torch.exp(log_w.clamp(max=math.log(self.awr_w_max)))
-            actor_rows = torch.where(off, -awr_w * log_prob, surrogate)
+            actor_rows = torch.where(off, -awr_w * log_prob, actor_rows)
         if self.use_clipped_value_loss:
             value_clipped = old_values + (values - old_values).clamp(-self.clip_param, self.clip_param)
             value_rows = torch.max((values - returns).pow(2), (value_clipped - returns).pow(2)).view(-1)
@@ -555,7 +576,7 @@ class SAPG(PPO):
             counts = torch.bincount(group, minlength=self.num_blocks + 1).clamp(min=1).to(per_row.dtype)
             means = sums / counts
             loss = means[: self.num_blocks].sum() + self.off_policy_coef * means[self.num_blocks]
-        elif self.off_policy_coef != 1.0 or self.off_policy_update != "is":
+        elif self.off_policy_coef != 1.0 or self.off_policy_update != "is" or self.leader_on_policy_coef != 1.0:
             row_w = torch.where(off, self.off_policy_coef, 1.0)
             loss = ((actor_rows + self.value_loss_coef * value_rows - entropy_rows) * row_w).mean()
         else:
@@ -567,6 +588,8 @@ class SAPG(PPO):
         return {
             "loss": loss,
             "surrogate": surrogate.mean(),
+            "leader_on_surrogate": surrogate.detach()[leader_on].sum(),
+            "leader_on_count": leader_on.sum(),
             "value": value_rows.mean(),
             "entropy": entropy.mean(),
             "surrogate_rows": surrogate,
@@ -770,6 +793,8 @@ class SAPG(PPO):
 
                 acc("value", terms["value"])
                 acc("surrogate", terms["surrogate"])
+                acc("_lead_on_surr", terms["leader_on_surrogate"])
+                acc("_lead_on_count", terms["leader_on_count"])
                 acc("entropy", terms["entropy"])
                 with torch.no_grad():
                     inside = terms["inside_clip"]
@@ -815,6 +840,7 @@ class SAPG(PPO):
             "surrogate": out["surrogate"] / num_updates,
             "entropy": out["entropy"] / num_updates,
         }
+        loss_dict["SAPG/leader_on_surrogate"] = out["_lead_on_surr"] / max(out["_lead_on_count"], 1.0)
         kls = torch.stack(epoch_kls).mean(dim=0).tolist()
         loss_dict["SAPG/kl_all"], loss_dict["SAPG/kl_leader"] = kls[0], kls[1]
         if out["_count_off"] > 0:
@@ -926,7 +952,9 @@ class SAPG(PPO):
             "awr_beta": self.awr_beta,
             "awr_w_max": self.awr_w_max,
             "awr_advantage": self.awr_advantage,
+            "awr_per_follower_norm": self.awr_per_follower_norm,
             "off_policy_coef": self.off_policy_coef,
+            "leader_on_policy_coef": self.leader_on_policy_coef,
         }
         return saved
 

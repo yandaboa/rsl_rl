@@ -41,7 +41,16 @@ def _indep(update: str = "is", dist: dict = GSDE, seed: int = 0, **overrides) ->
         leader_entropy_coef=0.006,
         follower_entropy_coef=0.006,
     )
-    sapg_keys = ("awr_beta", "awr_w_max", "awr_advantage", "off_policy_coef", "kl_reference", "critic_shared_layers")
+    sapg_keys = (
+        "awr_beta",
+        "awr_w_max",
+        "awr_advantage",
+        "awr_per_follower_norm",
+        "off_policy_coef",
+        "leader_on_policy_coef",
+        "kl_reference",
+        "critic_shared_layers",
+    )
     for key in list(overrides):
         if key in kw or key in sapg_keys:
             kw[key] = overrides.pop(key)
@@ -388,3 +397,129 @@ def test_awr_advantage_validated_and_saved() -> None:
     for j in range(1, NUM_BLOCKS):
         assert math.isfinite(losses[f"SAPG/awr_w_mean_f{j}"]) and 0 < losses[f"SAPG/awr_w_ess_f{j}"] <= 1 + 1e-6
     assert alg.save()["sapg"]["awr_advantage"] == "follower"
+
+
+# ------------------------------------------------------------------------------------------------
+# awr_per_follower_norm: the leader-relabeled advantage normalized per source follower for the AWR weight
+# ------------------------------------------------------------------------------------------------
+
+
+def _hand_leader_per_follower_weights(alg: SAPG) -> torch.Tensor:
+    """clamp(exp(A_L / beta)) on the relabeled rows, A_L = raw leader TD advantage normalized per source follower."""
+    rows = alg._rows
+    raw = (rows["returns"] - rows["values"]).view(-1)
+    expected = torch.full_like(raw, float("nan"))
+    for j in range(1, NUM_BLOCKS):
+        mask = rows["off"] & (rows["src_block"] == j)
+        a = raw[mask]
+        expected[mask] = torch.exp((a - a.mean()) / (a.std() + 1e-8) / alg.awr_beta).clamp(max=alg.awr_w_max)
+    return expected[rows["off"]]
+
+
+@pytest.mark.parametrize("per_mini_batch", [True, False])
+def test_awr_per_follower_norm_weights(per_mini_batch: bool) -> None:
+    kw = dict(awr_beta=0.7, awr_w_max=3.0, normalize_advantage_per_mini_batch=per_mini_batch)
+    alg = _indep("awr", awr_per_follower_norm=True, **kw)
+    _collect(alg)
+    terms = _all_row_terms(alg)
+    off = terms["off"]
+    assert torch.allclose(terms["awr_w"][off], _hand_leader_per_follower_weights(alg), atol=1e-6)
+    pooled = _indep("awr", **kw)
+    _collect(pooled)
+    pooled_terms = _all_row_terms(pooled)
+    assert not torch.allclose(terms["awr_w"][off], pooled_terms["awr_w"][off], atol=1e-3)
+    # only the AWR weight changes
+    for key in ("value_rows", "entropy_rows", "surrogate_rows"):
+        assert torch.equal(terms[key], pooled_terms[key]), key
+    assert torch.equal(terms["actor_rows"][~off], pooled_terms["actor_rows"][~off])
+
+
+@pytest.mark.parametrize("per_mini_batch", [True, False])
+def test_awr_per_follower_norm_isolates_followers(per_mini_batch: bool) -> None:
+    """Scaling follower 2's rewards leaves follower 1's leader-relabeled weights untouched (pooled: it does not)."""
+
+    def weights(flag: bool, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        alg = _indep("awr", awr_per_follower_norm=flag, normalize_advantage_per_mini_batch=per_mini_batch)
+        factor = torch.where(alg.env_block_ids == 2, scale, 1.0)
+        step = alg.process_env_step
+        alg.process_env_step = lambda obs, r, d, e: step(obs, r * factor + 5.0 * (factor != 1.0), d, e)
+        _collect(alg)
+        terms = _all_row_terms(alg)
+        w, src_block = terms["awr_w"], terms["src_block"]
+        return w[terms["off"] & (src_block == 1)], w[terms["off"] & (src_block == 2)]
+
+    base, scaled = weights(True, 1.0), weights(True, 10.0)
+    assert torch.equal(base[0], scaled[0])
+    assert not torch.allclose(base[1], scaled[1])
+    base, scaled = weights(False, 1.0), weights(False, 10.0)
+    assert not torch.allclose(base[0], scaled[0])
+
+
+def test_new_knobs_validated_printed_and_saved(capsys) -> None:
+    with pytest.raises(AssertionError):
+        _indep("is", awr_per_follower_norm=True)
+    with pytest.raises(AssertionError):
+        _indep("awr", leader_on_policy_coef=-0.1)
+    alg = _indep("awr", awr_per_follower_norm=True, leader_on_policy_coef=0.1)
+    assert "[SAPG] awr_advantage=leader per_follower_norm=True leader_on_policy_coef=0.1" in capsys.readouterr().out
+    _collect(alg)
+    losses = alg.update()
+    assert all(math.isfinite(v) for v in losses.values())
+    assert math.isfinite(losses["SAPG/leader_on_surrogate"])
+    saved = alg.save()["sapg"]
+    assert saved["awr_per_follower_norm"] is True and saved["leader_on_policy_coef"] == 0.1
+
+
+# ------------------------------------------------------------------------------------------------
+# leader_on_policy_coef: scales only the leader's on-policy actor surrogate
+# ------------------------------------------------------------------------------------------------
+
+
+def _shared(update: str, **overrides) -> SAPG:
+    """Non-independent SAPG (shared trunk + phi) on the uniform off-policy draw."""
+    actor, critic = _models(dist=GAUSSIAN, seed=0)
+    kw = dict(num_blocks=NUM_BLOCKS, phi_dim=4, off_policy_ratio=1.0, off_policy_sampling="uniform")
+    kw.update(off_policy_update=update, leader_entropy_coef=0.0, **overrides)
+    return SAPG(actor, critic, _storage(), **kw, **_alg_kwargs(normalize_advantage_per_mini_batch=True))
+
+
+def _split_grads(alg: SAPG, idx: torch.Tensor, coef: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """(actor grad, critic grad) of the loss on rows ``idx`` with ``leader_on_policy_coef = coef``."""
+    alg.leader_on_policy_coef = coef
+    rows = alg._rows
+    old = tuple(p.flatten(0, 1)[rows["src"]] for p in alg.storage.distribution_params)
+    alg.optimizer.zero_grad()
+    alg.minibatch_losses(idx, _flat(alg), tuple(p[idx] for p in old))["loss"].backward()
+
+    def flat(params) -> torch.Tensor:
+        return torch.cat([(torch.zeros_like(p) if p.grad is None else p.grad).reshape(-1) for p in params])
+
+    return flat(alg.actor.parameters()), flat(alg.critic.parameters())
+
+
+@pytest.mark.parametrize("update", ["is", "awr"])
+@pytest.mark.parametrize("independent", [True, False])
+def test_leader_on_policy_coef_scales_leader_actor_only(update: str, independent: bool) -> None:
+    alg = _indep(update, leader_entropy_coef=0.0) if independent else _shared(update)
+    _collect(alg)
+    rows = alg._rows
+    lead = torch.nonzero(~rows["off"] & (rows["block"] == 0)).view(-1)
+    follow = torch.nonzero(~rows["off"] & (rows["block"] != 0)).view(-1)
+    off = torch.nonzero(rows["off"]).view(-1)
+    a1, c1 = _split_grads(alg, lead, 1.0)
+    assert a1.abs().sum() > 0 and c1.abs().sum() > 0
+    for coef in (0.3, 0.0):
+        a, c = _split_grads(alg, lead, coef)
+        assert torch.allclose(a, coef * a1, rtol=1e-5, atol=1e-8), coef
+        assert torch.equal(c, c1), coef
+    a0, c0 = _split_grads(alg, lead, 0.0)
+    assert a0.abs().max() == 0 and c0.abs().sum() > 0
+    for idx in (follow, off):
+        a_ref, c_ref = _split_grads(alg, idx, 1.0)
+        a, c = _split_grads(alg, idx, 0.1)
+        assert torch.equal(a, a_ref) and torch.equal(c, c_ref)
+    # the logged surrogate stays unscaled
+    alg.leader_on_policy_coef = 0.1
+    terms = _all_row_terms(alg)
+    alg.leader_on_policy_coef = 1.0
+    assert torch.equal(terms["surrogate"], _all_row_terms(alg)["surrogate"])
